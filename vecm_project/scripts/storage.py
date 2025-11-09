@@ -59,7 +59,12 @@ def storage_open(read_only: bool = False) -> duckdb.DuckDBPyConnection:
     _ensure_dirs()
     conn = duckdb.connect(str(DB_PATH), read_only=read_only)
     if not read_only:
-        conn.execute("PRAGMA busy_timeout=60000")
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+        except duckdb.Error:  # pragma: no cover - compatibility fallback
+            logging.getLogger(__name__).debug(
+                "DuckDB busy_timeout pragma unsupported; continuing without it"
+            )
         conn.execute("PRAGMA threads=4")
     return conn
 
