@@ -36,6 +36,17 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 _DEFAULT_CFG_DICT: Optional[Dict[str, Any]] = None
 _DATA_CACHE: Dict[str, pd.DataFrame] = {}
 _PLAYBOOK_FIELDS = {field.name for field in fields(PlaybookConfig)}
+_GRID_TO_PLAYBOOK_FIELDS = {
+    "p": "p_th",
+    "rc": "regime_confirm",
+    "g": "gate_corr_min",
+    "w": "gate_corr_win",
+    "cd": "cooldown",
+    "ze": "z_exit",
+    "zs": "z_stop",
+    "z_meth": "z_auto_method",
+    "z_q": "z_auto_q",
+}
 
 DEFAULT_SUBSETS = (
     "ANTM,MDKA",
@@ -117,6 +128,12 @@ def _playbook_payload(job: "JobSpec", config: "RunnerConfig") -> Dict[str, Any]:
     for key, value in job.params.items():
         if key in _PLAYBOOK_FIELDS:
             payload[key] = value
+    grid_params = job.params.get("grid_params")
+    if isinstance(grid_params, dict):
+        for key, value in grid_params.items():
+            mapped = _GRID_TO_PLAYBOOK_FIELDS.get(key)
+            if mapped and mapped in _PLAYBOOK_FIELDS:
+                payload[mapped] = value
     return payload
 
 
