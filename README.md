@@ -4,13 +4,53 @@ for stock market price analysis
 
 ## Getting started
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r vecm_project/requirements.txt
-# The loader will fetch adjusted close data from Yahoo Finance on first run
-python vecm_project/run_demo.py
-```
+1. **Siapkan virtual environment dan dependensi.**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r vecm_project/requirements.txt
+   ```
+   Langkah ini memastikan modul inti seperti `duckdb`, `pandas`, dan `statsmodels`
+   tersedia sebelum pipeline dijalankan.
+
+2. **Unduh dan validasi data harga pertama kali.**
+   Jalankan demo end-to-end sesaat setelah instalasi:
+   ```bash
+   python vecm_project/run_demo.py
+   ```
+   Skrip akan memanggil `ensure_price_data()` dari
+   `vecm_project/scripts/data_streaming.py` sehingga file cache
+   `adj_close_data.csv` dibuat/di-update otomatis dengan minimal dua ticker dan
+   kolom tanggal tervalidasi. Jika cache rusak, fungsi tersebut mengunduh ulang
+   harga penutupan disesuaikan dari Yahoo Finance sebelum analisis dimulai.
+
+3. **Konfirmasi storage DuckDB.**
+   `run_demo.py` menggunakan konteks `managed_storage()` untuk memanggil
+   `storage_init`, membuat seluruh tabel dan indeks yang dibutuhkan agar metrik,
+   artefak model, dan log optimisasi tersimpan konsisten untuk audit berikutnya.
+
+4. **Pastikan artefak pipeline dipersistenkan.**
+   Jalankan demo hingga selesai sehingga fungsi `persist_artifacts` menyimpan
+   posisi, return, trade, metrik, manifest, dan catatan model ke filesystem dan
+   DuckDB. Keluaran terstruktur inilah yang diperlukan untuk verifikasi ulang
+   Sharpe/Drawdown serta audit performa.
+
+## Operational checklist
+
+Sebelum menjalankan eksperimen lanjutan, pastikan empat pilar berikut sudah
+dipenuhi—ini menjawab pertanyaan _“apakah Anda sudah melakukan ini?”_ yang
+sering muncul saat men-deploy playbook:
+
+1. **Kualitas data harga.** Pastikan `ensure_price_data()` dijalankan sampai
+   selesai sehingga cache `adj_close_data.csv` terisi dengan dua ticker atau
+   lebih, tanggal tervalidasi, serta duplikat tersaring.
+2. **Konsistensi storage.** Gunakan konteks `managed_storage()` agar
+   `storage_init` menyiapkan tabel DuckDB sebelum metrik dicatat.
+3. **Pipeline menyeluruh.** Biarkan `run_demo.main()` mengeksekusi skor cepat,
+   playbook penuh, hook ekspor, Bayesian optimisation, successive halving, dan
+   penulisan Pareto/dashboard.
+4. **Artefak lengkap.** Pastikan `persist=True` sehingga artefak dan metrik
+   terekam untuk audit maupun analisis lanjutan.
 
 ### When `pip install` is blocked
 
@@ -49,20 +89,26 @@ network access once the packages are available in your virtual environment.
 
 ## Runtime controls
 
-The Python translation ships with conservative defaults so a full demo run
-completes within roughly an hour on a laptop. You can tune the workload via
-environment variables:
+Pipeline demo menjalankan rangkaian penuh: skor cepat, playbook utama dengan
+`persist=True`, hook ekspor, optimisasi Bayesian (`run_bo`), successive halving,
+hingga penulisan front Pareto dan ringkasan dashboard. Seluruh keluaran yang
+terstruktur—posisi, return, trades, manifest, metrik—dibuat secara otomatis
+melalui `persist_artifacts` sehingga presisi Sharpe/Drawdown dan histori run
+dapat diverifikasi ulang.
 
-* ``VECM_MAX_GRID`` limits the number of jobs spawned by ``parallel_run``
-  (default ``48``). Set a higher value when you have more time to sweep the
-  Stage-1 grid.
-* ``run_bo`` now launches 16 trials by default (4 initial points + 12 TPE
-  steps) and caps parallel workers at four logical cores. Override ``n_init``
-  or ``iters`` when you want a deeper Bayesian search.
-* ``run_successive_halving`` evaluates up to 12 trials across the ``("short",
-  "long")`` horizons and also restricts parallelism to four workers by
-  default. Increase ``n_trials`` or pass a custom ``horizons`` tuple for a more
-  exhaustive pass.
+Penerjemahan Python ini tetap memakai default konservatif sehingga satu kali
+demo selesai dalam ±1 jam di laptop. Anda dapat menyesuaikan beban kerja melalui
+variabel lingkungan:
 
-These defaults keep the optimisation passes responsive while still leaving room
-for users to scale up the search when more compute time is available.
+* ``VECM_MAX_GRID`` membatasi jumlah job yang dibuat ``parallel_run``
+  (default ``48``). Naikkan nilainya jika ingin menyapu grid Stage-1 lebih luas.
+* ``run_bo`` menjalankan 16 trial secara baku (4 inisiasi + 12 langkah TPE) dan
+  membatasi pekerja paralel pada empat core logis. Ganti ``n_init`` atau
+  ``iters`` bila Anda memerlukan eksplorasi Bayesian lebih dalam.
+* ``run_successive_halving`` mengevaluasi hingga 12 trial pada horizon
+  ``("short", "long")`` sambil membatasi paralelisme ke empat pekerja. Tambah
+  ``n_trials`` atau beri tuple ``horizons`` kustom untuk pass yang lebih ekstensif.
+
+Default ini menjaga optimisasi tetap responsif, tetapi seluruh data dan artefak
+tetap lengkap sehingga dapat dianalisis lebih lanjut ketika Anda memperluas
+pencarian parameter.
