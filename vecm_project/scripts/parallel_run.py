@@ -36,6 +36,31 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 _DEFAULT_CFG_DICT: Optional[Dict[str, Any]] = None
 _DATA_CACHE: Dict[str, pd.DataFrame] = {}
 _PLAYBOOK_FIELDS = {field.name for field in fields(PlaybookConfig)}
+_GRID_PARAM_MAPPING = {
+    "p": "p_th",
+    "rc": "regime_confirm",
+    "g": "gate_corr_min",
+    "w": "gate_corr_win",
+    "cd": "cooldown",
+    "ze": "z_exit",
+    "zs": "z_stop",
+    "z_meth": "z_auto_method",
+    "z_q": "z_auto_q",
+    "z_quantile": "z_auto_q",
+}
+
+
+def _playbook_overrides(params: Dict[str, Any]) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    for key, value in params.items():
+        if key == "grid_params" and isinstance(value, dict):
+            overrides.update(_playbook_overrides(value))
+            continue
+        mapped = _GRID_PARAM_MAPPING.get(key, key)
+        if mapped in _PLAYBOOK_FIELDS:
+            overrides[mapped] = value
+    return overrides
+
 
 DEFAULT_SUBSETS = (
     "ANTM,MDKA",
@@ -114,9 +139,7 @@ def _playbook_payload(job: "JobSpec", config: "RunnerConfig") -> Dict[str, Any]:
     payload["input_file"] = str(input_path)
     payload["subset"] = job.subset
     payload["tag"] = job.tag
-    for key, value in job.params.items():
-        if key in _PLAYBOOK_FIELDS:
-            payload[key] = value
+    payload.update(_playbook_overrides(job.params))
     return payload
 
 
