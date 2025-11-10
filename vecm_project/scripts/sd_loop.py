@@ -228,7 +228,7 @@ def persist_policy(
             }
         )
         storage.storage_write_df(conn, "sd_loop", payload)
-        conn.execute("ANALYZE sd_loop")
+        storage.storage_schedule_analyze(conn, "sd_loop")
     finally:
         if close_conn:
             conn.close()
