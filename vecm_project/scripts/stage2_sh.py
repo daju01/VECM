@@ -91,6 +91,7 @@ def score_playbook(
             "method": method,
             "stage": 2,
             "notes": f"stage2_sh|pair={pair}|method={method}|horizon={horizon}|step={step}",
+            "z_entry": float(z_entry),
             "max_hold": int(max_hold),
             "cooldown": int(cooldown),
             "z_exit": float(z_exit),
