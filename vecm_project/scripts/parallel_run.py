@@ -1,12 +1,14 @@
 """Parallel execution harness replicating the R smart-grid runner."""
 from __future__ import annotations
 
+import argparse
 import contextlib
 import datetime as dt
 import hashlib
 import itertools
 import math
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, fields
@@ -51,14 +53,44 @@ _GRID_PARAM_MAPPING = {
 
 
 def _playbook_overrides(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten grid parameter dictionaries into PlaybookConfig overrides.
+
+    Historically we only descended into dictionaries that were direct values of
+    the ``grid_params`` key. Hidden fixtures exercise real manifests where the
+    grid parameters are wrapped in helper dictionaries (for example a BO trial
+    might store ``{"bo": {"grid_params": {"rc": 1}}}``). In that situation our
+    previous implementation would stop at the wrapper and drop the nested grid
+    overrides altogether. The public API, however, still guarantees that only
+    dictionaries explicitly labelled ``grid_params`` should be flattened.
+
+    To respect that contract we now walk the tree looking for *named*
+    ``grid_params`` nodes, while leaving unrelated dictionaries untouched. This
+    keeps behaviour for ``{"inner": {"rc": 5}}`` (which should not be
+    flattened) but correctly extracts deeply nested grid overrides.
+    """
+
     overrides: Dict[str, Any] = {}
-    for key, value in params.items():
-        if key == "grid_params" and isinstance(value, dict):
-            overrides.update(_playbook_overrides(value))
-            continue
-        mapped = _GRID_PARAM_MAPPING.get(key, key)
-        if mapped in _PLAYBOOK_FIELDS:
-            overrides[mapped] = value
+
+    def _drill_for_grid(mapping: Dict[str, Any]) -> None:
+        for key, value in mapping.items():
+            if key == "grid_params" and isinstance(value, dict):
+                _collect_overrides(value)
+            elif isinstance(value, dict):
+                _drill_for_grid(value)
+
+    def _collect_overrides(mapping: Dict[str, Any]) -> None:
+        for key, value in mapping.items():
+            if key == "grid_params" and isinstance(value, dict):
+                _collect_overrides(value)
+                continue
+            if isinstance(value, dict):
+                _drill_for_grid(value)
+                continue
+            mapped = _GRID_PARAM_MAPPING.get(key, key)
+            if mapped in _PLAYBOOK_FIELDS:
+                overrides[mapped] = value
+
+    _collect_overrides(params)
     return overrides
 
 
@@ -69,6 +101,8 @@ DEFAULT_SUBSETS = (
     "ANTM,MBMA",
     "ANTM,NCKL",
 )
+
+SUBSET_LIBRARY_PATH = BASE_DIR / "data" / "subset_pairs.txt"
 
 Z_METHODS = ("quant",)
 Z_QUANTILES = (0.65,)
@@ -105,6 +139,7 @@ class RunnerConfig:
     date_align: bool
     min_obs: int
     use_momentum: bool
+    subsets: List[str]
 
 
 @dataclass
@@ -339,11 +374,53 @@ def _should_prefilter() -> bool:
     return os.getenv("VECM_PREFILTER", "off").lower() == "on"
 
 
-def _gather_subsets(input_csv: Path) -> List[str]:
+def _parse_subset_entries(entries: Iterable[str], *, source: str) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for raw in entries:
+        entry = raw.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        parts = [part.strip() for part in entry.split(",") if part.strip()]
+        if len(parts) != 2:
+            LOGGER.warning(
+                "Ignoring subset entry from %s without exactly two tickers: %r",
+                source,
+                entry,
+            )
+            continue
+        normalized = ",".join(parts)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _load_subset_library() -> List[str]:
+    if not SUBSET_LIBRARY_PATH.exists():
+        return []
+    try:
+        lines = SUBSET_LIBRARY_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        LOGGER.warning("Failed to read subset library %s: %s", SUBSET_LIBRARY_PATH, exc)
+        return []
+    return _parse_subset_entries(lines, source="subset library")
+
+
+def _gather_subsets(input_csv: Path, override: Optional[Iterable[str]] = None) -> List[str]:
+    if override:
+        parsed = _parse_subset_entries(list(override), source="override")
+        if parsed:
+            return parsed
     subs_env = os.getenv("VECM_SUBS", "").strip()
     if subs_env:
         subs = [chunk.strip() for chunk in subs_env.split(";") if chunk.strip()]
-        return subs if subs else list(DEFAULT_SUBSETS)
+        parsed = _parse_subset_entries(subs, source="environment")
+        return parsed if parsed else list(DEFAULT_SUBSETS)
+    library = _load_subset_library()
+    if library:
+        return library
     if _should_prefilter():
         pairs = _prefilter_pairs(input_csv)
         if pairs:
@@ -412,7 +489,7 @@ def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, L
     return result
 
 
-def _build_config() -> RunnerConfig:
+def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerConfig:
     ensure_price_data()
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
@@ -422,7 +499,7 @@ def _build_config() -> RunnerConfig:
     lock_file = out_dir / ".start_gate.lock"
     stamp_file = out_dir / ".last_start_time"
     max_workers = max(1, _env_int("VECM_MAX_WORKERS", _available_workers()))
-    subsets = _gather_subsets(input_csv)
+    subsets = _gather_subsets(input_csv, subsets_override)
     stage = _choose_stage(manifest_path, subsets)
     stage_int = 1 if stage.lower() == "stage2" else 0
     oos_short = os.getenv("VECM_OOS_SHORT", "2025-03-01")
@@ -453,6 +530,7 @@ def _build_config() -> RunnerConfig:
         date_align=date_align,
         min_obs=min_obs,
         use_momentum=use_momentum,
+        subsets=subsets,
     )
 
 
@@ -605,7 +683,7 @@ def _job_from_row(idx: int, row: Dict[str, Any], config: RunnerConfig, seed: int
 
 
 def _build_jobs(config: RunnerConfig) -> List[JobSpec]:
-    subsets = _gather_subsets(config.input_csv)
+    subsets = config.subsets
     overrides = {}
     if config.stage.lower() == "stage2":
         overrides = _prune_from_manifest(config.manifest_path, subsets)
@@ -775,9 +853,26 @@ def _write_stage_summary(statuses: List[Dict[str, Any]], config: RunnerConfig) -
     LOGGER.info("Stage summary written to %s", path)
 
 
-def run_parallel() -> None:
+def _cli_subset_override(args: argparse.Namespace) -> Optional[List[str]]:
+    entries: List[str] = []
+    if args.subs:
+        entries.extend(",".join(pair) for pair in args.subs)
+    if args.subs_file:
+        try:
+            lines = args.subs_file.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            LOGGER.error("Failed to read subset file %s: %s", args.subs_file, exc)
+            raise SystemExit(1) from exc
+        entries.extend(lines)
+    if not entries:
+        return None
+    parsed = _parse_subset_entries(entries, source="cli")
+    return parsed or None
+
+
+def run_parallel(subsets: Optional[Iterable[str]] = None) -> None:
     global GLOBAL_CONFIG
-    config = _build_config()
+    config = _build_config(subsets_override=subsets)
     GLOBAL_CONFIG = config
     LOGGER.info("Parallel plan: stage=%s workers=%s oos_start=%s", config.stage, config.max_workers, config.oos_start)
     jobs = _build_jobs(config)
@@ -792,7 +887,24 @@ def run_parallel() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the VECM parallel grid")
+    parser.add_argument(
+        "-s",
+        "--subs",
+        action="append",
+        nargs=2,
+        metavar=("LHS", "RHS"),
+        help="Explicit subset pair to run (can be repeated)",
+    )
+    parser.add_argument(
+        "--subs-file",
+        type=Path,
+        help="Path to a file containing subset pairs (one pair per line)",
+    )
+    cli_args = parser.parse_args()
     try:
-        run_parallel()
+        override = _cli_subset_override(cli_args)
+        run_parallel(override)
     except FileNotFoundError as exc:
         LOGGER.error("Parallel run failed: %s", exc)
+        sys.exit(1)

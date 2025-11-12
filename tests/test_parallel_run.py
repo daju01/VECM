@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 
@@ -27,6 +28,7 @@ class PlaybookPayloadMappingTest(unittest.TestCase):
             date_align=False,
             min_obs=100,
             use_momentum=False,
+            subsets=["ANTM,MDKA"],
         )
 
     def tearDown(self) -> None:
@@ -120,6 +122,60 @@ class PlaybookPayloadMappingTest(unittest.TestCase):
 
         self.assertEqual(payload["regime_confirm"], 1)
         self.assertNotIn("inner", payload)
+
+    def test_deeply_nested_grid_params_are_discovered(self) -> None:
+        subset = "ANTM,MDKA"
+        grid_params = {
+            "rc": 1,
+            "wrapper": {
+                "grid_params": {
+                    "grid_params": {"g": 0.71},
+                    "nested": {"grid_params": {"cd": 9}},
+                }
+            },
+        }
+        job = self._make_job(subset, grid_params)
+
+        payload = parallel_run._playbook_payload(job, self.runner)
+
+        self.assertEqual(payload["regime_confirm"], 1)
+        self.assertEqual(payload["gate_corr_min"], 0.71)
+        self.assertEqual(payload["cooldown"], 9)
+
+
+class GatherSubsetsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.input_csv = Path("dummy.csv")
+        self._env_backup = {key: os.environ.get(key) for key in ["VECM_SUBS", "VECM_PREFILTER"]}
+        for key in ["VECM_SUBS", "VECM_PREFILTER"]:
+            os.environ.pop(key, None)
+        self._original_library = parallel_run.SUBSET_LIBRARY_PATH
+        parallel_run.SUBSET_LIBRARY_PATH = Path("missing_library.txt")
+
+    def tearDown(self) -> None:
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        parallel_run.SUBSET_LIBRARY_PATH = self._original_library
+
+    def test_override_pairs_are_honoured(self) -> None:
+        pairs = ["BBCA.JK,BMRI.JK"]
+        result = parallel_run._gather_subsets(self.input_csv, override=pairs)
+        self.assertEqual(result, pairs)
+
+    def test_override_supersedes_environment(self) -> None:
+        os.environ["VECM_SUBS"] = "ANTM,MDKA;TLKM,ISAT"
+        result = parallel_run._gather_subsets(
+            self.input_csv, override=["BBCA.JK,BMRI.JK"]
+        )
+        self.assertEqual(result, ["BBCA.JK,BMRI.JK"])
+
+    def test_environment_used_when_no_override(self) -> None:
+        os.environ["VECM_SUBS"] = "ANTM,MDKA;TLKM,ISAT"
+        result = parallel_run._gather_subsets(self.input_csv)
+        self.assertEqual(result, ["ANTM,MDKA", "TLKM,ISAT"])
 
 
 if __name__ == "__main__":
