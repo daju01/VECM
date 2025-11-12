@@ -108,18 +108,27 @@ class PlaybookConfig:
 
 
 def _default_input_path() -> str:
+    """Return the default price cache path without forcing it to exist."""
+
     data_path = BASE_DIR / "data" / "adj_close_data.csv"
-    if not data_path.exists():
-        raise FileNotFoundError(
-            "Price data missing. Please provide 'vecm_project/data/adj_close_data.csv' or "
-            "allow the streaming loader to populate it."
-        )
     return str(data_path)
+
+
+def _ensure_default_input(path: str) -> str:
+    """Ensure the default price cache exists before returning it."""
+
+    if not os.path.exists(path):
+        LOGGER.info("Default input %s missing; invoking streaming loader", path)
+        try:
+            ensure_price_data(force_refresh=False)
+        except Exception as exc:  # pragma: no cover - download/runtime issues
+            LOGGER.warning("Price streaming failed when populating default input: %s", exc)
+    return path
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser = argparse.ArgumentParser(description="VECM/TVECM Trading Playbook")
-    parser.add_argument("input_file", nargs="?", default=_default_input_path())
+    parser.add_argument("input_file", nargs="?", default=None)
     parser.add_argument("--subset", default="")
     parser.add_argument("--method", default="TVECM")
     parser.add_argument("--roll_years", type=float, default=3.0)
@@ -156,8 +165,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--mom_gate_k", type=int, default=3)
     parser.add_argument("--mom_cooldown", type=int, default=2)
     args = parser.parse_args(argv)
+    input_path = str(args.input_file) if args.input_file else _ensure_default_input(_default_input_path())
+
     cfg = PlaybookConfig(
-        input_file=str(args.input_file),
+        input_file=input_path,
         subset=args.subset,
         method=args.method.upper(),
         roll_years=float(args.roll_years),

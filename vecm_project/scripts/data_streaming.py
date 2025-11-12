@@ -1,10 +1,12 @@
 """Streaming adjusted close data loader for Indonesian equities universe."""
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as dt
+import json
 import pathlib
 import time
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 import yfinance as yf
@@ -15,7 +17,11 @@ LOGGER = storage.configure_logging("data_streaming")
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
+CACHE_META_PATH = DATA_DIR / "adj_close_data.meta.json"
 DEFAULT_START_DATE = dt.date(2013, 1, 1)
+MAX_WORKERS = 4
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +233,77 @@ def _write_wide(df: pd.DataFrame) -> None:
     LOGGER.info("Price cache updated at %s with %d rows", DATA_PATH, len(df))
 
 
+def _ensure_meta_bucket(meta: Dict[str, Any]) -> Dict[str, Any]:
+    bucket = meta.get("tickers")
+    if not isinstance(bucket, dict):
+        bucket = {}
+        meta["tickers"] = bucket
+    return bucket
+
+
+def _read_cache_meta() -> Dict[str, Any]:
+    if not CACHE_META_PATH.exists():
+        return {"tickers": {}}
+    try:
+        with CACHE_META_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):  # pragma: no cover - best effort cache
+        LOGGER.warning("Failed to read cache metadata at %s; recreating", CACHE_META_PATH)
+        return {"tickers": {}}
+    if not isinstance(data, dict):
+        return {"tickers": {}}
+    bucket = data.get("tickers")
+    if not isinstance(bucket, dict):
+        data["tickers"] = {}
+    return data
+
+
+def _write_cache_meta(meta: Dict[str, Any]) -> None:
+    CACHE_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CACHE_META_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2, sort_keys=True)
+
+
+def _update_meta_record(
+    meta: Dict[str, Any], ticker: str, *, refreshed: bool, timestamp: Optional[dt.datetime] = None
+) -> None:
+    bucket = _ensure_meta_bucket(meta)
+    record = bucket.get(ticker, {})
+    stamp = timestamp or dt.datetime.utcnow()
+    record["last_attempt"] = stamp.isoformat()
+    if refreshed:
+        record["last_refresh"] = stamp.date().isoformat()
+        record.pop("failures", None)
+    else:
+        record["failures"] = int(record.get("failures", 0)) + 1
+    bucket[ticker] = record
+
+
+def _should_skip_download(
+    ticker: str,
+    start: pd.Timestamp,
+    today: dt.date,
+    meta: Dict[str, Any],
+    force_refresh: bool,
+) -> bool:
+    if force_refresh:
+        return False
+    if start >= pd.Timestamp(today):
+        return True
+    bucket = meta.get("tickers", {})
+    record = bucket.get(ticker) if isinstance(bucket, dict) else None
+    if not record:
+        return False
+    last_refresh = record.get("last_refresh")
+    if not last_refresh:
+        return False
+    try:
+        last_refresh_date = dt.date.fromisoformat(last_refresh)
+    except ValueError:
+        return False
+    return last_refresh_date >= today
+
+
 def _resume_dates(
     tickers: Sequence[str],
     existing: Optional[pd.DataFrame],
@@ -267,6 +344,21 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
     return frame
 
 
+def _download_with_retry(
+    ticker: str, start: pd.Timestamp, end: dt.date, *, max_attempts: int = MAX_RETRIES
+) -> pd.DataFrame:
+    delay = RETRY_BASE_DELAY
+    for attempt in range(1, max_attempts + 1):
+        frame = _download_single_ticker(ticker, start, end)
+        if not frame.empty or start >= pd.Timestamp(end):
+            return frame
+        if attempt < max_attempts:
+            time.sleep(delay)
+            delay *= 2
+    LOGGER.warning("No data returned for %s after %d attempts", ticker, max_attempts)
+    return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+
+
 def _merge_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     valid_frames = [frame for frame in frames if frame is not None and not frame.empty]
     if not valid_frames:
@@ -294,6 +386,7 @@ def ensure_price_data(
         raise ValueError("No tickers provided for download")
 
     existing = None if force_refresh else _read_existing_prices()
+    meta = _read_cache_meta() if not force_refresh else {"tickers": {}}
     today = dt.date.today()
     if existing is not None and not force_refresh:
         resume_dates = _resume_dates(ticker_list, existing, default_start)
@@ -314,14 +407,55 @@ def ensure_price_data(
     else:
         resume_dates = _resume_dates(ticker_list, existing, default_start)
 
-    new_frames: List[pd.DataFrame] = []
-    for idx, ticker in enumerate(ticker_list, start=1):
+    download_plan = []
+    throttled: List[str] = []
+    for ticker in ticker_list:
         start = resume_dates[ticker]
-        frame = _download_single_ticker(ticker, start, today)
-        if not frame.empty:
-            new_frames.append(frame)
-        if idx % 10 == 0:
-            time.sleep(0.25)
+        if _should_skip_download(ticker, start, today, meta, force_refresh):
+            throttled.append(ticker)
+            continue
+        download_plan.append((ticker, start))
+
+    if throttled:
+        LOGGER.info("Skipping %d tickers already refreshed today", len(throttled))
+
+    new_frames: List[pd.DataFrame] = []
+    refreshed_tickers: List[str] = []
+    meta_changed = False
+    if download_plan:
+        max_workers = max(1, min(MAX_WORKERS, len(download_plan)))
+        LOGGER.info(
+            "Downloading %d tickers in %d workers (force_refresh=%s)",
+            len(download_plan),
+            max_workers,
+            force_refresh,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_download_with_retry, ticker, start, today): ticker
+                for ticker, start in download_plan
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                ticker = future_map[future]
+                try:
+                    frame = future.result()
+                except Exception as exc:  # pragma: no cover - network/runtime errors
+                    LOGGER.warning("Download task failed for %s: %s", ticker, exc)
+                    _update_meta_record(meta, ticker, refreshed=False)
+                    meta_changed = True
+                    continue
+                if not frame.empty:
+                    new_frames.append(frame)
+                    refreshed_tickers.append(ticker)
+                    _update_meta_record(meta, ticker, refreshed=True)
+                else:
+                    _update_meta_record(meta, ticker, refreshed=False)
+                meta_changed = True
+    else:
+        LOGGER.info("No tickers required download; cache is up to date")
+
+    if meta_changed:
+        _write_cache_meta(meta)
 
     combined = _merge_frames([existing, _merge_frames(new_frames)])
     if combined.empty:
@@ -331,6 +465,10 @@ def ensure_price_data(
 
     wide = _tidy_to_wide(combined)
     _write_wide(wide)
+    if refreshed_tickers:
+        LOGGER.info("Refreshed %d tickers: %s", len(refreshed_tickers), ", ".join(sorted(refreshed_tickers)[:10]))
+        if len(refreshed_tickers) > 10:
+            LOGGER.info("...and %d more", len(refreshed_tickers) - 10)
     return wide
 
 
