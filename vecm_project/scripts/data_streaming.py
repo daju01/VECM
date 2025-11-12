@@ -4,6 +4,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import json
+import os
 import pathlib
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -22,6 +23,9 @@ DEFAULT_START_DATE = dt.date(2013, 1, 1)
 MAX_WORKERS = 4
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 0.75
+DOWNLOAD_CONTROL_ENV = "VECM_PRICE_DOWNLOAD"
+_DOWNLOAD_DISABLE = {"0", "false", "no", "off", "skip", "never"}
+_DOWNLOAD_FORCE = {"force", "always"}
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +389,11 @@ def ensure_price_data(
     if not ticker_list:
         raise ValueError("No tickers provided for download")
 
+    download_mode = os.getenv(DOWNLOAD_CONTROL_ENV, "auto").strip().lower()
+    if download_mode in _DOWNLOAD_FORCE:
+        force_refresh = True
+    offline_requested = download_mode in _DOWNLOAD_DISABLE and not force_refresh
+
     existing = None if force_refresh else _read_existing_prices()
     meta = _read_cache_meta() if not force_refresh else {"tickers": {}}
     today = dt.date.today()
@@ -409,12 +418,29 @@ def ensure_price_data(
 
     download_plan = []
     throttled: List[str] = []
-    for ticker in ticker_list:
-        start = resume_dates[ticker]
-        if _should_skip_download(ticker, start, today, meta, force_refresh):
-            throttled.append(ticker)
-            continue
-        download_plan.append((ticker, start))
+    if offline_requested:
+        LOGGER.info(
+            "Price download disabled via %s; relying on cached data only",
+            DOWNLOAD_CONTROL_ENV,
+        )
+        missing = set(ticker_list)
+        if existing is not None:
+            missing -= set(existing["Ticker"].unique())
+        if missing:
+            LOGGER.warning(
+                "Offline mode active but cache lacks %d tickers: %s",
+                len(missing),
+                ", ".join(sorted(missing)[:10]),
+            )
+            if len(missing) > 10:
+                LOGGER.warning("...and %d more", len(missing) - 10)
+    else:
+        for ticker in ticker_list:
+            start = resume_dates[ticker]
+            if _should_skip_download(ticker, start, today, meta, force_refresh):
+                throttled.append(ticker)
+                continue
+            download_plan.append((ticker, start))
 
     if throttled:
         LOGGER.info("Skipping %d tickers already refreshed today", len(throttled))
