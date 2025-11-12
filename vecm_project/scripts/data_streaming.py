@@ -288,7 +288,7 @@ def _should_skip_download(
 ) -> bool:
     if force_refresh:
         return False
-    if start >= pd.Timestamp(today):
+    if start > pd.Timestamp(today):
         return True
     bucket = meta.get("tickers", {})
     record = bucket.get(ticker) if isinstance(bucket, dict) else None
