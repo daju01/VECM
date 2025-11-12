@@ -6,7 +6,7 @@ import datetime as dt
 import json
 import pathlib
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import pandas as pd
 import yfinance as yf
@@ -409,8 +409,14 @@ def ensure_price_data(
 
     download_plan = []
     throttled: List[str] = []
+    existing_tickers: Set[str] = set()
+    if existing is not None and not existing.empty:
+        existing_tickers = set(existing["Ticker"].unique())
     for ticker in ticker_list:
         start = resume_dates[ticker]
+        if ticker not in existing_tickers:
+            download_plan.append((ticker, start))
+            continue
         if _should_skip_download(ticker, start, today, meta, force_refresh):
             throttled.append(ticker)
             continue
