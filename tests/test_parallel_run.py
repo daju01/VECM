@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vecm_project.scripts import parallel_run
 
@@ -177,6 +178,54 @@ class GatherSubsetsTest(unittest.TestCase):
         os.environ["VECM_SUBS"] = "ANTM,MDKA;TLKM,ISAT"
         result = parallel_run._gather_subsets(self.input_csv)
         self.assertEqual(result, ["ANTM,MDKA", "TLKM,ISAT"])
+
+
+class DownloadTickersForSubsetsTest(unittest.TestCase):
+    def test_unique_tickers_uppercase_with_suffix_added(self) -> None:
+        subsets = ["bbca,bmri", "bmri.jk,antm", "ANTM,mdka"]
+        result = parallel_run._download_tickers_for_subsets(subsets)
+        self.assertEqual(result, ["BBCA.JK", "BMRI.JK", "ANTM.JK", "MDKA.JK"])
+
+    def test_preserves_symbols_with_existing_suffixes(self) -> None:
+        subsets = ["^JKSE,USDIDR=X", "ANTM.JK,MDKA"]
+        result = parallel_run._download_tickers_for_subsets(subsets)
+        self.assertEqual(result, ["^JKSE", "USDIDR=X", "ANTM.JK", "MDKA.JK"])
+
+
+class BuildConfigTickerSelectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        base = Path(self.tmpdir.name)
+        self.input_csv = base / "adj_close_data.csv"
+        self.input_csv.write_text("Date\n", encoding="utf-8")
+        self.out_dir = base / "out"
+        os.environ["VECM_INPUT"] = str(self.input_csv)
+        os.environ["VECM_OUT"] = str(self.out_dir)
+        self._subset_file = base / "subset_pairs.txt"
+        self._subset_file.write_text("BBCA,BMRI\nANTM,MDKA\n", encoding="utf-8")
+        self._subset_backup = parallel_run.SUBSET_LIBRARY_PATH
+        parallel_run.SUBSET_LIBRARY_PATH = self._subset_file
+        self.addCleanup(self._restore_subset_path)
+        patcher = mock.patch("vecm_project.scripts.parallel_run.ensure_price_data")
+        self.mock_ensure = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        for key in ["VECM_INPUT", "VECM_OUT"]:
+            os.environ.pop(key, None)
+
+    def _restore_subset_path(self) -> None:
+        parallel_run.SUBSET_LIBRARY_PATH = self._subset_backup
+
+    def test_build_config_downloads_subset_tickers_only(self) -> None:
+        self.mock_ensure.return_value = None
+        config = parallel_run._build_config()
+        self.assertIsInstance(config.subsets, list)
+        self.mock_ensure.assert_called_once()
+        _, kwargs = self.mock_ensure.call_args
+        self.assertIn("tickers", kwargs)
+        self.assertCountEqual(kwargs["tickers"], ["BBCA.JK", "BMRI.JK", "ANTM.JK", "MDKA.JK"])
 
 
 class AlignPairTest(unittest.TestCase):
