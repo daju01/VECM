@@ -408,13 +408,7 @@ def _load_subset_library() -> List[str]:
     return _parse_subset_entries(lines, source="subset library")
 
 
-def _gather_subsets(
-    input_csv: Path,
-    override: Optional[Iterable[str]] = None,
-    *,
-    allow_prefilter: bool = True,
-    fallback_defaults: bool = True,
-) -> List[str]:
+def _gather_subsets(input_csv: Path, override: Optional[Iterable[str]] = None) -> List[str]:
     if override:
         parsed = _parse_subset_entries(list(override), source="override")
         if parsed:
@@ -427,7 +421,7 @@ def _gather_subsets(
     library = _load_subset_library()
     if library:
         return library
-    if allow_prefilter and _should_prefilter():
+    if _should_prefilter():
         pairs = _prefilter_pairs(input_csv)
         if pairs:
             LOGGER.info("Prefilter selected %s pairs", len(pairs))
@@ -513,6 +507,7 @@ def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, L
 
 
 def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerConfig:
+    ensure_price_data()
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -521,18 +516,7 @@ def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerCon
     lock_file = out_dir / ".start_gate.lock"
     stamp_file = out_dir / ".last_start_time"
     max_workers = max(1, _env_int("VECM_MAX_WORKERS", _available_workers()))
-    subsets = _gather_subsets(
-        input_csv,
-        subsets_override,
-        allow_prefilter=False,
-        fallback_defaults=False,
-    )
-    tickers = _download_tickers_for_subsets(subsets)
-    if tickers:
-        ensure_price_data(tickers=tickers)
-    else:
-        ensure_price_data()
-        subsets = _gather_subsets(input_csv, subsets_override)
+    subsets = _gather_subsets(input_csv, subsets_override)
     stage = _choose_stage(manifest_path, subsets)
     stage_int = 1 if stage.lower() == "stage2" else 0
     oos_short = os.getenv("VECM_OOS_SHORT", "2025-03-01")
