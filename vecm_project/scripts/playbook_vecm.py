@@ -417,7 +417,11 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
 def _johansen_beta(log_prices: pd.DataFrame) -> float:
     if len(log_prices) < 120:
         return float("nan")
-    vecm = VECM(log_prices, k_ar_diff=1, deterministic="ci", rank=1)
+    vecm_kwargs = {"k_ar_diff": 1, "deterministic": "ci"}
+    try:
+        vecm = VECM(log_prices, coint_rank=1, **vecm_kwargs)
+    except TypeError:
+        vecm = VECM(log_prices, rank=1, **vecm_kwargs)
     result = vecm.fit()
     beta = result.beta[:, 0]
     if len(beta) != 2 or not np.all(np.isfinite(beta)):

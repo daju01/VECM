@@ -427,7 +427,24 @@ def _gather_subsets(input_csv: Path, override: Optional[Iterable[str]] = None) -
             LOGGER.info("Prefilter selected %s pairs", len(pairs))
             return pairs
         LOGGER.info("Prefilter yielded no pairs; falling back to defaults")
-    return list(DEFAULT_SUBSETS)
+    return list(DEFAULT_SUBSETS) if fallback_defaults else []
+
+
+def _download_tickers_for_subsets(subsets: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    tickers: List[str] = []
+    for subset in subsets:
+        parts = [part.strip() for part in subset.split(",") if part.strip()]
+        for part in parts:
+            symbol = part.upper()
+            if not symbol:
+                continue
+            if "." not in symbol and not symbol.startswith("^") and "=" not in symbol:
+                symbol = f"{symbol}.JK"
+            if symbol not in seen:
+                seen.add(symbol)
+                tickers.append(symbol)
+    return tickers
 
 
 def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, List[Any]]:
