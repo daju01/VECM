@@ -1,0 +1,7 @@
+# Default pair universe for the parallel runner.
+# Edit this file to customise the ticker pairs without changing the code.
+ANTM,MDKA
+ANTM,INCO
+ANTM,AMMN
+ANTM,MBMA
+ANTM,NCKL
