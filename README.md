@@ -87,6 +87,41 @@ python -m compileall vecm_project
 The command only compiles the sources, so it runs quickly and does not require
 network access once the packages are available in your virtual environment.
 
+## Menjalankan analisis untuk ticker kustom
+
+Pipeline VECM dapat dieksekusi dengan pasangan ticker apa pun yang tersedia di
+Yahoo Finance. Gunakan opsi `--subset` untuk memberi tahu playbook pasangan mana
+yang ingin dianalisis tanpa perlu mengubah kode ataupun daftar default pada
+`parallel_run`.
+
+### Contoh satu pasangan (playbook_vecm)
+
+Perintah berikut memuat cache `adj_close_data.csv`, memastikan harga BBRI/BBNI
+tersedia (akan diunduh otomatis jika belum ada), lalu menjalankan playbook
+TVECM pada pasangan tersebut:
+
+```bash
+python -m vecm_project.scripts.playbook_vecm \
+  vecm_project/data/adj_close_data.csv \
+  --subset BBRI.JK,BBNI.JK \
+  --method TVECM
+```
+
+### Contoh multi-pair (parallel_run)
+
+Jika ingin memproses beberapa pasangan sekaligus, `parallel_run.py` menerima
+daftar subset yang sama. Pasangan yang tidak ada di cache akan otomatis
+diunduh sebelum analisis dijalankan.
+
+```bash
+python -m vecm_project.scripts.parallel_run \
+  --subs BBRI.JK BBNI.JK \
+  --subs BBCA.JK BMRI.JK
+```
+
+Set variabel lingkungan `VECM_PRICE_DOWNLOAD=force` apabila ingin memaksa
+pembaruan data harga terlepas dari keberadaan cache lokal.
+
 ## Runtime controls
 
 Pipeline demo menjalankan rangkaian penuh: skor cepat, playbook utama dengan
