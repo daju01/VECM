@@ -1,8 +1,10 @@
 """Demo entrypoint for the VECM project components."""
 from __future__ import annotations
 
+import argparse
 import logging
 import uuid
+from typing import Sequence
 
 from scripts import storage
 from scripts.dashboard_aggregator import dashboard_aggregate
@@ -17,23 +19,126 @@ from scripts.vecm_hooks import vh_run_export, vh_run_visualize
 LOGGER = storage.configure_logging("run_demo")
 
 
-def choose_tickers() -> list[str]:
+def parse_ticker_list(raw: str) -> list[str]:
+    """Parse a comma separated ticker string into a unique list."""
+
+    tickers = [item.strip() for item in raw.split(",") if item.strip()]
+    deduped = list(dict.fromkeys(ticker.upper() for ticker in tickers))
+    if len(deduped) < 2:
+        raise ValueError("Need at least two tickers in the provided list")
+    return deduped
+
+
+def prompt_for_tickers(prompt: str) -> list[str]:
+    """Request tickers from stdin using *prompt*.
+
+    If the user provides no input or stdin is unavailable, an empty list is
+    returned so the caller can fall back to an automatic selection.
+    """
+
+    try:
+        raw = input(prompt)
+    except EOFError:  # pragma: no cover - non-interactive execution
+        return []
+    if not raw.strip():
+        return []
+    return parse_ticker_list(raw)
+
+
+def _alias_map(columns: Sequence[str]) -> dict[str, str]:
+    """Build a case-insensitive alias map for the cached ticker columns."""
+
+    mapping: dict[str, str] = {}
+    for column in columns:
+        upper = column.upper()
+        mapping.setdefault(upper, column)
+        if "." in upper:
+            prefix = upper.split(".", 1)[0]
+            mapping.setdefault(prefix, column)
+        if upper.endswith(".JK"):
+            mapping.setdefault(upper[:-3], column)
+    return mapping
+
+
+def _resolve_tickers(candidates: Sequence[str], columns: Sequence[str]) -> list[str]:
+    mapping = _alias_map(columns)
+    resolved: list[str] = []
+    missing: list[str] = []
+
+    for ticker in candidates:
+        key = ticker.upper().strip()
+        column = mapping.get(key)
+        if column is None:
+            missing.append(ticker)
+            continue
+        if column not in resolved:
+            resolved.append(column)
+
+    if missing:
+        raise ValueError(
+            "Tickers not found in cached data: %s" % ", ".join(missing)
+        )
+    if len(resolved) < 2:
+        raise ValueError("Need at least two unique tickers after resolving aliases")
+    return resolved
+
+
+def choose_tickers(*, provided: Sequence[str] | None = None, ticker_prompt: str | None = None) -> list[str]:
+    """Determine which tickers to use for the demo run.
+
+    *provided* may contain a user-specified list (already parsed). If not
+    supplied, *ticker_prompt* is used to ask the user for input. Both pathways
+    are validated against the cached price data. When neither path yields a
+    selection, the first two cached tickers are returned for backwards
+    compatibility with the original behaviour.
+    """
+
     if not DATA_PATH.exists():
         ensure_price_data()
     prices = load_cached_prices()
     columns = [col for col in prices.columns if col != "Date"]
     if len(columns) < 2:
         raise ValueError("Need at least two tickers available from the streaming loader")
+
+    if provided:
+        return _resolve_tickers(provided, columns)
+
+    if ticker_prompt is not None:
+        prompted = prompt_for_tickers(ticker_prompt)
+        if prompted:
+            return _resolve_tickers(prompted, columns)
+
     return columns[:2]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the VECM demo pipeline")
+    parser.add_argument(
+        "--tickers",
+        help=(
+            "Comma separated list of tickers to use (e.g. 'BBRI,BBNI'). "
+            "Accepts raw tickers or their .JK variants."
+        ),
+    )
+    parser.add_argument(
+        "--prompt",
+        default=(
+            "Masukkan daftar ticker dipisahkan koma (kosongkan untuk default): "
+        ),
+        help="Prompt yang digunakan ketika meminta ticker melalui stdin.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     LOGGER.info("Initialising storage")
     with storage.managed_storage("demo-bootstrap") as conn:
         storage.storage_init(conn)
 
     ensure_price_data()
-    tickers = choose_tickers()
+    provided = parse_ticker_list(args.tickers) if args.tickers else None
+    tickers = choose_tickers(provided=provided, ticker_prompt=args.prompt)
     subset = ",".join(tickers)
     LOGGER.info("Using tickers: %s", tickers)
 
