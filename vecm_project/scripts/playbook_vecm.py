@@ -72,6 +72,7 @@ class PlaybookConfig:
     roll_years: float = 3.0
     oos_start: str = ""
     exit: str = "zexit"
+    z_entry: Optional[float] = None
     z_exit: float = 0.6
     z_stop: float = 0.8
     max_hold: int = 8
@@ -108,23 +109,33 @@ class PlaybookConfig:
 
 
 def _default_input_path() -> str:
+    """Return the default price cache path without forcing it to exist."""
+
     data_path = BASE_DIR / "data" / "adj_close_data.csv"
-    if not data_path.exists():
-        raise FileNotFoundError(
-            "Price data missing. Please provide 'vecm_project/data/adj_close_data.csv' or "
-            "allow the streaming loader to populate it."
-        )
     return str(data_path)
+
+
+def _ensure_default_input(path: str) -> str:
+    """Ensure the default price cache exists before returning it."""
+
+    if not os.path.exists(path):
+        LOGGER.info("Default input %s missing; invoking streaming loader", path)
+        try:
+            ensure_price_data(force_refresh=False)
+        except Exception as exc:  # pragma: no cover - download/runtime issues
+            LOGGER.warning("Price streaming failed when populating default input: %s", exc)
+    return path
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser = argparse.ArgumentParser(description="VECM/TVECM Trading Playbook")
-    parser.add_argument("input_file", nargs="?", default=_default_input_path())
+    parser.add_argument("input_file", nargs="?", default=None)
     parser.add_argument("--subset", default="")
     parser.add_argument("--method", default="TVECM")
     parser.add_argument("--roll_years", type=float, default=3.0)
     parser.add_argument("--oos_start", default="")
     parser.add_argument("--exit", default="zexit")
+    parser.add_argument("--z_entry", type=float, default=None)
     parser.add_argument("--z_exit", type=float, default=0.6)
     parser.add_argument("--z_stop", type=float, default=0.8)
     parser.add_argument("--max_hold", type=int, default=8)
@@ -156,13 +167,16 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--mom_gate_k", type=int, default=3)
     parser.add_argument("--mom_cooldown", type=int, default=2)
     args = parser.parse_args(argv)
+    input_path = str(args.input_file) if args.input_file else _ensure_default_input(_default_input_path())
+
     cfg = PlaybookConfig(
-        input_file=str(args.input_file),
+        input_file=input_path,
         subset=args.subset,
         method=args.method.upper(),
         roll_years=float(args.roll_years),
         oos_start=args.oos_start,
         exit=args.exit.lower(),
+        z_entry=float(args.z_entry) if args.z_entry is not None else None,
         z_exit=float(args.z_exit),
         z_stop=float(args.z_stop),
         max_hold=int(args.max_hold),
@@ -506,15 +520,29 @@ def kalman_dynamic_beta(y: pd.Series, x: pd.Series, beta0: float) -> Tuple[pd.Se
 def build_signals(zect: pd.Series, cfg: PlaybookConfig, gates: pd.Series) -> Tuple[pd.DataFrame, float]:
     # Determine z threshold
     if cfg.z_auto_method == "mfpt":
-        z_th, _ = _mfpt_threshold(zect, np.arange(0.8, 3.05, 0.1), cfg.z_exit, cfg.fee_buy, cfg.fee_sell, cfg.ann_days)
+        auto_th, _ = _mfpt_threshold(zect, np.arange(0.8, 3.05, 0.1), cfg.z_exit, cfg.fee_buy, cfg.fee_sell, cfg.ann_days)
     else:
         vals = zect.loc[~pd.isna(zect)]
         if cfg.oos_start:
             vals = vals[vals.index < pd.to_datetime(cfg.oos_start)]
         if vals.empty:
             vals = zect.loc[~pd.isna(zect)]
-        z_th = float(np.quantile(np.abs(vals), cfg.z_auto_q)) if not vals.empty else 1.5
-    LOGGER.info("Threshold z_th=%.3f (method=%s)", z_th, cfg.z_auto_method)
+        auto_th = float(np.quantile(np.abs(vals), cfg.z_auto_q)) if not vals.empty else 1.5
+    z_th = auto_th
+    manual_entry = cfg.z_entry
+    source = cfg.z_auto_method
+    if manual_entry is not None and np.isfinite(manual_entry):
+        if manual_entry <= 0:
+            LOGGER.warning("Ignoring non-positive z_entry override: %.3f", manual_entry)
+        else:
+            z_th = float(manual_entry)
+            source = "z_entry"
+            LOGGER.info(
+                "Manual z_entry override applied (auto=%.3f -> z_entry=%.3f)",
+                auto_th,
+                z_th,
+            )
+    LOGGER.info("Using entry threshold z_th=%.3f (source=%s)", z_th, source)
     abs_z = np.abs(zect)
     base_prob = np.where(abs_z >= np.nanquantile(abs_z, 0.75), 0.85, 0.55)
     prob_series = pd.Series(base_prob, index=abs_z.index)
@@ -720,6 +748,17 @@ def run_playbook(
         cfg_dict = default_cfg.to_dict()
         cfg_dict.update({k: v for k, v in dict(config).items() if v is not None})
         cfg = PlaybookConfig(**cfg_dict)
+    if cfg.z_entry is not None:
+        if not np.isfinite(cfg.z_entry) or cfg.z_entry <= 0:
+            LOGGER.warning("Invalid z_entry %.3f supplied; disabling manual override", cfg.z_entry)
+            cfg.z_entry = None
+        elif cfg.z_stop < cfg.z_entry:
+            LOGGER.info(
+                "Adjusting z_stop from %.3f to %.3f to respect z_entry threshold",
+                cfg.z_stop,
+                cfg.z_entry,
+            )
+            cfg.z_stop = float(cfg.z_entry)
     if cfg.seed is not None:
         np.random.seed(cfg.seed)
     run_id = dt.datetime.utcnow().strftime(RUN_ID_FMT)
@@ -736,8 +775,24 @@ def run_playbook(
     beta_series, ect = kalman_dynamic_beta(lp.iloc[:, 0], lp.iloc[:, 1], beta0)
     mect = ect.rolling(252, min_periods=20).mean()
     sect = ect.rolling(252, min_periods=20).std()
+    sect = sect.replace(0.0, np.nan)
     zect = (ect - mect) / sect
-    zect = zect.dropna()
+    zect = zect.replace([np.inf, -np.inf], np.nan)
+    zect_valid = zect.dropna()
+    if zect_valid.empty:
+        fallback_std_val = float(ect.std())
+        if np.isfinite(fallback_std_val) and fallback_std_val > 0:
+            LOGGER.warning(
+                "Z-score series empty after normalisation; falling back to global standard deviation"
+            )
+            fallback = (ect - ect.mean()) / fallback_std_val
+            zect_valid = fallback.dropna()
+    if zect_valid.empty:
+        LOGGER.warning(
+            "Z-score series still empty; synthesising flat spread to allow pipeline continuation"
+        )
+        zect_valid = pd.Series(0.0, index=lp.index)
+    zect = zect_valid
     corr_gate = _run_cor(lp.iloc[:, 0].diff(), lp.iloc[:, 1].diff(), max(cfg.gate_corr_win, 10))
     corr_gate = (corr_gate >= cfg.gate_corr_min).reindex(zect.index).fillna(False)
     hl_series = zect.rolling(252, min_periods=60).apply(_half_life, raw=False)
@@ -748,9 +803,19 @@ def run_playbook(
         combined_gate = pd.Series(True, index= zect.index)
     signals, z_th = build_signals(zect, cfg, combined_gate)
     exec_res = execute_trades(zect, signals, lp, beta_series, cfg)
-    oos_start_date = pd.to_datetime(cfg.oos_start).date() if cfg.oos_start else (zect.index[int(len(zect) * 0.7)].date())
+    if cfg.oos_start:
+        oos_start_date = pd.to_datetime(cfg.oos_start).date()
+    else:
+        base_index = zect.index if len(zect) else lp.index
+        if not len(base_index):
+            raise ValueError("Cannot determine OOS start date; no observations available")
+        cutoff_idx = int(len(base_index) * 0.7)
+        cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+        oos_start_date = base_index[cutoff_idx].date()
     metrics = compute_metrics(exec_res, cfg, oos_start_date)
     metrics["z_th"] = z_th
+    if cfg.z_entry is not None and np.isfinite(cfg.z_entry):
+        metrics["z_entry"] = float(cfg.z_entry)
     result = {
         "run_id": run_id,
         "params": cfg.to_dict(),

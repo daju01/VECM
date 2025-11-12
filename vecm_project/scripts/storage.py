@@ -25,6 +25,21 @@ DB_DIR = BASE_DIR / "out" / "db"
 DB_PATH = DB_DIR / "vecm.duckdb"
 LOG_DIR = BASE_DIR / "out" / "logs"
 
+LOGGER = logging.getLogger(__name__)
+
+DIRTY_META_TABLE = "storage_meta_dirty"
+ANALYZE_MIN_INTERVAL = dt.timedelta(hours=6)
+TRACKED_TABLES: Sequence[str] = (
+    "runs",
+    "trials",
+    "exec_metrics",
+    "storage_metrics",
+    "model_checks",
+    "pareto_front",
+    "sd_loop",
+    "dashboard_daily",
+)
+
 
 def _ensure_dirs() -> None:
     DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,6 +178,14 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
             parquet_p95_s DOUBLE
         );
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {DIRTY_META_TABLE} (
+            table_name TEXT PRIMARY KEY,
+            dirty BOOLEAN,
+            last_marked TIMESTAMP,
+            last_analyze TIMESTAMP
+        );
+        """,
     ]
     for sql in statements:
         conn.execute(sql)
@@ -179,7 +202,7 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
     }
     for table, columns in index_specs.items():
         storage_create_index(conn, table, columns)
-    storage_analyze(conn)
+    _bootstrap_dirty_meta(conn)
 
 
 def storage_create_index(
@@ -196,8 +219,86 @@ def storage_create_index(
         )
 
 
+def _bootstrap_dirty_meta(conn: duckdb.DuckDBPyConnection) -> None:
+    now = dt.datetime.utcnow()
+    for table in TRACKED_TABLES:
+        conn.execute(
+            f"""
+            INSERT INTO {DIRTY_META_TABLE} (table_name, dirty, last_marked, last_analyze)
+            VALUES (?, FALSE, ?, NULL)
+            ON CONFLICT(table_name) DO NOTHING
+            """,
+            [table, now],
+        )
+
+
+def _mark_table_dirty(conn: duckdb.DuckDBPyConnection, table: str) -> None:
+    conn.execute(
+        f"""
+        INSERT INTO {DIRTY_META_TABLE} (table_name, dirty, last_marked)
+        VALUES (?, TRUE, ?)
+        ON CONFLICT(table_name) DO UPDATE SET
+            dirty = TRUE,
+            last_marked = excluded.last_marked
+        """,
+        [table, dt.datetime.utcnow()],
+    )
+
+
+def storage_schedule_analyze(conn: duckdb.DuckDBPyConnection, table: str) -> None:
+    """Mark a table as needing statistics refresh."""
+
+    try:
+        _mark_table_dirty(conn, table)
+    except duckdb.Error as exc:  # pragma: no cover - defensive
+        LOGGER.warning("Failed to mark table %%s dirty: %%s", table, exc)
+
+
+def _eligible_dirty_tables(conn: duckdb.DuckDBPyConnection, *, force: bool) -> Iterable[str]:
+    threshold = dt.datetime.utcnow() - ANALYZE_MIN_INTERVAL
+    if force:
+        query = f"SELECT table_name FROM {DIRTY_META_TABLE} WHERE dirty"
+        rows = conn.execute(query).fetchall()
+        return [row[0] for row in rows]
+    query = f"""
+        SELECT table_name
+        FROM {DIRTY_META_TABLE}
+        WHERE dirty AND (last_analyze IS NULL OR last_analyze <= ?)
+    """
+    rows = conn.execute(query, [threshold]).fetchall()
+    return [row[0] for row in rows]
+
+
+def storage_run_maintenance(
+    conn: duckdb.DuckDBPyConnection, *, force: bool = False
+) -> None:
+    """Run pending ANALYZE statements in batch if tables are marked dirty."""
+
+    tables = list(_eligible_dirty_tables(conn, force=force))
+    if not tables:
+        return
+    now = dt.datetime.utcnow()
+    for table in tables:
+        try:
+            conn.execute(f"ANALYZE {_escape(table)}")
+            conn.execute(
+                f"""
+                UPDATE {DIRTY_META_TABLE}
+                SET dirty = FALSE,
+                    last_analyze = ?,
+                    last_marked = COALESCE(last_marked, ?)
+                WHERE table_name = ?
+                """,
+                [now, now, table],
+            )
+        except duckdb.Error as exc:  # pragma: no cover - defensive
+            LOGGER.warning("ANALYZE failed for %%s: %%s", table, exc)
+
+
 def storage_analyze(conn: duckdb.DuckDBPyConnection) -> None:
-    conn.execute("ANALYZE")
+    """Force an ANALYZE run for all dirty tables regardless of interval."""
+
+    storage_run_maintenance(conn, force=True)
 
 
 def write_run(
@@ -225,7 +326,7 @@ def write_run(
         """,
         [run_id, started, finished_at, n_workers, plan, seed_method, notes],
     )
-    conn.execute("ANALYZE runs")
+    storage_schedule_analyze(conn, "runs")
 
 
 def mark_run_finished(
@@ -237,6 +338,7 @@ def mark_run_finished(
         "UPDATE runs SET finished_at = ? WHERE run_id = ?",
         [finished_at or dt.datetime.utcnow(), run_id],
     )
+    storage_schedule_analyze(conn, "runs")
 
 
 def write_trial(
@@ -274,7 +376,7 @@ def write_trial(
             bool(pruned),
         ],
     )
-    conn.execute("ANALYZE trials")
+    storage_schedule_analyze(conn, "trials")
 
 
 def write_exec_metrics(
@@ -302,7 +404,7 @@ def write_exec_metrics(
             progress_latency_s,
         ],
     )
-    conn.execute("ANALYZE exec_metrics")
+    storage_schedule_analyze(conn, "exec_metrics")
 
 
 def write_storage_metrics(
@@ -326,7 +428,7 @@ def write_storage_metrics(
             parquet_read_p95_s,
         ],
     )
-    conn.execute("ANALYZE storage_metrics")
+    storage_schedule_analyze(conn, "storage_metrics")
 
 
 def write_model_checks(
@@ -352,7 +454,7 @@ def write_model_checks(
             bool(spec_ok),
         ],
     )
-    conn.execute("ANALYZE model_checks")
+    storage_schedule_analyze(conn, "model_checks")
 
 
 def write_pareto_front(
@@ -366,7 +468,7 @@ def write_pareto_front(
         for row in rows
     ]
     conn.executemany("INSERT INTO pareto_front VALUES (?, ?, ?)", values)
-    conn.execute("ANALYZE pareto_front")
+    storage_schedule_analyze(conn, "pareto_front")
 
 
 def write_sd_loop(
@@ -392,7 +494,7 @@ def write_sd_loop(
         "INSERT INTO sd_loop VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         values,
     )
-    conn.execute("ANALYZE sd_loop")
+    storage_schedule_analyze(conn, "sd_loop")
 
 
 def write_dashboard_daily(
@@ -420,7 +522,7 @@ def write_dashboard_daily(
         "INSERT INTO dashboard_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         values,
     )
-    conn.execute("ANALYZE dashboard_daily")
+    storage_schedule_analyze(conn, "dashboard_daily")
 
 
 def storage_write_df(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> None:
@@ -434,6 +536,7 @@ def storage_write_df(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFra
         )
     finally:
         conn.unregister(tmp_name)
+    storage_schedule_analyze(conn, table)
 
 
 def write_parquet_safely(
@@ -486,6 +589,10 @@ def managed_storage(_note: str = ""):
         storage_init(conn)
         yield conn
     finally:
+        try:
+            storage_run_maintenance(conn)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.warning("Storage maintenance failed on close: %s", exc)
         conn.close()
 
 

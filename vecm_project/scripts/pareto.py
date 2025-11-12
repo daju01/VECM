@@ -92,7 +92,7 @@ def write_pareto_front(conn, run_id: str) -> pd.DataFrame:
             "INSERT INTO pareto_front VALUES (?, ?, ?)",
             payload.itertuples(index=False, name=None),
         )
-    conn.execute("ANALYZE pareto_front")
+    storage.storage_schedule_analyze(conn, "pareto_front")
     LOGGER.info("Stored %d Pareto rows for run %s", len(payload), run_id)
     return frontier
 
