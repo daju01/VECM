@@ -89,8 +89,6 @@ def score_playbook(
         {
             "subset": pair,
             "method": method,
-            "stage": 2,
-            "notes": f"stage2_sh|pair={pair}|method={method}|horizon={horizon}|step={step}",
             "max_hold": int(max_hold),
             "cooldown": int(cooldown),
             "z_exit": float(z_exit),
@@ -98,8 +96,14 @@ def score_playbook(
             "z_stop": float(max(z_entry, z_exit)),
         }
     )
+    if "tag" not in cfg_payload or not cfg_payload["tag"]:
+        cfg_payload["tag"] = (
+            f"stage2_sh|pair={pair}|method={method}|horizon={horizon}|step={step}"
+        )
     if horizon:
-        cfg_payload.setdefault("horizon", horizon)
+        existing_tag = str(cfg_payload.get("tag", ""))
+        horizon_tag = f"horizon={horizon}"
+        cfg_payload["tag"] = f"{existing_tag}|{horizon_tag}" if existing_tag else horizon_tag
 
     cfg = PlaybookConfig(**cfg_payload)
     start = time.perf_counter()

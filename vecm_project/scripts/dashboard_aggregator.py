@@ -58,7 +58,7 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
         _fetch_scalar(
             conn,
             """
-            SELECT PERCENTILE_CONT(worker_idle_pct, 0.95) AS idle_p95
+            SELECT QUANTILE_CONT(worker_idle_pct, 0.95) AS idle_p95
             FROM exec_metrics WHERE run_id = ?
             """,
             [run_id],
@@ -89,7 +89,7 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
         _fetch_scalar(
             conn,
             """
-            SELECT PERCENTILE_CONT(maxdd, 0.95) AS dd_p95
+            SELECT QUANTILE_CONT(maxdd, 0.95) AS dd_p95
             FROM trials WHERE run_id = ? AND stage = 2
             """,
             [run_id],

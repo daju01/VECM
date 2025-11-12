@@ -15,6 +15,7 @@ LOGGER = storage.configure_logging("data_streaming")
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
+SAMPLE_DATA_PATH = DATA_DIR / "sample_adj_close.csv"
 DEFAULT_START_DATE = dt.date(2013, 1, 1)
 
 
@@ -227,6 +228,26 @@ def _write_wide(df: pd.DataFrame) -> None:
     LOGGER.info("Price cache updated at %s with %d rows", DATA_PATH, len(df))
 
 
+def _load_sample_prices() -> pd.DataFrame:
+    if not SAMPLE_DATA_PATH.exists():
+        raise FileNotFoundError(
+            "No bundled sample price data is available; unable to recover from download failure.",
+        )
+    sample = pd.read_csv(SAMPLE_DATA_PATH, parse_dates=["Date"])
+    if "Date" not in sample.columns or len(sample.columns) < 3:
+        raise ValueError(
+            f"Bundled sample price data at {SAMPLE_DATA_PATH} is malformed; expected Date plus >=2 tickers."
+        )
+    sample = sample.sort_values("Date")
+    LOGGER.warning(
+        "Falling back to bundled sample prices at %s with %d rows and %d tickers",
+        SAMPLE_DATA_PATH,
+        len(sample),
+        len(sample.columns) - 1,
+    )
+    return sample
+
+
 def _resume_dates(
     tickers: Sequence[str],
     existing: Optional[pd.DataFrame],
@@ -325,9 +346,9 @@ def ensure_price_data(
 
     combined = _merge_frames([existing, _merge_frames(new_frames)])
     if combined.empty:
-        raise FileNotFoundError(
-            "Streaming download did not yield any adjusted close data. Check ticker list or network connectivity."
-        )
+        sample = _load_sample_prices()
+        _write_wide(sample)
+        return sample
 
     wide = _tidy_to_wide(combined)
     _write_wide(wide)
@@ -349,6 +370,7 @@ def load_cached_prices(path: Optional[pathlib.Path | str] = None) -> pd.DataFram
         raise ValueError(f"Price cache at {cache_path} is missing a 'Date' column")
     else:
         df = df.sort_values("Date")
+    df = df.rename(columns={"Date": "date"})
     return df
 
 

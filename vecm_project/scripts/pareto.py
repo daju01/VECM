@@ -86,12 +86,14 @@ def write_pareto_front(conn, run_id: str) -> pd.DataFrame:
         }
     )
 
+    rows = list(payload.itertuples(index=False, name=None))
     with storage.with_transaction(conn):
         conn.execute("DELETE FROM pareto_front WHERE run_id = ?", [run_id])
-        conn.executemany(
-            "INSERT INTO pareto_front VALUES (?, ?, ?)",
-            payload.itertuples(index=False, name=None),
-        )
+        if rows:
+            conn.executemany(
+                "INSERT INTO pareto_front VALUES (?, ?, ?)",
+                rows,
+            )
     conn.execute("ANALYZE pareto_front")
     LOGGER.info("Stored %d Pareto rows for run %s", len(payload), run_id)
     return frontier

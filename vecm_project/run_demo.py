@@ -15,13 +15,14 @@ from scripts.stage2_sh import run_successive_halving
 from scripts.vecm_hooks import vh_run_export, vh_run_visualize
 
 LOGGER = storage.configure_logging("run_demo")
+DEMO_TICKERS = ["BBCA.JK", "BMRI.JK", "BBRI.JK", "TLKM.JK"]
 
 
 def choose_tickers() -> list[str]:
     if not DATA_PATH.exists():
-        ensure_price_data()
+        ensure_price_data(tickers=DEMO_TICKERS)
     prices = load_cached_prices()
-    columns = [col for col in prices.columns if col != "Date"]
+    columns = [col for col in prices.columns if col.lower() != "date"]
     if len(columns) < 2:
         raise ValueError("Need at least two tickers available from the streaming loader")
     return columns[:2]
@@ -32,7 +33,7 @@ def main() -> None:
     with storage.managed_storage("demo-bootstrap") as conn:
         storage.storage_init(conn)
 
-    ensure_price_data()
+    ensure_price_data(tickers=DEMO_TICKERS)
     tickers = choose_tickers()
     subset = ",".join(tickers)
     LOGGER.info("Using tickers: %s", tickers)
@@ -53,7 +54,7 @@ def main() -> None:
         LOGGER.warning("Hook execution failed: %s", exc)
 
     bo_run_id = f"demo_bo_{uuid.uuid4().hex[:8]}"
-    run_bo(pair=subset, cfg=base_params, run_id=bo_run_id, n_init=2, iters=3, n_jobs=1)
+    run_bo(pair=subset, cfg=base_params, run_id=bo_run_id, n_init=1, iters=1, n_jobs=1)
 
     sh_run_id = f"demo_sh_{uuid.uuid4().hex[:8]}"
     run_successive_halving(
@@ -61,7 +62,7 @@ def main() -> None:
         cfg=base_params,
         run_id=sh_run_id,
         horizons=("short", "long"),
-        n_trials=3,
+        n_trials=1,
         n_jobs=1,
     )
 
