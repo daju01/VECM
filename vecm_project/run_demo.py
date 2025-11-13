@@ -112,6 +112,9 @@ def choose_tickers(*, provided: Sequence[str] | None = None, ticker_prompt: str 
     return columns[:2]
 
 
+_PROMPT_UNSET = object()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the VECM demo pipeline")
     parser.add_argument(
@@ -127,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         const=(
             "Masukkan daftar ticker dipisahkan koma (kosongkan untuk default): "
         ),
-        default=None,
+        default=_PROMPT_UNSET,
         help=(
             "Aktifkan mode interaktif untuk memasukkan daftar ticker melalui stdin. "
             "Tanpa argumen tambahan menggunakan pesan default."
@@ -144,7 +147,8 @@ def main() -> None:
 
     ensure_price_data()
     provided = parse_ticker_list(args.tickers) if args.tickers else None
-    tickers = choose_tickers(provided=provided, ticker_prompt=args.prompt)
+    ticker_prompt = None if args.prompt is _PROMPT_UNSET else args.prompt
+    tickers = choose_tickers(provided=provided, ticker_prompt=ticker_prompt)
     subset = ",".join(tickers)
     LOGGER.info("Using tickers: %s", tickers)
 
