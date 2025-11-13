@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import uuid
 from typing import Sequence
 
@@ -103,7 +104,7 @@ def choose_tickers(*, provided: Sequence[str] | None = None, ticker_prompt: str 
     if provided:
         return _resolve_tickers(provided, columns)
 
-    if ticker_prompt is not None:
+    if ticker_prompt is not None and sys.stdin is not None and sys.stdin.isatty():
         prompted = prompt_for_tickers(ticker_prompt)
         if prompted:
             return _resolve_tickers(prompted, columns)
@@ -122,10 +123,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default=(
+        nargs="?",
+        const=(
             "Masukkan daftar ticker dipisahkan koma (kosongkan untuk default): "
         ),
-        help="Prompt yang digunakan ketika meminta ticker melalui stdin.",
+        default=None,
+        help=(
+            "Aktifkan mode interaktif untuk memasukkan daftar ticker melalui stdin. "
+            "Tanpa argumen tambahan menggunakan pesan default."
+        ),
     )
     return parser.parse_args()
 
