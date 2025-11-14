@@ -97,7 +97,7 @@ def choose_tickers(*, provided: Sequence[str] | None = None, ticker_prompt: str 
     if not DATA_PATH.exists():
         ensure_price_data()
     prices = load_cached_prices()
-    columns = [col for col in prices.columns if col != "Date"]
+    columns = [col for col in prices.columns if col.lower() != "date"]
     if len(columns) < 2:
         raise ValueError("Need at least two tickers available from the streaming loader")
 
@@ -145,10 +145,13 @@ def main() -> None:
     with storage.managed_storage("demo-bootstrap") as conn:
         storage.storage_init(conn)
 
-    ensure_price_data()
     provided = parse_ticker_list(args.tickers) if args.tickers else None
+    if provided:
+        ensure_price_data(tickers=provided)
     ticker_prompt = None if args.prompt is _PROMPT_UNSET else args.prompt
     tickers = choose_tickers(provided=provided, ticker_prompt=ticker_prompt)
+    if not provided:
+        ensure_price_data(tickers=tickers)
     subset = ",".join(tickers)
     LOGGER.info("Using tickers: %s", tickers)
 

@@ -71,6 +71,9 @@ class PlaybookConfig:
     method: str = "TVECM"
     roll_years: float = 3.0
     oos_start: str = ""
+    horizon: str = ""
+    stage: int = 0
+    notes: str = ""
     exit: str = "zexit"
     z_entry: Optional[float] = None
     z_exit: float = 0.6
@@ -134,6 +137,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--method", default="TVECM")
     parser.add_argument("--roll_years", type=float, default=3.0)
     parser.add_argument("--oos_start", default="")
+    parser.add_argument("--horizon", default="")
+    parser.add_argument("--stage", type=int, default=0)
+    parser.add_argument("--notes", default="")
     parser.add_argument("--exit", default="zexit")
     parser.add_argument("--z_entry", type=float, default=None)
     parser.add_argument("--z_exit", type=float, default=0.6)
@@ -175,6 +181,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         method=args.method.upper(),
         roll_years=float(args.roll_years),
         oos_start=args.oos_start,
+        horizon=args.horizon,
+        stage=int(args.stage),
+        notes=args.notes,
         exit=args.exit.lower(),
         z_entry=float(args.z_entry) if args.z_entry is not None else None,
         z_exit=float(args.z_exit),

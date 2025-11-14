@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import time
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
@@ -26,6 +27,7 @@ RETRY_BASE_DELAY = 0.75
 DOWNLOAD_CONTROL_ENV = "VECM_PRICE_DOWNLOAD"
 _DOWNLOAD_DISABLE = {"0", "false", "no", "off", "skip", "never"}
 _DOWNLOAD_FORCE = {"force", "always"}
+OFFLINE_FALLBACK_PATH = DATA_DIR / "offline_prices.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +219,51 @@ def _read_existing_prices() -> Optional[pd.DataFrame]:
     return tidy[["Date", "Ticker", "AdjClose"]]
 
 
+@lru_cache(maxsize=1)
+def _load_offline_table() -> pd.DataFrame:
+    if not OFFLINE_FALLBACK_PATH.exists():
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    try:
+        table = pd.read_csv(OFFLINE_FALLBACK_PATH, parse_dates=["Date"])
+    except Exception as exc:  # pragma: no cover - fallback best effort
+        LOGGER.warning("Failed to load offline fallback at %s: %s", OFFLINE_FALLBACK_PATH, exc)
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    required = {"Date", "Ticker", "AdjClose"}
+    if not required.issubset(table.columns):
+        LOGGER.warning(
+            "Offline fallback at %s missing required columns %s", OFFLINE_FALLBACK_PATH, required - set(table.columns)
+        )
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    table = table[list(required)].copy()
+    table["Ticker"] = table["Ticker"].astype(str)
+    table["AdjClose"] = pd.to_numeric(table["AdjClose"], errors="coerce")
+    table = table.dropna(subset=["AdjClose"])
+    return table
+
+
+def _offline_prices_for(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
+    table = _load_offline_table()
+    if table.empty:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    mask = (
+        (table["Ticker"].str.upper() == ticker.upper())
+        & (table["Date"] >= start)
+        & (table["Date"] <= pd.Timestamp(end))
+    )
+    subset = table.loc[mask].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    subset["Ticker"] = ticker
+    LOGGER.info(
+        "Loaded %d offline rows for %s covering %s to %s",
+        len(subset),
+        ticker,
+        subset["Date"].min().date(),
+        subset["Date"].max().date(),
+    )
+    return subset
+
+
 def _tidy_to_wide(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["Date"])
@@ -225,14 +272,17 @@ def _tidy_to_wide(df: pd.DataFrame) -> pd.DataFrame:
         .sort_index()
     )
     pivot = pivot.reset_index()
-    pivot.columns = ["Date", *[str(col) for col in pivot.columns[1:]]]
+    pivot.columns = ["date", *[str(col) for col in pivot.columns[1:]]]
     return pivot
 
 
 def _write_wide(df: pd.DataFrame) -> None:
     df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date")
+    if "date" not in df.columns and "Date" in df.columns:
+        df = df.rename(columns={"Date": "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    df = df.rename(columns={"date": "Date"})
     df.to_csv(DATA_PATH, index=False)
     LOGGER.info("Price cache updated at %s with %d rows", DATA_PATH, len(df))
 
@@ -328,6 +378,7 @@ def _resume_dates(
 def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
     if start >= pd.Timestamp(end):
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    proxy_url = os.getenv("https_proxy") or os.getenv("HTTPS_PROXY")
     try:
         history = yf.download(
             ticker,
@@ -336,12 +387,16 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
             progress=False,
             auto_adjust=False,
             threads=False,
+            proxy=proxy_url if proxy_url is not None else None,
         )
     except Exception as exc:  # pragma: no cover - network/runtime errors
         LOGGER.warning("Failed to download %s: %s", ticker, exc)
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return _offline_prices_for(ticker, start, end)
     if history.empty or "Adj Close" not in history.columns:
         LOGGER.warning("No adjusted close data returned for %s", ticker)
+        fallback = _offline_prices_for(ticker, start, end)
+        if not fallback.empty:
+            return fallback
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     frame = history.reset_index()[["Date", "Adj Close"]].rename(columns={"Adj Close": "AdjClose"})
     frame["Ticker"] = ticker
@@ -513,6 +568,10 @@ def load_cached_prices(path: Optional[pathlib.Path | str] = None) -> pd.DataFram
         raise ValueError(f"Price cache at {cache_path} is missing a 'Date' column")
     else:
         df = df.sort_values("Date")
+    if "Date" in df.columns:
+        df = df.rename(columns={"Date": "date"})
+    elif "date" not in df.columns:
+        raise ValueError(f"Price cache at {cache_path} does not expose a date column")
     return df
 
 
