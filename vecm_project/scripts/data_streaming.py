@@ -11,6 +11,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 import yfinance as yf
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from requests.utils import get_environ_proxies
+
+try:  # pragma: no cover - optional dependency for robust downloads
+    from curl_cffi import requests as curl_requests
+except Exception:  # pragma: no cover - curl_cffi not available
+    curl_requests = None
 
 from . import storage
 
@@ -26,6 +35,19 @@ RETRY_BASE_DELAY = 0.75
 DOWNLOAD_CONTROL_ENV = "VECM_PRICE_DOWNLOAD"
 _DOWNLOAD_DISABLE = {"0", "false", "no", "off", "skip", "never"}
 _DOWNLOAD_FORCE = {"force", "always"}
+YF_USER_AGENT_ENV = "VECM_YF_USER_AGENT"
+YF_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
+YF_RETRY_STATUS_CODES = (403, 429, 500, 502, 503, 504)
+YF_IMPERSONATE_ENV = "VECM_YF_IMPERSONATE"
+YF_VERIFY_ENV = "VECM_YF_VERIFY"
+YF_PROXY_AUTH_ENV = "VECM_PROXY_AUTH"
+
+
+_REQUESTS_SESSION: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +218,72 @@ def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _get_requests_session() -> Any:
+    global _REQUESTS_SESSION
+    if _REQUESTS_SESSION is not None:
+        return _REQUESTS_SESSION
+
+    user_agent = os.getenv(YF_USER_AGENT_ENV, "").strip() or YF_DEFAULT_USER_AGENT
+    impersonate = os.getenv(YF_IMPERSONATE_ENV, "chrome124").strip() or "chrome124"
+    verify_path = os.getenv(YF_VERIFY_ENV, "").strip() or os.getenv("CODEX_PROXY_CERT", "").strip()
+    proxy_auth = os.getenv(YF_PROXY_AUTH_ENV, "").strip()
+    proxies = get_environ_proxies("https://query1.finance.yahoo.com")
+
+    if curl_requests is not None:
+        session = curl_requests.Session(impersonate=impersonate, trust_env=False)
+        session.headers.setdefault("User-Agent", user_agent)
+        session.headers.setdefault(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        session.headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+        session.headers.setdefault("Host", "query1.finance.yahoo.com")
+        session.headers.setdefault("Connection", "keep-alive")
+        session.headers.setdefault("Proxy-Connection", "keep-alive")
+        session.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+        session.timeout = 30
+    else:
+        session = requests.Session()
+        session.headers.setdefault("User-Agent", user_agent)
+        session.headers.setdefault(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        session.headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+        session.headers.setdefault("Host", "query1.finance.yahoo.com")
+        session.headers.setdefault("Connection", "keep-alive")
+        session.headers.setdefault("Proxy-Connection", "keep-alive")
+        session.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+        session.trust_env = False
+        retries = Retry(
+            total=5,
+            read=5,
+            connect=5,
+            backoff_factor=0.5,
+            status_forcelist=YF_RETRY_STATUS_CODES,
+            allowed_methods=("GET", "POST"),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+    session.trust_env = False
+
+    if proxies:
+        session.proxies = proxies
+        if proxy_auth:
+            session.headers.setdefault("Proxy-Authorization", proxy_auth)
+    else:
+        session.proxies = {}
+
+    if verify_path:
+        session.verify = verify_path
+
+    _REQUESTS_SESSION = session
+    return session
+
+
 def _read_existing_prices() -> Optional[pd.DataFrame]:
     if not DATA_PATH.exists():
         return None
@@ -329,6 +417,7 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
     if start >= pd.Timestamp(end):
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     try:
+        session = _get_requests_session()
         history = yf.download(
             ticker,
             start=start.to_pydatetime().date(),
@@ -336,6 +425,7 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
             progress=False,
             auto_adjust=False,
             threads=False,
+            session=session,
         )
     except Exception as exc:  # pragma: no cover - network/runtime errors
         LOGGER.warning("Failed to download %s: %s", ticker, exc)
