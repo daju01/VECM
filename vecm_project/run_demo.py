@@ -30,6 +30,21 @@ def parse_ticker_list(raw: str) -> list[str]:
     return deduped
 
 
+def _normalise_provided_tickers(tickers: Sequence[str]) -> list[str]:
+    """Normalise raw ticker aliases to canonical symbols for downloads."""
+
+    normalised: list[str] = []
+    for ticker in tickers:
+        upper = ticker.upper().strip()
+        if not upper:
+            continue
+        if "." not in upper:
+            upper = f"{upper}.JK"
+        if upper not in normalised:
+            normalised.append(upper)
+    return normalised
+
+
 def prompt_for_tickers(prompt: str) -> list[str]:
     """Request tickers from stdin using *prompt*.
 
@@ -147,7 +162,7 @@ def main() -> None:
 
     provided = parse_ticker_list(args.tickers) if args.tickers else None
     if provided:
-        ensure_price_data(tickers=provided)
+        ensure_price_data(tickers=_normalise_provided_tickers(provided))
     ticker_prompt = None if args.prompt is _PROMPT_UNSET else args.prompt
     tickers = choose_tickers(provided=provided, ticker_prompt=ticker_prompt)
     if not provided:
