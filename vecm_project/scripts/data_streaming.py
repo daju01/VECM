@@ -227,35 +227,34 @@ def _get_requests_session() -> Any:
     user_agent = os.getenv(YF_USER_AGENT_ENV, "").strip() or YF_DEFAULT_USER_AGENT
     impersonate = os.getenv(YF_IMPERSONATE_ENV, "chrome124").strip() or "chrome124"
     verify_path = os.getenv(YF_VERIFY_ENV, "").strip() or os.getenv("CODEX_PROXY_CERT", "").strip()
+    if not verify_path:
+        for env_var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+            verify_candidate = os.getenv(env_var, "").strip()
+            if verify_candidate:
+                verify_path = verify_candidate
+                break
     proxy_auth = os.getenv(YF_PROXY_AUTH_ENV, "").strip()
     proxies = get_environ_proxies("https://query1.finance.yahoo.com")
 
     if curl_requests is not None:
-        session = curl_requests.Session(impersonate=impersonate, trust_env=False)
-        session.headers.setdefault("User-Agent", user_agent)
-        session.headers.setdefault(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        session.headers.setdefault("Accept-Language", "en-US,en;q=0.9")
-        session.headers.setdefault("Host", "query1.finance.yahoo.com")
-        session.headers.setdefault("Connection", "keep-alive")
-        session.headers.setdefault("Proxy-Connection", "keep-alive")
-        session.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+        session = curl_requests.Session(impersonate=impersonate)
+        session.headers["User-Agent"] = user_agent
+        session.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        session.headers["Accept-Language"] = "en-US,en;q=0.9"
+        session.headers["Host"] = "query1.finance.yahoo.com"
+        session.headers["Connection"] = "keep-alive"
+        session.headers["Proxy-Connection"] = "keep-alive"
+        session.headers["Accept-Encoding"] = "gzip, deflate, br"
         session.timeout = 30
     else:
         session = requests.Session()
-        session.headers.setdefault("User-Agent", user_agent)
-        session.headers.setdefault(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        session.headers.setdefault("Accept-Language", "en-US,en;q=0.9")
-        session.headers.setdefault("Host", "query1.finance.yahoo.com")
-        session.headers.setdefault("Connection", "keep-alive")
-        session.headers.setdefault("Proxy-Connection", "keep-alive")
-        session.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
-        session.trust_env = False
+        session.headers["User-Agent"] = user_agent
+        session.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        session.headers["Accept-Language"] = "en-US,en;q=0.9"
+        session.headers["Host"] = "query1.finance.yahoo.com"
+        session.headers["Connection"] = "keep-alive"
+        session.headers["Proxy-Connection"] = "keep-alive"
+        session.headers["Accept-Encoding"] = "gzip, deflate, br"
         retries = Retry(
             total=5,
             read=5,
@@ -269,12 +268,10 @@ def _get_requests_session() -> Any:
         session.mount("https://", adapter)
         session.mount("http://", adapter)
 
-    session.trust_env = False
-
     if proxies:
         session.proxies = proxies
         if proxy_auth:
-            session.headers.setdefault("Proxy-Authorization", proxy_auth)
+            session.headers["Proxy-Authorization"] = proxy_auth
     else:
         session.proxies = {}
 
