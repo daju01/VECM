@@ -210,6 +210,15 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
     for sql in statements:
         conn.execute(sql)
 
+    # Backward compatibility for widened trials schema
+    trials_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('trials')").fetchall()
+    }
+    if "alpha_ec" not in trials_columns:
+        conn.execute("ALTER TABLE trials ADD COLUMN alpha_ec DOUBLE")
+    if "half_life_full" not in trials_columns:
+        conn.execute("ALTER TABLE trials ADD COLUMN half_life_full DOUBLE")
+
     index_specs = {
         "runs": ("run_id",),
         "trials": ("run_id", "trial_id"),
@@ -383,7 +392,22 @@ def write_trial(
 ) -> None:
     conn.execute(
         """
-        INSERT INTO trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO trials (
+            run_id,
+            trial_id,
+            stage,
+            pair,
+            method,
+            params,
+            horizon,
+            eval_time_s,
+            sharpe_oos,
+            maxdd,
+            turnover,
+            alpha_ec,
+            half_life_full,
+            pruned
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             run_id,
