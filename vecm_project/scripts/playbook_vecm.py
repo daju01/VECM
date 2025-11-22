@@ -48,6 +48,8 @@ from statsmodels.tsa.vector_ar.vecm import VECM
 
 from . import storage
 from .data_streaming import ensure_price_data
+from .ms_spread import compute_regime_prob, fit_ms_spread
+from .short_term_signals import build_short_term_signals
 
 # ---------------------------------------------------------------------------
 # Logging / paths -----------------------------------------------------------
@@ -217,6 +219,14 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         mom_gate_k=int(args.mom_gate_k),
         mom_cooldown=int(args.mom_cooldown),
     )
+
+    # Allow quick overrides via environment variables without touching CLI defaults.
+    env_fee_buy = os.getenv("PLAYBOOK_FEE_BUY")
+    env_fee_sell = os.getenv("PLAYBOOK_FEE_SELL")
+    if env_fee_buy is not None:
+        cfg.fee_buy = float(env_fee_buy)
+    if env_fee_sell is not None:
+        cfg.fee_sell = float(env_fee_sell)
     return cfg
 
 
@@ -263,6 +273,38 @@ def _half_life(series: pd.Series) -> float:
     if not np.isfinite(beta) or abs(beta) >= 1:
         return float("inf")
     return -math.log(2) / math.log(abs(beta))
+
+
+def _convergence_stats(zect: pd.Series) -> Tuple[float, float]:
+    """
+    Estimasi kecepatan konvergensi spread pada full sample.
+
+    Returns
+    -------
+    alpha_ec : float
+        Koefisien error–correction (≈ phi - 1 dari AR(1)).
+    half_life : float
+        Half-life dalam hari (unit sama dengan step waktu index).
+        Mengembalikan +inf kalau tidak bisa diestimasi.
+    """
+
+    vals = zect.dropna().values
+    if len(vals) < 60:
+        return float("nan"), float("inf")
+
+    y = vals[1:]
+    x = vals[:-1]
+    if len(y) < 10:
+        return float("nan"), float("inf")
+
+    beta = np.polyfit(x, y, 1)[0]
+    if not np.isfinite(beta) or abs(beta) >= 1:
+        return float("nan"), float("inf")
+
+    half_life = -math.log(2.0) / math.log(abs(beta))
+    alpha_ec = beta - 1.0
+
+    return float(alpha_ec), float(half_life)
 
 
 def _run_cor(left: pd.Series, right: pd.Series, window: int) -> pd.Series:
@@ -530,7 +572,14 @@ def kalman_dynamic_beta(y: pd.Series, x: pd.Series, beta0: float) -> Tuple[pd.Se
 # ---------------------------------------------------------------------------
 # Signal & execution --------------------------------------------------------
 # ---------------------------------------------------------------------------
-def build_signals(zect: pd.Series, cfg: PlaybookConfig, gates: pd.Series) -> Tuple[pd.DataFrame, float]:
+def build_signals(
+    zect: pd.Series,
+    cfg: PlaybookConfig,
+    gates: pd.Series,
+    *,
+    delta_score: Optional[pd.Series] = None,
+    p_regime: Optional[pd.Series] = None,
+) -> Tuple[pd.DataFrame, float]:
     # Determine z threshold
     if cfg.z_auto_method == "mfpt":
         auto_th, _ = _mfpt_threshold(zect, np.arange(0.8, 3.05, 0.1), cfg.z_exit, cfg.fee_buy, cfg.fee_sell, cfg.ann_days)
@@ -557,10 +606,24 @@ def build_signals(zect: pd.Series, cfg: PlaybookConfig, gates: pd.Series) -> Tup
             )
     LOGGER.info("Using entry threshold z_th=%.3f (source=%s)", z_th, source)
     abs_z = np.abs(zect)
-    base_prob = np.where(abs_z >= np.nanquantile(abs_z, 0.75), 0.85, 0.55)
-    prob_series = pd.Series(base_prob, index=abs_z.index)
+
+    if p_regime is not None:
+        prob_series = p_regime.reindex(zect.index).astype(float)
+        if prob_series.isna().any():
+            base_prob = np.where(abs_z >= np.nanquantile(abs_z, 0.75), 0.85, 0.55)
+            prob_series = prob_series.fillna(pd.Series(base_prob, index=abs_z.index))
+        LOGGER.info("Using MS-spread regime probabilities for entry gating")
+    else:
+        base_prob = np.where(abs_z >= np.nanquantile(abs_z, 0.75), 0.85, 0.55)
+        prob_series = pd.Series(base_prob, index=abs_z.index)
+
     enter_long = (zect <= -z_th) & (prob_series >= cfg.p_th)
     enter_short = (zect >= z_th) & (prob_series >= cfg.p_th)
+
+    if delta_score is not None:
+        ds = delta_score.reindex(zect.index).astype(float)
+        enter_long = enter_long & (ds < 0)
+        enter_short = enter_short & (ds > 0)
     gates = gates.reindex(zect.index).fillna(False)
     if cfg.gate_enforce:
         enter_long &= gates
@@ -569,7 +632,9 @@ def build_signals(zect: pd.Series, cfg: PlaybookConfig, gates: pd.Series) -> Tup
     short_conf = _confirm_streak(enter_short, cfg.regime_confirm)
     long_cd = _cooldown(long_conf, cfg.cooldown)
     short_cd = _cooldown(short_conf, cfg.cooldown)
-    signals = pd.DataFrame({"long": long_cd.astype(float), "short": short_cd.astype(float)}, index= zect.index, dtype=float)
+    signals = pd.DataFrame({"long": long_cd.astype(float), "short": short_cd.astype(float)}, index=zect.index, dtype=float)
+    if delta_score is not None:
+        signals["delta_score"] = delta_score.reindex(zect.index)
     # Enforce long-only patch
     signals["short"] = 0.0
     if cfg.mom_enable:
@@ -601,15 +666,26 @@ class ExecutionResult:
     ret_core: pd.Series
     cost: pd.Series
     trades: pd.DataFrame
+    p_regime: Optional[pd.Series] = None
+    delta_score: Optional[pd.Series] = None
 
 
-def execute_trades(zect: pd.Series, signals: pd.DataFrame, lp_pair: pd.DataFrame,
-                   beta_series: pd.Series, cfg: PlaybookConfig) -> ExecutionResult:
+def execute_trades(
+    zect: pd.Series,
+    signals: pd.DataFrame,
+    lp_pair: pd.DataFrame,
+    beta_series: pd.Series,
+    cfg: PlaybookConfig,
+    p_regime: Optional[pd.Series] = None,
+    delta_score: Optional[pd.Series] = None,
+) -> ExecutionResult:
     idx = zect.index
     signals = signals.reindex(idx).fillna(0.0)
     lp_pair = lp_pair.reindex(idx).fillna(method="ffill").dropna()
     beta_series = beta_series.reindex(lp_pair.index).fillna(method="ffill")
     zect = zect.reindex(lp_pair.index)
+    if p_regime is not None:
+        p_regime = p_regime.reindex(lp_pair.index)
     r1 = lp_pair.iloc[:, 0].diff().fillna(0.0)
     r2 = lp_pair.iloc[:, 1].diff().fillna(0.0)
     beta_vals = beta_series.fillna(beta_series.mean()).to_numpy()
@@ -709,37 +785,113 @@ def execute_trades(zect: pd.Series, signals: pd.DataFrame, lp_pair: pd.DataFrame
     ret_net = ret_core - cost_series
     ret_net.name = "ret"
     trades_df = pd.DataFrame(trades)
-    return ExecutionResult(pos=pos_series, ret=ret_net, ret_core=ret_core, cost=cost_series, trades=trades_df)
+    return ExecutionResult(
+        pos=pos_series,
+        ret=ret_net,
+        ret_core=ret_core,
+        cost=cost_series,
+        trades=trades_df,
+        p_regime=p_regime,
+        delta_score=delta_score,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Metrics -------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-def compute_metrics(exec_res: ExecutionResult, cfg: PlaybookConfig,
-                    oos_start: dt.date) -> Dict[str, float]:
+def compute_metrics(
+    exec_res: ExecutionResult,
+    cfg: PlaybookConfig,
+    oos_start: dt.date,
+) -> Dict[str, float]:
+    """Compute per-run performance metrics.
+
+    Tambahan:
+    - n_trades
+    - avg_hold_days
+    - turnover_annualised (turnover per tahun, berdasarkan posisi OOS)
+    """
+    # --- trade-based stats dulu ---
+    trades = getattr(exec_res, "trades", None)
+    if trades is not None and not trades.empty:
+        n_trades = int(trades.shape[0])
+        if "days" in trades.columns:
+            avg_hold_days = float(trades["days"].mean())
+        else:
+            avg_hold_days = 0.0
+    else:
+        n_trades = 0
+        avg_hold_days = 0.0
+
+    p_regime = getattr(exec_res, "p_regime", None)
+    if isinstance(p_regime, pd.Series) and not p_regime.empty:
+        p_mr_mean = float(np.nanmean(p_regime))
+        pos_mask = exec_res.pos.reindex(p_regime.index).fillna(0.0) != 0
+        if pos_mask.any():
+            p_mr_inpos = float(np.nanmean(p_regime[pos_mask]))
+        else:
+            p_mr_inpos = float("nan")
+    else:
+        p_mr_mean = float("nan")
+        p_mr_inpos = float("nan")
+
     ret = exec_res.ret
+
+    # Kalau sama sekali tidak ada return, kembalikan metrik default
     if ret.empty:
-        return {"sharpe_oos": 0.0, "maxdd": 0.0, "turnover": 0.0}
+        return {
+            "sharpe_oos": 0.0,
+            "maxdd": 0.0,
+            "turnover": 0.0,
+            "turnover_annualised": 0.0,
+            "n_trades": n_trades,
+            "avg_hold_days": avg_hold_days,
+            "p_mr_mean": p_mr_mean,
+            "p_mr_inpos_mean": p_mr_inpos,
+            "cagr": 0.0,
+            "nav_oos": 1.0,
+        }
+
+    # --- OOS mask & NAV ---
     mask_oos = ret.index.date >= oos_start
     ret_oos = ret[mask_oos]
     if ret_oos.empty:
         ret_oos = ret
+
     nav = (1 + ret_oos).cumprod()
     nav0 = nav.iloc[0] if not nav.empty else 1.0
     nav1 = nav.iloc[-1] if not nav.empty else 1.0
+
     ann_days = cfg.ann_days if cfg.ann_days else 252
     total_days = max(len(ret_oos), 1)
     cagr = (nav1 / nav0) ** (ann_days / total_days) - 1 if nav0 > 0 and nav1 > 0 else 0.0
+
     dd = nav / nav.cummax() - 1
     maxdd = float(dd.min()) if not dd.empty else 0.0
+
     mu = float(ret_oos.mean())
     sd = float(ret_oos.std())
     sharpe = (mu / sd) * math.sqrt(252) if sd > 0 else 0.0
-    turnover = float(np.abs(exec_res.pos.diff().fillna(0)).sum())
+
+    # --- Turnover: dihitung di horizon OOS ---
+    pos = exec_res.pos
+    pos_oos = pos[mask_oos]
+    if pos_oos.empty:
+        pos_oos = pos
+
+    turnover_total = float(np.abs(pos_oos.diff().fillna(0)).sum())
+    days_pos = max(len(pos_oos), 1)
+    turnover_annualised = float(turnover_total * (ann_days / days_pos))
+
     return {
         "sharpe_oos": float(sharpe),
         "maxdd": float(maxdd),
-        "turnover": turnover,
+        "turnover": float(turnover_total),
+        "turnover_annualised": float(turnover_annualised),
+        "n_trades": int(n_trades),
+        "avg_hold_days": float(avg_hold_days),
+        "p_mr_mean": float(p_mr_mean),
+        "p_mr_inpos_mean": float(p_mr_inpos),
         "cagr": float(cagr),
         "nav_oos": float(nav1),
     }
@@ -780,6 +932,14 @@ def run_playbook(
         df = data_frame.copy(deep=True)
     else:
         df = load_and_validate_data(cfg.input_file)
+
+    short_panel: Optional[pd.DataFrame] = None
+    try:
+        short_panel = build_short_term_signals(df, market_col="^JKSE")
+        LOGGER.info("Short-term signals panel built with shape %s", short_panel.shape)
+    except Exception as exc:
+        LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
+
     df_clean, tickers = preprocess_data(df, cfg)
     selected_l, selected_r, beta0 = select_pair(df_clean, cfg)
     LOGGER.info("Selected pair: %s ~ %s | beta0=%.4f", selected_l, selected_r, beta0)
@@ -806,6 +966,31 @@ def run_playbook(
         )
         zect_valid = pd.Series(0.0, index=lp.index)
     zect = zect_valid
+
+    delta_score: Optional[pd.Series] = None
+    if short_panel is not None:
+        try:
+            score_l = short_panel[selected_l].reindex(zect.index)
+            score_r = short_panel[selected_r].reindex(zect.index)
+            delta_score = (score_l - score_r).astype(float)
+        except KeyError:
+            LOGGER.warning(
+                "Short-term signals missing for %s or %s; disabling delta_score overlay",
+                selected_l,
+                selected_r,
+            )
+
+    # Regime switching model on the spread to infer mean-reverting regime probability
+    try:
+        ms_model = fit_ms_spread(zect)
+        p_mr_series = compute_regime_prob(ms_model, zect)
+    except Exception as exc:
+        LOGGER.warning("MS spread modelling failed; falling back to flat regime prob: %s", exc)
+        p_mr_series = pd.Series(0.7, index=zect.index)
+
+    # Estimasi parameter konvergensi spread pada full sample
+    alpha_ec, half_life_full = _convergence_stats(zect)
+
     corr_gate = _run_cor(lp.iloc[:, 0].diff(), lp.iloc[:, 1].diff(), max(cfg.gate_corr_win, 10))
     corr_gate = (corr_gate >= cfg.gate_corr_min).reindex(zect.index).fillna(False)
     hl_series = zect.rolling(252, min_periods=60).apply(_half_life, raw=False)
@@ -813,9 +998,23 @@ def run_playbook(
     if cfg.gate_enforce:
         combined_gate = (corr_gate & hl_gate).reindex(zect.index).fillna(False)
     else:
-        combined_gate = pd.Series(True, index= zect.index)
-    signals, z_th = build_signals(zect, cfg, combined_gate)
-    exec_res = execute_trades(zect, signals, lp, beta_series, cfg)
+        combined_gate = pd.Series(True, index=zect.index)
+    signals, z_th = build_signals(
+        zect,
+        cfg,
+        combined_gate,
+        delta_score=delta_score,
+        p_regime=p_mr_series,
+    )
+    exec_res = execute_trades(
+        zect,
+        signals,
+        lp,
+        beta_series,
+        cfg,
+        p_regime=p_mr_series,
+        delta_score=delta_score,
+    )
     if cfg.oos_start:
         oos_start_date = pd.to_datetime(cfg.oos_start).date()
     else:
@@ -826,6 +1025,8 @@ def run_playbook(
         cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
         oos_start_date = base_index[cutoff_idx].date()
     metrics = compute_metrics(exec_res, cfg, oos_start_date)
+    metrics["alpha_ec"] = alpha_ec
+    metrics["half_life_full"] = half_life_full
     metrics["z_th"] = z_th
     if cfg.z_entry is not None and np.isfinite(cfg.z_entry):
         metrics["z_entry"] = float(cfg.z_entry)
@@ -880,7 +1081,13 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
     manifest_lock = manifest_path.with_suffix(".lock")
 
     _df_to_csv(exec_res.pos.to_frame("pos"), pos_path)
-    _df_to_csv(pd.DataFrame({"ret": exec_res.ret, "cost": exec_res.cost}), ret_path)
+
+    ret_df = pd.DataFrame({"ret": exec_res.ret, "cost": exec_res.cost})
+    if getattr(exec_res, "p_regime", None) is not None:
+        ret_df["p_regime"] = exec_res.p_regime
+    if getattr(exec_res, "delta_score", None) is not None:
+        ret_df["delta_score"] = exec_res.delta_score
+    _df_to_csv(ret_df, ret_path)
     if not exec_res.trades.empty:
         trades_df = exec_res.trades.copy()
         if "open_date" in trades_df.columns:
@@ -932,6 +1139,12 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
                 "z_th": result["metrics"].get("z_th"),
             },
             spec_ok=True,
+        )
+        storage.write_regime_stats(
+            conn,
+            run_id,
+            p_mr_mean=float(result["metrics"].get("p_mr_mean", math.nan)),
+            p_mr_inpos_mean=float(result["metrics"].get("p_mr_inpos_mean", math.nan)),
         )
 
 

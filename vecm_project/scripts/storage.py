@@ -33,6 +33,7 @@ TRACKED_TABLES: Sequence[str] = (
     "runs",
     "trials",
     "exec_metrics",
+    "trade_stats",
     "storage_metrics",
     "model_checks",
     "pareto_front",
@@ -112,6 +113,8 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
             sharpe_oos DOUBLE,
             maxdd DOUBLE,
             turnover DOUBLE,
+            alpha_ec DOUBLE,
+            half_life_full DOUBLE,
             pruned BOOLEAN
         );
         """,
@@ -124,6 +127,21 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
             worker_idle_pct DOUBLE,
             chunk_size INT,
             progress_latency_s DOUBLE
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS trade_stats (
+            run_id TEXT PRIMARY KEY,
+            n_trades INT,
+            avg_hold_days DOUBLE,
+            turnover_annualised DOUBLE
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS regime_stats (
+            run_id TEXT PRIMARY KEY,
+            p_mr_mean DOUBLE,
+            p_mr_inpos_mean DOUBLE
         );
         """,
         """
@@ -175,7 +193,9 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
             dd_p95 DOUBLE,
             ttr_days DOUBLE,
             duckdb_q_p95_s DOUBLE,
-            parquet_p95_s DOUBLE
+            parquet_p95_s DOUBLE,
+            n_trades INT,
+            turnover_annualised DOUBLE
         );
         """,
         f"""
@@ -194,6 +214,8 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
         "runs": ("run_id",),
         "trials": ("run_id", "trial_id"),
         "exec_metrics": ("run_id",),
+        "trade_stats": ("run_id",),
+        "regime_stats": ("run_id",),
         "storage_metrics": ("run_id",),
         "model_checks": ("run_id", "pair"),
         "pareto_front": ("run_id",),
@@ -355,11 +377,13 @@ def write_trial(
     sharpe_oos: float,
     maxdd: float,
     turnover: float,
+    alpha_ec: float | None = None,
+    half_life_full: float | None = None,
     pruned: bool = False,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO trials VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             run_id,
@@ -373,6 +397,8 @@ def write_trial(
             float(sharpe_oos),
             float(maxdd),
             float(turnover),
+            alpha_ec,
+            half_life_full,
             bool(pruned),
         ],
     )
@@ -429,6 +455,56 @@ def write_storage_metrics(
         ],
     )
     storage_schedule_analyze(conn, "storage_metrics")
+
+
+def write_trade_stats(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: str,
+    *,
+    n_trades: int,
+    avg_hold_days: float,
+    turnover_annualised: float,
+) -> None:
+    """Upsert statistik trading per run ke tabel trade_stats."""
+    conn.execute(
+        """
+        INSERT INTO trade_stats (run_id, n_trades, avg_hold_days, turnover_annualised)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (run_id) DO UPDATE SET
+            n_trades = excluded.n_trades,
+            avg_hold_days = excluded.avg_hold_days,
+            turnover_annualised = excluded.turnover_annualised
+        """,
+        [
+            run_id,
+            int(n_trades),
+            float(avg_hold_days),
+            float(turnover_annualised),
+        ],
+    )
+    storage_schedule_analyze(conn, "trade_stats")
+
+
+def write_regime_stats(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: str,
+    *,
+    p_mr_mean: float,
+    p_mr_inpos_mean: float,
+) -> None:
+    """Upsert ringkasan probabilitas regime MR per run."""
+
+    conn.execute(
+        """
+        INSERT INTO regime_stats (run_id, p_mr_mean, p_mr_inpos_mean)
+        VALUES (?, ?, ?)
+        ON CONFLICT (run_id) DO UPDATE SET
+            p_mr_mean = excluded.p_mr_mean,
+            p_mr_inpos_mean = excluded.p_mr_inpos_mean
+        """,
+        [run_id, float(p_mr_mean), float(p_mr_inpos_mean)],
+    )
+    storage_schedule_analyze(conn, "regime_stats")
 
 
 def write_model_checks(
@@ -515,11 +591,13 @@ def write_dashboard_daily(
             row.get("ttr_days"),
             row.get("duckdb_q_p95_s"),
             row.get("parquet_p95_s"),
+            row.get("n_trades"),
+            row.get("turnover_annualised"),
         )
         for row in rows
     ]
     conn.executemany(
-        "INSERT INTO dashboard_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO dashboard_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         values,
     )
     storage_schedule_analyze(conn, "dashboard_daily")
