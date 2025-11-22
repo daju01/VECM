@@ -215,6 +215,8 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
     for sql in statements:
         conn.execute(sql)
 
+    _migrate_dashboard_daily(conn)
+
     index_specs = {
         "runs": ("run_id",),
         "trials": ("run_id", "trial_id"),
@@ -230,6 +232,26 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
     for table, columns in index_specs.items():
         storage_create_index(conn, table, columns)
     _bootstrap_dirty_meta(conn)
+
+
+def _migrate_dashboard_daily(conn: duckdb.DuckDBPyConnection) -> None:
+    """Ensure dashboard_daily includes factor-aware overlay columns."""
+
+    required_columns = {
+        "avg_p_regime": "DOUBLE",
+        "avg_abs_delta_score_pos": "DOUBLE",
+        "avg_abs_delta_mom12_pos": "DOUBLE",
+        "avg_delta_value_entry": "DOUBLE",
+        "avg_delta_quality_entry": "DOUBLE",
+    }
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info('dashboard_daily')").fetchall()
+    }
+    for column, column_type in required_columns.items():
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE dashboard_daily ADD COLUMN {column} {column_type}"
+            )
 
 
 def storage_create_index(
