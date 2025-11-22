@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -107,12 +108,28 @@ def score_playbook(
     result = run_playbook(cfg, persist=False, data_frame=data_frame)
     elapsed = time.perf_counter() - start
     metrics = result.get("metrics", {})
+    sharpe = float(metrics.get("sharpe_oos", 0.0))
+    turnover = float(metrics.get("turnover", 0.0))
+    turnover_ann = float(metrics.get("turnover_annualised", turnover))
+
+    lambda_str = os.getenv("STAGE2_LAMBDA_TURNOVER", "0.01")
+    try:
+        lambda_turnover = float(lambda_str)
+    except ValueError:
+        lambda_turnover = 0.01
+
+    score = sharpe - lambda_turnover * turnover_ann
+    loss = -score
+
     diagnostics = {
-        "loss": float(-metrics.get("sharpe_oos", 0.0)),
+        "loss": float(loss),
         "eval_time_s": float(elapsed),
-        "sharpe_oos": float(metrics.get("sharpe_oos", 0.0)),
+        "sharpe_oos": sharpe,
         "maxdd": float(metrics.get("maxdd", 0.0)),
-        "turnover": float(metrics.get("turnover", 0.0)),
+        "turnover": turnover,
+        "turnover_annualised": turnover_ann,
+        "alpha_ec": float(metrics.get("alpha_ec", math.nan)),
+        "half_life_full": float(metrics.get("half_life_full", math.nan)),
     }
     return diagnostics
 
@@ -252,6 +269,8 @@ def run_successive_halving(
                     sharpe_oos=diagnostics["sharpe_oos"],
                     maxdd=diagnostics["maxdd"],
                     turnover=diagnostics["turnover"],
+                    alpha_ec=diagnostics.get("alpha_ec"),
+                    half_life_full=diagnostics.get("half_life_full"),
                     pruned=bool(is_pruned and step == rung_records[-1]["step"]),
                 )
 

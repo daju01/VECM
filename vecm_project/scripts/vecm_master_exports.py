@@ -207,8 +207,14 @@ def build_daily_panel(config: ExportConfig, manifest_row: pd.Series, lhs: str, r
     px["r_lhs"] = np.log(px["price_lhs"]).diff()
     px["r_rhs"] = np.log(px["price_rhs"]).diff()
 
+    ret_cols = ["date", "ret_net", "cost"]
+    if "p_regime" in returns_df.columns:
+        ret_cols.append("p_regime")
+    if "delta_score" in returns_df.columns:
+        ret_cols.append("delta_score")
+
     daily = (
-        pd.merge(returns_df[["date", "ret_net", "cost"]], positions_df[["date", "pos"]], on="date", how="outer")
+        pd.merge(returns_df[ret_cols], positions_df[["date", "pos"]], on="date", how="outer")
         .merge(px, on="date", how="left")
         .sort_values("date")
         .reset_index(drop=True)

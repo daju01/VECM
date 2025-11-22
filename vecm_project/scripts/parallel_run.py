@@ -25,6 +25,7 @@ from .playbook_vecm import (
     load_and_validate_data,
     parse_args,
     run_playbook,
+    _half_life,
 )
 
 try:  # pragma: no cover - fcntl unavailable on Windows
@@ -255,15 +256,33 @@ def _prefilter_pairs(
         return []
     if df.shape[1] < 3:
         return []
+
     date_col = df.columns[0]
     df[date_col] = pd.to_datetime(df[date_col])
+
+    # Hanya ambil saham ekuitas (.JK)
     equities = df.loc[:, df.columns.str.endswith(".JK")]
     if equities.shape[1] < 2:
         return []
+
+    # Window terakhir sebagai basis screening
     tail = equities.tail(last_n)
+    if tail.shape[0] < 60:
+        return []
+
     corr = tail.corr()
+
+    # Ambil batas half-life dari default PlaybookConfig (fallback = 90 hari)
+    try:
+        default_cfg = parse_args([])
+        half_life_max = float(getattr(default_cfg, "half_life_max", 90.0))
+    except Exception:
+        half_life_max = 90.0
+
     pairs: List[tuple[str, str, float]] = []
     cols = list(corr.columns)
+
+    # 1) Screening awal by korelasi
     for i in range(len(cols)):
         for j in range(i + 1, len(cols)):
             val = corr.iloc[i, j]
@@ -273,16 +292,48 @@ def _prefilter_pairs(
                 lhs = cols[i].replace(".JK", "")
                 rhs = cols[j].replace(".JK", "")
                 pairs.append((lhs, rhs, abs(val)))
+
+    # Urut dari korelasi tertinggi ke bawah
     pairs.sort(key=lambda item: item[2], reverse=True)
+
     unique: List[str] = []
     seen: set[str] = set()
+
+    # 2) Filter tambahan: half-life spread harus cukup pendek
     for lhs, rhs, _ in pairs:
         key = f"{lhs},{rhs}"
-        if key not in seen:
-            unique.append(key)
-            seen.add(key)
+        if key in seen:
+            continue
+
+        lhs_col = _match_price_column(equities.columns, lhs)
+        rhs_col = _match_price_column(equities.columns, rhs)
+        if not lhs_col or not rhs_col:
+            continue
+
+        sub = tail[[lhs_col, rhs_col]].dropna()
+        if sub.shape[0] < 60:
+            continue
+
+        log_prices = np.log(sub)
+        y = log_prices.iloc[:, 0]
+        x = log_prices.iloc[:, 1]
+
+        denom = float(np.dot(x, x))
+        if not np.isfinite(denom) or denom == 0.0:
+            continue
+
+        beta = float(np.dot(x, y) / denom)
+        spread = y - beta * x
+
+        hl_val = _half_life(spread)
+        if not np.isfinite(hl_val) or hl_val > half_life_max:
+            continue
+
+        unique.append(key)
+        seen.add(key)
         if len(unique) >= top_k:
             break
+
     return unique
 
 

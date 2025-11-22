@@ -1,4 +1,8 @@
-"""Demo entrypoint for the VECM project components."""
+"""Demo entrypoint for the VECM project components.
+
+Demo ini menjalankan satu pass playbook (regime-aware + short-term overlay)
+dan kemudian Stage-2 Bayesian optimisation untuk satu pair pilihan Anda.
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,177 +16,132 @@ from scripts.dashboard_aggregator import dashboard_aggregate
 from scripts.data_streaming import DATA_PATH, ensure_price_data, load_cached_prices
 from scripts.pareto import write_pareto_front
 from scripts.playbook_api import playbook_score_once
-from scripts.playbook_vecm import pipeline
 from scripts.stage2_bo import run_bo
-from scripts.stage2_sh import run_successive_halving
-from scripts.vecm_hooks import vh_run_export, vh_run_visualize
 
-LOGGER = storage.configure_logging("run_demo")
+LOGGER = logging.getLogger(__name__)
 
 
-def parse_ticker_list(raw: str) -> list[str]:
-    """Parse a comma separated ticker string into a unique list."""
-
-    tickers = [item.strip() for item in raw.split(",") if item.strip()]
-    deduped = list(dict.fromkeys(ticker.upper() for ticker in tickers))
-    if len(deduped) < 2:
-        raise ValueError("Need at least two tickers in the provided list")
-    return deduped
-
-
-def prompt_for_tickers(prompt: str) -> list[str]:
-    """Request tickers from stdin using *prompt*.
-
-    If the user provides no input or stdin is unavailable, an empty list is
-    returned so the caller can fall back to an automatic selection.
-    """
-
-    try:
-        raw = input(prompt)
-    except EOFError:  # pragma: no cover - non-interactive execution
-        return []
-    if not raw.strip():
-        return []
-    return parse_ticker_list(raw)
-
-
-def _alias_map(columns: Sequence[str]) -> dict[str, str]:
-    """Build a case-insensitive alias map for the cached ticker columns."""
-
-    mapping: dict[str, str] = {}
-    for column in columns:
-        upper = column.upper()
-        mapping.setdefault(upper, column)
-        if "." in upper:
-            prefix = upper.split(".", 1)[0]
-            mapping.setdefault(prefix, column)
-        if upper.endswith(".JK"):
-            mapping.setdefault(upper[:-3], column)
-    return mapping
-
-
-def _resolve_tickers(candidates: Sequence[str], columns: Sequence[str]) -> list[str]:
-    mapping = _alias_map(columns)
-    resolved: list[str] = []
-    missing: list[str] = []
-
-    for ticker in candidates:
-        key = ticker.upper().strip()
-        column = mapping.get(key)
-        if column is None:
-            missing.append(ticker)
-            continue
-        if column not in resolved:
-            resolved.append(column)
-
-    if missing:
-        raise ValueError(
-            "Tickers not found in cached data: %s" % ", ".join(missing)
-        )
-    if len(resolved) < 2:
-        raise ValueError("Need at least two unique tickers after resolving aliases")
-    return resolved
-
-
-def choose_tickers(*, provided: Sequence[str] | None = None, ticker_prompt: str | None = None) -> list[str]:
-    """Determine which tickers to use for the demo run.
-
-    *provided* may contain a user-specified list (already parsed). If not
-    supplied, *ticker_prompt* is used to ask the user for input. Both pathways
-    are validated against the cached price data. When neither path yields a
-    selection, the first two cached tickers are returned for backwards
-    compatibility with the original behaviour.
-    """
-
-    if not DATA_PATH.exists():
-        ensure_price_data()
-    prices = load_cached_prices()
-    columns = [col for col in prices.columns if col.lower() != "date"]
-    if len(columns) < 2:
-        raise ValueError("Need at least two tickers available from the streaming loader")
-
-    if provided:
-        return _resolve_tickers(provided, columns)
-
-    if ticker_prompt is not None and sys.stdin is not None and sys.stdin.isatty():
-        prompted = prompt_for_tickers(ticker_prompt)
-        if prompted:
-            return _resolve_tickers(prompted, columns)
-
-    return columns[:2]
-
-
-_PROMPT_UNSET = object()
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the VECM demo pipeline")
-    parser.add_argument(
-        "--tickers",
-        help=(
-            "Comma separated list of tickers to use (e.g. 'BBRI,BBNI'). "
-            "Accepts raw tickers or their .JK variants."
-        ),
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="VECM demo: regime-aware pairs trading + short-term overlay"
     )
     parser.add_argument(
-        "--prompt",
-        nargs="?",
-        const=(
-            "Masukkan daftar ticker dipisahkan koma (kosongkan untuk default): "
-        ),
-        default=_PROMPT_UNSET,
-        help=(
-            "Aktifkan mode interaktif untuk memasukkan daftar ticker melalui stdin. "
-            "Tanpa argumen tambahan menggunakan pesan default."
-        ),
+        "--pair",
+        default="ANTM,INCO",
+        help="Pair ticker untuk Stage-2 BO, format 'LHS,RHS' (default: ANTM,INCO)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--method",
+        default="TVECM",
+        help="Metode utama (default: TVECM)",
+    )
+    parser.add_argument(
+        "--horizon",
+        default="oos_full",
+        help="Nama horizon OOS (default: oos_full)",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force refresh Yahoo price data ke adj_close_data.csv sebelum demo.",
+    )
+    parser.add_argument(
+        "--n-init",
+        type=int,
+        default=4,
+        help="Jumlah initial points untuk Stage-2 BO (default: 4)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=12,
+        help="Jumlah iterasi TPE tambahan untuk Stage-2 BO (default: 12)",
+    )
+
+    return parser.parse_args(list(argv) if argv is not None else sys.argv[1:])
 
 
-def main() -> None:
-    args = parse_args()
-    LOGGER.info("Initialising storage")
-    with storage.managed_storage("demo-bootstrap") as conn:
-        storage.storage_init(conn)
+def main(argv: Sequence[str] | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
 
-    provided = parse_ticker_list(args.tickers) if args.tickers else None
-    if provided:
-        ensure_price_data(tickers=provided)
-    ticker_prompt = None if args.prompt is _PROMPT_UNSET else args.prompt
-    tickers = choose_tickers(provided=provided, ticker_prompt=ticker_prompt)
-    if not provided:
-        ensure_price_data(tickers=tickers)
-    subset = ",".join(tickers)
-    LOGGER.info("Using tickers: %s", tickers)
+    args = _parse_args(argv)
 
-    base_params = {"input_file": str(DATA_PATH), "subset": subset, "method": "TVECM"}
+    if args.refresh:
+        LOGGER.info("Refreshing Yahoo price data into %s", DATA_PATH)
+        ensure_price_data(DATA_PATH)
 
-    metrics = playbook_score_once(base_params)
-    LOGGER.info("playbook_score_once metrics: %s", metrics)
+    # Load panel harga (adj_close_data.csv) – dipakai oleh playbook, short-term
+    # overlay, dan gating regime spread.
+    prices = load_cached_prices(DATA_PATH)
+    LOGGER.info("Loaded price panel from %s with shape %s", DATA_PATH, prices.shape)
 
-    detailed = pipeline(base_params, persist=True)
-    run_id = detailed["run_id"]
-    LOGGER.info("Pipeline completed with run_id=%s", run_id)
+    # ------------------------------------------------------------------
+    # 1) Single pass playbook (regime-aware + short-term overlay aktif)
+    # ------------------------------------------------------------------
+    run_id = f"demo-{uuid.uuid4().hex[:8]}"
+    base_params = {
+        "input_file": str(DATA_PATH),
+        "method": args.method,
+        "horizon": args.horizon,
+        "stage": 2,
+        "tag": run_id,
+    }
 
-    try:
-        vh_run_export(run_id)
-        vh_run_visualize(run_id)
-    except Exception as exc:  # pragma: no cover - demo convenience
-        LOGGER.warning("Hook execution failed: %s", exc)
+    LOGGER.info(
+        "Running single playbook pass (regime-aware + short-term overlay ON) ..."
+    )
+    score = playbook_score_once(base_params)
+    LOGGER.info(
+        "Single-run metrics | sharpe_oos=%.4f maxdd=%.4f turnover=%.4f",
+        score.get("sharpe_oos", 0.0),
+        score.get("maxdd", 0.0),
+        score.get("turnover", 0.0),
+    )
 
-    bo_run_id = f"demo_bo_{uuid.uuid4().hex[:8]}"
-    run_bo(pair=subset, cfg=base_params, run_id=bo_run_id, n_init=2, iters=3, n_jobs=1)
+    # ------------------------------------------------------------------
+    # 2) Stage-2 Bayesian optimisation untuk pair tertentu
+    # ------------------------------------------------------------------
+    bo_run_id = f"demo_stage2_bo_{args.pair.replace(',', '-')}_{uuid.uuid4().hex[:6]}"
+    LOGGER.info(
+        "Launching Stage-2 BO | pair=%s method=%s horizon=%s run_id=%s ...",
+        args.pair,
+        args.method,
+        args.horizon,
+        bo_run_id,
+    )
 
-    sh_run_id = f"demo_sh_{uuid.uuid4().hex[:8]}"
-    run_successive_halving(
-        pair=subset,
-        cfg=base_params,
-        run_id=sh_run_id,
-        horizons=("short", "long"),
-        n_trials=3,
+    study = run_bo(
+        pair=args.pair,
+        method=args.method,
+        horizon=args.horizon,
+        cfg={"input_file": str(DATA_PATH)},
+        run_id=bo_run_id,
+        n_init=args.n_init,
+        iters=args.iters,
         n_jobs=1,
     )
 
+    best = study.best_trial
+    best_rec = best.user_attrs.get("record", {})
+    best_diag = best_rec.get("diagnostics", {})
+
+    LOGGER.info(
+        "Best Stage-2 trial | number=%d Score=%.4f sharpe_oos=%.4f maxdd=%.4f "
+        "turnover=%.4f t_ann=%.4f",
+        best.number,
+        best.value,
+        best_diag.get("sharpe_oos", 0.0),
+        best_diag.get("maxdd", 0.0),
+        best_diag.get("turnover", 0.0),
+        best_diag.get("turnover_annualised", 0.0),
+    )
+
+    # ------------------------------------------------------------------
+    # 3) Tuliskan Pareto frontier & ringkasan dashboard untuk run BO ini
+    # ------------------------------------------------------------------
     with storage.managed_storage("demo-summary") as conn:
         frontier = write_pareto_front(conn, bo_run_id)
         LOGGER.info("Stored %d Pareto rows for %s", len(frontier), bo_run_id)

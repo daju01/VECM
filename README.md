@@ -147,3 +147,120 @@ variabel lingkungan:
 Default ini menjaga optimisasi tetap responsif, tetapi seluruh data dan artefak
 tetap lengkap sehingga dapat dianalisis lebih lanjut ketika Anda memperluas
 pencarian parameter.
+
+## Regime-aware pairs trading & short-term overlay
+
+Sejak versi terbaru, pipeline VECM tidak lagi hanya mengandalkan z-score spread
+klasik. Ada tiga layer tambahan yang aktif secara default:
+
+1. **Convergence & mean-reversion filter**
+
+   - Untuk setiap pair, playbook mengestimasi hubungan jangka panjang
+     (cointegration + error-correction) dan menghitung:
+       - `alpha_ec` – speed of adjustment dari error-correction,
+       - `half_life_full` – estimasi half-life konvergensi spread.
+   - Pada tahap prefilter (`parallel_run`), pair dengan half-life terlalu besar
+     atau tidak cukup mean-reverting akan dibuang terlebih dahulu, sehingga grid
+     Stage-1/Stage-2 hanya diisi pair yang memang cenderung kembali ke
+     equilibrium.
+
+2. **Regime-spread gating (Markov switching)**
+
+   - Di dalam `playbook_vecm.run_playbook`, spread / z-score dimodelkan dengan
+     Markov-switching 2-state sederhana (spread mean-reverting vs non-MR).
+   - Untuk setiap hari, pipeline menghitung probabilitas `p_regime` bahwa
+     spread sedang berada di regime **mean-reverting**.
+   - Rule entry menjadi:
+
+     > masuk posisi hanya jika `|z_t| > z_entry` **dan**
+     > `p_regime_t >= p_th`,
+     > serta gate korelasi + half-life (bila `gate_enforce=1`) terpenuhi.
+
+3. **Short-term signal overlay (Blitz-style)**
+
+   - Modul `short_term_signals.py` membangun sinyal jangka pendek dari
+     `adj_close_data.csv`, antara lain:
+       - 1M momentum,
+       - 5D reversal (return 5 hari terakhir),
+       - idiosyncratic volatility 1 bulan vs indeks pasar,
+       - seasonality bulanan (efek bulan dalam setahun).
+   - Setiap sinyal diubah menjadi robust cross-sectional z-score yang
+     di-cap pada ±3 dan dirata-ratakan menjadi `score_short`.
+   - Untuk setiap pasangan (A,B), pipeline menghitung
+     `delta_score = score_short_A - score_short_B` dan hanya mengizinkan entry
+     jika arah `delta_score` konsisten dengan arah mispricing spread:
+       - kalau `z_t > 0` (A relatif mahal vs B) → butuh `delta_score > 0`
+         (A kelihatan "lebih jelek" secara sinyal jangka pendek),
+       - kalau `z_t < 0` → butuh `delta_score < 0`.
+
+Hasilnya, trade hanya muncul ketika:
+**spread mispricing + hubungan pair masih MR + sinyal jangka pendek setuju.**
+
+### Cara mengaktifkan / menonaktifkan layer baru
+
+Semua layer di atas **aktif secara default** ketika Anda menjalankan:
+
+```bash
+python vecm_project/run_demo.py
+# atau langsung:
+python -m vecm_project.scripts.playbook_vecm
+```
+
+Beberapa parameter penting yang bisa diutak-atik:
+
+* **Convergence & gating**
+
+  * `--gate_enforce` (0/1) mengontrol apakah gate korelasi + half-life
+    dipaksa. Default: `1` (ON).
+  * `--half_life_max` (default 90 hari) menentukan batas maksimum half-life
+    yang masih diterima oleh gate half-life. Untuk eksperimen tanpa filter
+    konvergensi, Anda dapat:
+
+    * set `--gate_enforce 0`, ATAU
+    * memberikan `--half_life_max` yang sangat besar.
+
+* **Regime gating**
+
+  * `--p_th` (default 0.85) adalah ambang probabilitas regime mean-reverting
+    yang dibutuhkan untuk entry. Semakin tinggi `p_th`, semakin ketat filter
+    (trade lebih jarang tapi biasanya lebih bersih).
+  * Untuk relaksasi gate, turunkan `--p_th` (misalnya ke 0.60) sehingga trade
+    boleh terjadi walaupun `p_regime` tidak terlalu tinggi.
+
+* **Biaya transaksi & penalti turnover**
+
+  * Biaya komisi + pajak dimodelkan eksplisit di level trade:
+
+    * CLI: `--fee_buy` dan `--fee_sell`,
+    * atau variabel lingkungan:
+
+      * `PLAYBOOK_FEE_BUY`,
+      * `PLAYBOOK_FEE_SELL`.
+  * Stage-2 BO dan SH menggunakan objective berbasis:
+
+    > `Score = sharpe_oos – λ × turnover_annualised`
+
+    di mana λ dikontrol oleh environment:
+
+    * `STAGE2_LAMBDA_TURNOVER` (default `"0.01"`).
+
+    Semakin besar λ, semakin kuat penalti untuk strategi dengan
+    `turnover_annualised` tinggi (lebih cocok untuk market ber-biaya tinggi
+    seperti IDX).
+
+* **Short-term overlay**
+
+  * Short-term overlay akan aktif secara otomatis begitu panel harga
+    `adj_close_data.csv` tersedia, karena modul `short_term_signals` dipanggil
+    dari `run_playbook`.
+  * Jika Anda ingin membandingkan performa dengan/ tanpa overlay, cara paling
+    sederhana adalah meng-comment blok yang menggunakan `delta_score` di
+    `playbook_vecm.build_signals`, sehingga rule entry kembali hanya bergantung
+    pada z-score + gating regime.
+
+Dengan dokumentasi ini, tiga bulan lagi ketika Anda buka repo, Anda bisa
+langsung mengingat:
+* bagaimana layer *regime-aware* dan *short-term overlay* bekerja,
+* tombol mana saja (CLI / env) yang bisa di-tune,
+* dan kenapa sebuah run dengan Sharpe tinggi bisa tetap disingkirkan (misalnya
+  karena half-life terlalu lambat atau turnover terlalu agresif).

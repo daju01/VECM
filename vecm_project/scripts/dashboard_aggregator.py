@@ -96,6 +96,19 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
         )
     )
 
+    trade_stats_row = conn.execute(
+        """
+        SELECT n_trades, turnover_annualised
+        FROM trade_stats
+        WHERE run_id = ?
+        """,
+        [run_id],
+    ).fetchone()
+    run_n_trades = int(trade_stats_row[0]) if trade_stats_row and trade_stats_row[0] is not None else None
+    run_turnover_ann = (
+        float(trade_stats_row[1]) if trade_stats_row and trade_stats_row[1] is not None else None
+    )
+
     rowid_result = conn.execute(
         """
         SELECT duckdb_query_p95_s, parquet_read_p95_s
@@ -119,6 +132,8 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
         "ttr_days": None,
         "duckdb_q_p95_s": duckdb_q,
         "parquet_p95_s": parquet_q,
+        "n_trades": run_n_trades,
+        "turnover_annualised": run_turnover_ann,
     }
 
     df = pd.DataFrame([dashboard_row])

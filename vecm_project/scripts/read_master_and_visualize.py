@@ -199,6 +199,44 @@ def _plot_beta(ax: plt.Axes, daily: pd.DataFrame) -> None:
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
 
 
+def _plot_regime_overlay(ax: plt.Axes, daily: pd.DataFrame) -> None:
+    has_prob = "p_regime" in daily
+    has_delta = "delta_score" in daily
+
+    if not has_prob and not has_delta:
+        ax.text(0.5, 0.5, "No regime/overlay data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("Regime Probability & Δscore")
+        ax.axis("off")
+        return
+
+    ax.set_title("Regime Probability & Δscore")
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+    ax.grid(True, alpha=0.3)
+
+    twin_ax: Optional[plt.Axes] = None
+
+    if has_prob:
+        p = daily["p_regime"].astype(float)
+        ax.plot(daily["date"], p, color="#1f77b4", label="p_regime (MR)")
+        ax.set_ylabel("Prob. MR")
+        ax.set_ylim(0, 1)
+
+    if has_delta:
+        twin_ax = ax if not has_prob else ax.twinx()
+        delta = daily["delta_score"].astype(float)
+        twin_ax.plot(daily["date"], delta, color="#ff7f0e", label="delta_score", alpha=0.8)
+        twin_ax.set_ylabel("Δscore")
+
+    handles, labels = ax.get_legend_handles_labels()
+    if twin_ax is not None:
+        h2, l2 = twin_ax.get_legend_handles_labels()
+        handles.extend(h2)
+        labels.extend(l2)
+    if handles:
+        ax.legend(handles, labels, loc="upper left")
+
+
 def _plot_trade_pnl(ax: plt.Axes, trades: pd.DataFrame) -> None:
     if trades.empty:
         ax.text(0.5, 0.5, "No trades", ha="center", va="center", transform=ax.transAxes)
@@ -257,17 +295,19 @@ def _build_figure(master: MasterData, run_id: str, save_path: pathlib.Path, show
     daily = _prepare_daily_features(master.daily)
     leg_labels = _labels_from_orders(master.orders)
 
-    fig = plt.figure(figsize=(14, 10))
-    grid = fig.add_gridspec(3, 2, height_ratios=[1, 0.9, 1.0])
+    fig = plt.figure(figsize=(14, 12))
+    grid = fig.add_gridspec(4, 2, height_ratios=[1, 0.8, 0.9, 1.0])
 
     ax_cum = fig.add_subplot(grid[0, 0])
     ax_beta = fig.add_subplot(grid[0, 1])
-    ax_contrib = fig.add_subplot(grid[1, :])
-    ax_trade = fig.add_subplot(grid[2, 0])
-    ax_orders = fig.add_subplot(grid[2, 1])
+    ax_regime = fig.add_subplot(grid[1, :])
+    ax_contrib = fig.add_subplot(grid[2, :])
+    ax_trade = fig.add_subplot(grid[3, 0])
+    ax_orders = fig.add_subplot(grid[3, 1])
 
     _plot_cumulative(ax_cum, daily)
     _plot_beta(ax_beta, daily)
+    _plot_regime_overlay(ax_regime, daily)
     _plot_contributions(ax_contrib, daily, leg_labels)
     _plot_trade_pnl(ax_trade, master.trades)
     _plot_order_timeline(ax_orders, master.orders)
