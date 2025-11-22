@@ -244,6 +244,17 @@ def _auto_stage(subsets: Iterable[str], manifest: pd.DataFrame) -> str:
     return "stage1"
 
 
+def _load_factor_scores_panel(path: Path) -> Optional[pd.DataFrame]:
+    try:
+        return pd.read_parquet(path)
+    except FileNotFoundError:
+        LOGGER.info("Factor score file %s not found; skip factor-aware filter.", path)
+        return None
+    except Exception as exc:  # pragma: no cover - defensive logging
+        LOGGER.warning("Failed to load factor scores from %s: %s", path, exc)
+        return None
+
+
 def _prefilter_pairs(
     csv_path: Path,
     last_n: int = 180,
@@ -264,6 +275,21 @@ def _prefilter_pairs(
     equities = df.loc[:, df.columns.str.endswith(".JK")]
     if equities.shape[1] < 2:
         return []
+
+    factor_path = csv_path.with_name("factor_scores.parquet")
+    factor_panel = _load_factor_scores_panel(factor_path)
+    if factor_panel is not None and not factor_panel.empty:
+        last_scores = factor_panel.iloc[-1].reindex(equities.columns)
+        q10 = last_scores.quantile(0.10)
+        keep_cols = last_scores[last_scores >= q10].index.tolist()
+        equities = equities[keep_cols]
+        LOGGER.info(
+            "Factor-aware filter applied: from %d to %d equities",
+            len(last_scores),
+            len(keep_cols),
+        )
+        if equities.shape[1] < 2:
+            return []
 
     # Window terakhir sebagai basis screening
     tail = equities.tail(last_n)

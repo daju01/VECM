@@ -13,6 +13,7 @@ from . import storage
 
 LOGGER = storage.configure_logging("dashboard_aggregator")
 OUT_DASHBOARD_DIR = storage.BASE_DIR / "out" / "dashboard"
+OUT_EXECUTION_DIR = storage.BASE_DIR / "out_ms"
 
 try:  # Optional dependency used by ``benchmark_storage``.
     import pyarrow.parquet as pq
@@ -33,6 +34,48 @@ def _fetch_scalar(
 
 def _safe_percentile(value: Optional[Any]) -> Optional[float]:
     return float(value) if value is not None else None
+
+
+def _load_daily_panel_for_run(run_id: str) -> Optional[pd.DataFrame]:
+    """
+    Load daily panel for a run from CSV artifacts and merge returns/positions.
+    """
+
+    ret_path = OUT_EXECUTION_DIR / f"returns_{run_id}.csv"
+    pos_path = OUT_EXECUTION_DIR / f"positions_{run_id}.csv"
+
+    if not ret_path.exists() or not pos_path.exists():
+        LOGGER.info(
+            "Daily artifacts not found for run_id=%s (returns/positions missing); "
+            "factor dashboard metrics will be None",
+            run_id,
+        )
+        return None
+
+    ret_df = pd.read_csv(ret_path)
+    pos_df = pd.read_csv(pos_path)
+
+    ret_date_col = ret_df.columns[0]
+    pos_date_col = pos_df.columns[0]
+
+    ret_df["date"] = pd.to_datetime(ret_df[ret_date_col]).dt.date
+    pos_df["date"] = pd.to_datetime(pos_df[pos_date_col]).dt.date
+
+    if "pos" not in pos_df.columns:
+        pos_cols = [c for c in pos_df.columns if c.lower() == "pos"]
+        if pos_cols:
+            pos_df = pos_df.rename(columns={pos_cols[0]: "pos"})
+        else:
+            LOGGER.warning("No 'pos' column found in positions_%s.csv", run_id)
+
+    daily = pd.merge(
+        ret_df,
+        pos_df[["date", "pos"]] if "pos" in pos_df.columns else pos_df[["date"]],
+        on="date",
+        how="inner",
+    ).sort_values("date")
+
+    return daily
 
 
 def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
@@ -120,6 +163,71 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
     duckdb_q = float(rowid_result[0]) if rowid_result and rowid_result[0] is not None else None
     parquet_q = float(rowid_result[1]) if rowid_result and rowid_result[1] is not None else None
 
+    # --- Factor-aware dashboard metrics (Phase 8) -------------------------
+    avg_p_regime: Optional[float] = None
+    avg_abs_delta_score_pos: Optional[float] = None
+    avg_abs_delta_mom12_pos: Optional[float] = None
+    avg_delta_value_entry: Optional[float] = None
+    avg_delta_quality_entry: Optional[float] = None
+
+    daily = _load_daily_panel_for_run(run_id)
+    if daily is not None:
+        if "p_regime" in daily.columns:
+            try:
+                avg_p_regime = float(daily["p_regime"].mean())
+            except Exception:
+                LOGGER.exception("Failed to compute avg_p_regime for run_id=%s", run_id)
+
+        if "delta_score" in daily.columns and "pos" in daily.columns:
+            pos_mask = daily["pos"].fillna(0.0) != 0.0
+            if pos_mask.any():
+                try:
+                    avg_abs_delta_score_pos = float(
+                        daily.loc[pos_mask, "delta_score"].abs().mean()
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to compute avg_abs_delta_score_pos for run_id=%s",
+                        run_id,
+                    )
+
+        if "delta_mom12" in daily.columns and "pos" in daily.columns:
+            pos_mask = daily["pos"].fillna(0.0) != 0.0
+            if pos_mask.any():
+                try:
+                    avg_abs_delta_mom12_pos = float(
+                        daily.loc[pos_mask, "delta_mom12"].abs().mean()
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to compute avg_abs_delta_mom12_pos for run_id=%s",
+                        run_id,
+                    )
+
+        if "entry_flag" in daily.columns:
+            entry_mask = daily["entry_flag"] == 1
+            if entry_mask.any():
+                if "delta_value" in daily.columns:
+                    try:
+                        avg_delta_value_entry = float(
+                            daily.loc[entry_mask, "delta_value"].mean()
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Failed to compute avg_delta_value_entry for run_id=%s",
+                            run_id,
+                        )
+                if "delta_quality" in daily.columns:
+                    try:
+                        avg_delta_quality_entry = float(
+                            daily.loc[entry_mask, "delta_quality"].mean()
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Failed to compute avg_delta_quality_entry for run_id=%s",
+                            run_id,
+                        )
+
     today = dt.date.today()
     dashboard_row = {
         "date": today,
@@ -134,6 +242,11 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
         "parquet_p95_s": parquet_q,
         "n_trades": run_n_trades,
         "turnover_annualised": run_turnover_ann,
+        "avg_p_regime": avg_p_regime,
+        "avg_abs_delta_score_pos": avg_abs_delta_score_pos,
+        "avg_abs_delta_mom12_pos": avg_abs_delta_mom12_pos,
+        "avg_delta_value_entry": avg_delta_value_entry,
+        "avg_delta_quality_entry": avg_delta_quality_entry,
     }
 
     df = pd.DataFrame([dashboard_row])

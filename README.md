@@ -264,3 +264,72 @@ langsung mengingat:
 * tombol mana saja (CLI / env) yang bisa di-tune,
 * dan kenapa sebuah run dengan Sharpe tinggi bisa tetap disingkirkan (misalnya
   karena half-life terlalu lambat atau turnover terlalu agresif).
+
+### Factor-aware pairs trading & monitoring
+
+Playbook ini tidak hanya mengandalkan sinyal harga jangka pendek, tetapi
+didesain selaras dengan literatur factor-based investing modern.
+
+Secara garis besar:
+
+- **Lapisan VECM & regime switching.** VECM memastikan pasangan saham
+  benar-benar cointegrated, sedangkan model Markov-switching di spread
+  memberi probabilitas apakah kita sedang berada di regime mean-reverting
+  atau tidak. Hanya ketika `p_regime` cukup tinggi, sinyal pairs trading
+  diizinkan muncul.
+
+- **Overlay sinyal jangka pendek (1M & 12M).** Overlay short-term signals
+  menggabungkan reversal jangka sangat pendek, momentum 1 bulan, dan
+  juga **12-month momentum** (dengan 1-month skip) sebagai proxy faktor
+  momentum klasik yang diakui dalam literatur factor investing. Penelitian
+  seperti Berkin & Swedroe (2017) menunjukkan bahwa momentum adalah salah
+  satu faktor dengan Sharpe ratio tertinggi dan termasuk dalam delapan
+  faktor yang benar-benar lolos kriteria ketat (persistent, pervasive,
+  robust, investable, intuitive). :contentReference[oaicite:0]{index=0}
+
+- **Filter faktor jangka panjang (value, quality, profitability).**
+  Di atas sinyal harga, modul faktor opsional menambahkan layer screening:
+  - sortir universe berdasarkan value (misalnya B/M, P/E),
+  - buang saham dengan kualitas akuntansi / profitabilitas yang sangat
+    buruk,
+  - dan, jika diaktifkan, memberi bobot lebih besar untuk pasangan di mana
+    mispricing harga konsisten dengan “fundamental spread”. Temuan CFA
+    Institute dan ringkasan practitioner seperti NEPC menegaskan bahwa
+    kombinasi value, quality, dan profitability adalah faktor yang robust
+    untuk portofolio jangka panjang. :contentReference[oaicite:1]{index=1}
+
+- **Penalty turnover & biaya transaksi.** Objective optimasi Stage-2 tidak
+  lagi hanya memaksimalkan Sharpe, tetapi juga memasukkan penalty terhadap
+  turnover dan mengukur performa **setelah biaya transaksi**. Pendekatan
+  ini konsisten dengan literatur yang menunjukkan bahwa banyak anomali
+  harga jangka pendek hilang jika biaya trading diabaikan, sementara
+  kombinasi multi-sinyal dengan turnover terkendali masih bisa menghasilkan
+  alpha yang secara praktis dapat diimplementasikan.
+
+#### Mode konfigurasi
+
+Pipeline bisa dijalankan dalam dua mode besar:
+
+- **Pure price-based mode.**
+  - Regime switching, overlay faktor, dan filter value/quality dimatikan.
+  - Bermanfaat untuk backtest baseline atau debugging VECM murni.
+
+- **Factor-aware mode.**
+  - Aktifkan modul berikut lewat flag / environment variable:
+    - `ENABLE_MS_REGIME=1` → gunakan gating Markov-switching di spread.
+    - `ENABLE_SHORT_TERM_OVERLAY=1` → gunakan sinyal jangka pendek
+      (1M momentum, reversal, dll).
+    - `ENABLE_FACTOR_OVERLAY=1` → aktifkan filter value/quality/profitability.
+  - Pada mode ini, sinyal trade hanya muncul ketika:
+    1. Spread jauh dari equilibrium (z-score melewati threshold),
+    2. Probabilitas regime mean-reverting tinggi (`p_regime ≥ p_threshold`),
+    3. Overlay sinyal jangka pendek dan faktor fundamental “setuju” dengan
+       arah trade yang diusulkan.
+
+Dashboard menyimpan ringkasan metrik factor-aware per `run_id`, termasuk
+rata-rata `p_regime`, kekuatan rata-rata sinyal jangka pendek saat posisi
+aktif (`|delta_score|`, `|delta_mom12|`), dan, jika modul faktor diaktifkan,
+delta value/quality rata-rata ketika entry. Informasi ini memudahkan
+analisis pasca-run: apakah strategi benar-benar bertransaksi ketika kondisi
+regime dan faktor selaras dengan teori factor investing, bukan sekadar
+mengikuti noise harga jangka pendek.

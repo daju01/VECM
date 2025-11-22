@@ -212,6 +212,8 @@ def build_daily_panel(config: ExportConfig, manifest_row: pd.Series, lhs: str, r
         ret_cols.append("p_regime")
     if "delta_score" in returns_df.columns:
         ret_cols.append("delta_score")
+    if "delta_mom12" in returns_df.columns:
+        ret_cols.append("delta_mom12")
 
     daily = (
         pd.merge(returns_df[ret_cols], positions_df[["date", "pos"]], on="date", how="outer")
