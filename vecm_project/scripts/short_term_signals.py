@@ -86,11 +86,6 @@ def build_short_term_signals(
     """
     df = _ensure_datetime_index(price_panel)
 
-    if market_col not in df.columns:
-        raise KeyError(f"market_col '{market_col}' tidak ditemukan di price_panel")
-
-    mkt = df[market_col].astype(float)
-
     # Ambil hanya saham ekuitas .JK (sesuaikan kalau universe kamu beda)
     eq_cols = [c for c in df.columns if c.endswith(".JK")]
     if not eq_cols:
@@ -98,9 +93,19 @@ def build_short_term_signals(
 
     px = df[eq_cols].astype(float)
 
+    if market_col in df.columns:
+        mkt = df[market_col].astype(float)
+    else:
+        LOGGER.warning(
+            "market_col '%s' tidak ditemukan; memakai rata-rata equal-weight %d saham sebagai proxy indeks",
+            market_col,
+            len(eq_cols),
+        )
+        mkt = px.mean(axis=1)
+
     # --- Daily returns ---
-    ret = px.pct_change()
-    ret_mkt = mkt.pct_change()
+    ret = px.pct_change(fill_method=None)
+    ret_mkt = mkt.pct_change(fill_method=None)
 
     # --- 1M momentum: return kumulatif ~21 hari ---
     mom_1m = px / px.shift(lookback_mom_1m) - 1.0
@@ -128,7 +133,7 @@ def build_short_term_signals(
 
     # --- Seasonality bulanan: rata-rata return bulanan historis per saham ---
     monthly_px = px.resample("M").last()
-    monthly_ret = monthly_px.pct_change()
+    monthly_ret = monthly_px.pct_change(fill_method=None)
 
     if monthly_ret.shape[0] < 6:
         LOGGER.warning("Data bulanan terlalu pendek, seasonality mungkin kurang stabil")

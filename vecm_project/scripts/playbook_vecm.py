@@ -696,8 +696,8 @@ def execute_trades(
 ) -> ExecutionResult:
     idx = zect.index
     signals = signals.reindex(idx).fillna(0.0)
-    lp_pair = lp_pair.reindex(idx).fillna(method="ffill").dropna()
-    beta_series = beta_series.reindex(lp_pair.index).fillna(method="ffill")
+    lp_pair = lp_pair.reindex(idx).ffill().dropna()
+    beta_series = beta_series.reindex(lp_pair.index).ffill()
     zect = zect.reindex(lp_pair.index)
     if p_regime is not None:
         p_regime = p_regime.reindex(lp_pair.index)
