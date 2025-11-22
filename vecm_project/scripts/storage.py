@@ -195,7 +195,12 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
             duckdb_q_p95_s DOUBLE,
             parquet_p95_s DOUBLE,
             n_trades INT,
-            turnover_annualised DOUBLE
+            turnover_annualised DOUBLE,
+            avg_p_regime DOUBLE,
+            avg_abs_delta_score_pos DOUBLE,
+            avg_abs_delta_mom12_pos DOUBLE,
+            avg_delta_value_entry DOUBLE,
+            avg_delta_quality_entry DOUBLE
         );
         """,
         f"""
@@ -593,11 +598,21 @@ def write_dashboard_daily(
             row.get("parquet_p95_s"),
             row.get("n_trades"),
             row.get("turnover_annualised"),
+            row.get("avg_p_regime"),
+            row.get("avg_abs_delta_score_pos"),
+            row.get("avg_abs_delta_mom12_pos"),
+            row.get("avg_delta_value_entry"),
+            row.get("avg_delta_quality_entry"),
         )
         for row in rows
     ]
     conn.executemany(
-        "INSERT INTO dashboard_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO dashboard_daily VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
         values,
     )
     storage_schedule_analyze(conn, "dashboard_daily")

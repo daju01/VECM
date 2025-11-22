@@ -579,6 +579,7 @@ def build_signals(
     *,
     delta_score: Optional[pd.Series] = None,
     p_regime: Optional[pd.Series] = None,
+    delta_mom12: Optional[pd.Series] = None,
 ) -> Tuple[pd.DataFrame, float]:
     # Determine z threshold
     if cfg.z_auto_method == "mfpt":
@@ -624,6 +625,16 @@ def build_signals(
         ds = delta_score.reindex(zect.index).astype(float)
         enter_long = enter_long & (ds < 0)
         enter_short = enter_short & (ds > 0)
+
+    # Overlay 12M momentum spread (delta_mom12, faktor jangka panjang)
+    # z_mom12 tinggi = "lebih jelek" (overextended 12M), sama interpretasi dengan score_short.
+    # delta_mom12 = z_mom12_A - z_mom12_B
+    # z < 0 (A lebih murah) → kita ingin A "lebih bagus" → delta_mom12 < 0
+    # z > 0 (A lebih mahal) → kita ingin A "lebih jelek" → delta_mom12 > 0
+    if delta_mom12 is not None:
+        dm = delta_mom12.reindex(zect.index).astype(float)
+        enter_long = enter_long & (dm < 0)
+        enter_short = enter_short & (dm > 0)
     gates = gates.reindex(zect.index).fillna(False)
     if cfg.gate_enforce:
         enter_long &= gates
@@ -635,6 +646,8 @@ def build_signals(
     signals = pd.DataFrame({"long": long_cd.astype(float), "short": short_cd.astype(float)}, index=zect.index, dtype=float)
     if delta_score is not None:
         signals["delta_score"] = delta_score.reindex(zect.index)
+    if delta_mom12 is not None:
+        signals["delta_mom12"] = delta_mom12.reindex(zect.index)
     # Enforce long-only patch
     signals["short"] = 0.0
     if cfg.mom_enable:
@@ -668,6 +681,7 @@ class ExecutionResult:
     trades: pd.DataFrame
     p_regime: Optional[pd.Series] = None
     delta_score: Optional[pd.Series] = None
+    delta_mom12: Optional[pd.Series] = None
 
 
 def execute_trades(
@@ -678,6 +692,7 @@ def execute_trades(
     cfg: PlaybookConfig,
     p_regime: Optional[pd.Series] = None,
     delta_score: Optional[pd.Series] = None,
+    delta_mom12: Optional[pd.Series] = None,
 ) -> ExecutionResult:
     idx = zect.index
     signals = signals.reindex(idx).fillna(0.0)
@@ -793,6 +808,7 @@ def execute_trades(
         trades=trades_df,
         p_regime=p_regime,
         delta_score=delta_score,
+        delta_mom12=delta_mom12,
     )
 
 
@@ -980,6 +996,24 @@ def run_playbook(
                 selected_r,
             )
 
+    # --- Long-horizon factor: 12M momentum spread (delta_mom12) ---
+    delta_mom12: Optional[pd.Series] = None
+    if short_panel is not None:
+        z_mom12_panel = short_panel.attrs.get("z_mom12")
+        if isinstance(z_mom12_panel, pd.DataFrame):
+            try:
+                mom_l = z_mom12_panel[selected_l].reindex(zect.index)
+                mom_r = z_mom12_panel[selected_r].reindex(zect.index)
+                delta_mom12 = (mom_l - mom_r).astype(float)
+            except KeyError:
+                LOGGER.warning(
+                    "z_mom12 not available for %s or %s; disabling delta_mom12 overlay",
+                    selected_l,
+                    selected_r,
+                )
+        else:
+            LOGGER.info("No z_mom12 panel found in short_term_signals attrs; skip delta_mom12")
+
     # Regime switching model on the spread to infer mean-reverting regime probability
     try:
         ms_model = fit_ms_spread(zect)
@@ -1005,6 +1039,7 @@ def run_playbook(
         combined_gate,
         delta_score=delta_score,
         p_regime=p_mr_series,
+        delta_mom12=delta_mom12,
     )
     exec_res = execute_trades(
         zect,
@@ -1014,6 +1049,7 @@ def run_playbook(
         cfg,
         p_regime=p_mr_series,
         delta_score=delta_score,
+        delta_mom12=delta_mom12,
     )
     if cfg.oos_start:
         oos_start_date = pd.to_datetime(cfg.oos_start).date()
@@ -1087,6 +1123,8 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
         ret_df["p_regime"] = exec_res.p_regime
     if getattr(exec_res, "delta_score", None) is not None:
         ret_df["delta_score"] = exec_res.delta_score
+    if getattr(exec_res, "delta_mom12", None) is not None:
+        ret_df["delta_mom12"] = exec_res.delta_mom12
     _df_to_csv(ret_df, ret_path)
     if not exec_res.trades.empty:
         trades_df = exec_res.trades.copy()
