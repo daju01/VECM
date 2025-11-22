@@ -418,7 +418,7 @@ def _align_pair(
     aligned.columns = ["Date", "L", "R"]
     aligned["L"] = pd.to_numeric(aligned["L"], errors="coerce")
     aligned["R"] = pd.to_numeric(aligned["R"], errors="coerce")
-    mask = aligned[["L", "R"]].applymap(np.isfinite)
+    mask = np.isfinite(aligned[["L", "R"]])
     if not mask["L"].any() or not mask["R"].any():
         LOGGER.warning("Date-align failed for %s: no finite data", subset)
         return None
@@ -584,7 +584,6 @@ def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, L
 
 
 def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerConfig:
-    ensure_price_data()
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -594,6 +593,8 @@ def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerCon
     stamp_file = out_dir / ".last_start_time"
     max_workers = max(1, _env_int("VECM_MAX_WORKERS", _available_workers()))
     subsets = _gather_subsets(input_csv, subsets_override)
+    tickers = _download_tickers_for_subsets(subsets)
+    ensure_price_data(tickers=tickers or None)
     stage = _choose_stage(manifest_path, subsets)
     stage_int = 1 if stage.lower() == "stage2" else 0
     oos_short = os.getenv("VECM_OOS_SHORT", "2025-03-01")
