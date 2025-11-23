@@ -107,6 +107,21 @@ python -m vecm_project.scripts.playbook_vecm \
   --method TVECM
 ```
 
+Untuk pasangan likuid seperti BBCA/BBRI yang Anda ingin lebih aktif,
+pertimbangkan menambah opsi berikut agar filter entry lebih longgar dan sinyal
+short diizinkan:
+
+```bash
+python -m vecm_project.scripts.playbook_vecm \
+  vecm_project/data/adj_close_data.csv \
+  --subset BBCA.JK,BBRI.JK \
+  --method TVECM \
+  --allow_short \
+  --p_th 0.5 \
+  --cooldown 1 \
+  --z_entry_cap 0.85
+```
+
 ### Contoh multi-pair (parallel_run)
 
 Jika ingin memproses beberapa pasangan sekaligus, `parallel_run.py` menerima
