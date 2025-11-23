@@ -403,10 +403,45 @@ def load_and_validate_data(path: str) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df[["date", *price_cols]]
     df = df.dropna(how="all", subset=price_cols)
+    df = _maybe_attach_market_index(df)
+    price_cols = [c for c in df.columns if c != "date"]
     if len(price_cols) < 2:
         raise ValueError("Need at least two price columns")
     df = df.reset_index(drop=True)
     return df
+
+
+def _maybe_attach_market_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ^JKSE from Yahoo Finance when missing to support factor overlay."""
+
+    market_col = "^JKSE"
+    if market_col in df.columns:
+        return df
+
+    try:
+        market = ensure_price_data(tickers=[market_col], force_refresh=False)
+    except Exception as exc:  # pragma: no cover - download/runtime errors
+        LOGGER.warning("Gagal mengunduh %s: %s", market_col, exc)
+        return df
+
+    if market.empty or market_col not in market.columns:
+        LOGGER.warning("Unduhan %s kosong atau tidak memuat kolom harga", market_col)
+        return df
+
+    market = market.rename(columns={"Date": "date"})
+    if "date" not in market.columns:
+        LOGGER.warning("Unduhan %s tidak memiliki kolom tanggal", market_col)
+        return df
+
+    market = market[["date", market_col]].copy()
+    market[market_col] = pd.to_numeric(market[market_col], errors="coerce")
+    merged = df.merge(market, on="date", how="left")
+    filled = merged[market_col].notna().sum()
+    if filled:
+        LOGGER.info("Menambahkan kolom %s dari Yahoo Finance (%d baris terisi)", market_col, filled)
+    else:
+        LOGGER.warning("Kolom %s berhasil ditambahkan tetapi seluruh nilai kosong", market_col)
+    return merged
 
 
 def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame, List[str]]:
@@ -445,6 +480,19 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
             if mask.sum() and mask.sum() < 0.01 * len(series):
                 series = series.mask(mask)
         df[col] = series.interpolate(limit=5)
+    # If some tickers stop updating (e.g. due to offline cache issues) the tail of
+    # the dataset can be filled with NaNs for those symbols. Trim the history to
+    # the last date where all *retained* tickers still have observations so the
+    # downstream NA-ratio check does not discard the entire series.
+    last_valid_dates = []
+    for col in df.columns:
+        last_valid = df[col].last_valid_index()
+        if last_valid is not None:
+            last_valid_dates.append(last_valid)
+    if last_valid_dates:
+        cutoff = min(last_valid_dates)
+        if cutoff < df.index.max():
+            df = df.loc[:cutoff]
     na_ratios = df.isna().mean()
     drop_cols = [c for c, ratio in na_ratios.items() if ratio > 0.20]
     if drop_cols:
