@@ -81,21 +81,23 @@ class PlaybookConfig:
     z_exit: float = 0.6
     z_stop: float = 0.8
     max_hold: int = 8
-    cooldown: int = 5
+    cooldown: int = 2
     z_auto_method: str = "mfpt"
-    z_auto_q: float = 0.9
-    gate_require_corr: int = 1
-    gate_corr_min: float = 0.70
-    gate_corr_win: int = 60
+    z_auto_q: float = 0.7
+    z_entry_cap: float = 1.0
+    gate_require_corr: int = 0
+    gate_corr_min: float = 0.60
+    gate_corr_win: int = 45
     gate_enforce: bool = True
+    short_filter: bool = False
     beta_weight: bool = True
     cost_bps: float = 5.0
-    half_life_max: float = 90.0
+    half_life_max: float = 120.0
     dd_stop: float = 0.25
     fee_buy: float = 0.0019
     fee_sell: float = 0.0029
-    p_th: float = 0.85
-    regime_confirm: int = 4
+    p_th: float = 0.60
+    regime_confirm: int = 1
     kelly_frac: float = 0.5
     vol_cap: float = 0.20
     ann_days: int = 252
@@ -147,21 +149,23 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--z_exit", type=float, default=0.6)
     parser.add_argument("--z_stop", type=float, default=0.8)
     parser.add_argument("--max_hold", type=int, default=8)
-    parser.add_argument("--cooldown", type=int, default=5)
+    parser.add_argument("--cooldown", type=int, default=2)
     parser.add_argument("--z_auto_method", default="mfpt")
-    parser.add_argument("--z_auto", type=float, default=0.9)
-    parser.add_argument("--gate_require_corr", type=int, default=1)
-    parser.add_argument("--gate_corr_min", type=float, default=0.70)
-    parser.add_argument("--gate_corr_win", type=int, default=60)
+    parser.add_argument("--z_auto", type=float, default=0.7)
+    parser.add_argument("--z_entry_cap", type=float, default=1.0)
+    parser.add_argument("--gate_require_corr", type=int, default=0)
+    parser.add_argument("--gate_corr_min", type=float, default=0.60)
+    parser.add_argument("--gate_corr_win", type=int, default=45)
     parser.add_argument("--gate_enforce", type=int, default=1)
+    parser.add_argument("--short_filter", type=int, default=0)
     parser.add_argument("--beta_weight", type=int, default=1)
     parser.add_argument("--cost_bps", type=float, default=5.0)
-    parser.add_argument("--half_life_max", type=float, default=90.0)
+    parser.add_argument("--half_life_max", type=float, default=120.0)
     parser.add_argument("--dd_stop", type=float, default=0.25)
     parser.add_argument("--fee_buy", type=float, default=0.0019)
     parser.add_argument("--fee_sell", type=float, default=0.0029)
-    parser.add_argument("--p_th", type=float, default=0.85)
-    parser.add_argument("--regime_confirm", type=int, default=4)
+    parser.add_argument("--p_th", type=float, default=0.60)
+    parser.add_argument("--regime_confirm", type=int, default=1)
     parser.add_argument("--kelly_frac", type=float, default=0.5)
     parser.add_argument("--vol_cap", type=float, default=0.20)
     parser.add_argument("--ann_days", type=int, default=252)
@@ -194,10 +198,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         cooldown=int(args.cooldown),
         z_auto_method=args.z_auto_method.lower(),
         z_auto_q=float(args.z_auto),
+        z_entry_cap=float(args.z_entry_cap),
         gate_require_corr=int(args.gate_require_corr),
         gate_corr_min=float(args.gate_corr_min),
         gate_corr_win=int(args.gate_corr_win),
         gate_enforce=bool(args.gate_enforce),
+        short_filter=bool(args.short_filter),
         beta_weight=bool(args.beta_weight),
         cost_bps=float(args.cost_bps),
         half_life_max=float(args.half_life_max),
@@ -631,7 +637,14 @@ def build_signals(
 ) -> Tuple[pd.DataFrame, float]:
     # Determine z threshold
     if cfg.z_auto_method == "mfpt":
-        auto_th, _ = _mfpt_threshold(zect, np.arange(0.8, 3.05, 0.1), cfg.z_exit, cfg.fee_buy, cfg.fee_sell, cfg.ann_days)
+        auto_th, _ = _mfpt_threshold(
+            zect,
+            np.arange(0.6, 2.55, 0.1),
+            cfg.z_exit,
+            cfg.fee_buy,
+            cfg.fee_sell,
+            cfg.ann_days,
+        )
     else:
         vals = zect.loc[~pd.isna(zect)]
         if cfg.oos_start:
@@ -653,6 +666,11 @@ def build_signals(
                 auto_th,
                 z_th,
             )
+    cap = getattr(cfg, "z_entry_cap", None)
+    if source != "z_entry" and cap is not None and np.isfinite(cap) and cap > 0:
+        if z_th > cap:
+            LOGGER.info("Capping auto z_th from %.3f to %.3f (z_entry_cap)", z_th, cap)
+            z_th = float(cap)
     LOGGER.info("Using entry threshold z_th=%.3f (source=%s)", z_th, source)
     abs_z = np.abs(zect)
 
@@ -671,8 +689,9 @@ def build_signals(
 
     if delta_score is not None:
         ds = delta_score.reindex(zect.index).astype(float)
-        enter_long = enter_long & (ds < 0)
-        enter_short = enter_short & (ds > 0)
+        if cfg.short_filter:
+            enter_long = enter_long & (ds < 0)
+            enter_short = enter_short & (ds > 0)
 
     # Overlay 12M momentum spread (delta_mom12, faktor jangka panjang)
     # z_mom12 tinggi = "lebih jelek" (overextended 12M), sama interpretasi dengan score_short.
@@ -681,8 +700,9 @@ def build_signals(
     # z > 0 (A lebih mahal) → kita ingin A "lebih jelek" → delta_mom12 > 0
     if delta_mom12 is not None:
         dm = delta_mom12.reindex(zect.index).astype(float)
-        enter_long = enter_long & (dm < 0)
-        enter_short = enter_short & (dm > 0)
+        if cfg.short_filter:
+            enter_long = enter_long & (dm < 0)
+            enter_short = enter_short & (dm > 0)
     gates = gates.reindex(zect.index).fillna(False)
     if cfg.gate_enforce:
         enter_long &= gates
@@ -1073,8 +1093,11 @@ def run_playbook(
     # Estimasi parameter konvergensi spread pada full sample
     alpha_ec, half_life_full = _convergence_stats(zect)
 
-    corr_gate = _run_cor(lp.iloc[:, 0].diff(), lp.iloc[:, 1].diff(), max(cfg.gate_corr_win, 10))
-    corr_gate = (corr_gate >= cfg.gate_corr_min).reindex(zect.index).fillna(False)
+    corr_vals = _run_cor(lp.iloc[:, 0].diff(), lp.iloc[:, 1].diff(), max(cfg.gate_corr_win, 10))
+    if cfg.gate_require_corr:
+        corr_gate = (corr_vals >= cfg.gate_corr_min).reindex(zect.index).fillna(False)
+    else:
+        corr_gate = pd.Series(True, index=zect.index)
     hl_series = zect.rolling(252, min_periods=60).apply(_half_life, raw=False)
     hl_gate = (hl_series <= cfg.half_life_max).reindex(zect.index).fillna(False)
     if cfg.gate_enforce:
