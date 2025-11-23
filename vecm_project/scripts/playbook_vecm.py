@@ -78,13 +78,13 @@ class PlaybookConfig:
     notes: str = ""
     exit: str = "zexit"
     z_entry: Optional[float] = None
-    z_exit: float = 0.6
+    z_exit: float = 0.55
     z_stop: float = 0.8
     max_hold: int = 8
-    cooldown: int = 2
+    cooldown: int = 1
     z_auto_method: str = "mfpt"
     z_auto_q: float = 0.7
-    z_entry_cap: float = 1.0
+    z_entry_cap: float = 0.85
     gate_require_corr: int = 0
     gate_corr_min: float = 0.60
     gate_corr_win: int = 45
@@ -96,8 +96,9 @@ class PlaybookConfig:
     dd_stop: float = 0.25
     fee_buy: float = 0.0019
     fee_sell: float = 0.0029
-    p_th: float = 0.60
+    p_th: float = 0.50
     regime_confirm: int = 1
+    long_only: bool = True
     kelly_frac: float = 0.5
     vol_cap: float = 0.20
     ann_days: int = 252
@@ -146,13 +147,13 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--notes", default="")
     parser.add_argument("--exit", default="zexit")
     parser.add_argument("--z_entry", type=float, default=None)
-    parser.add_argument("--z_exit", type=float, default=0.6)
+    parser.add_argument("--z_exit", type=float, default=0.55)
     parser.add_argument("--z_stop", type=float, default=0.8)
     parser.add_argument("--max_hold", type=int, default=8)
-    parser.add_argument("--cooldown", type=int, default=2)
+    parser.add_argument("--cooldown", type=int, default=1)
     parser.add_argument("--z_auto_method", default="mfpt")
     parser.add_argument("--z_auto", type=float, default=0.7)
-    parser.add_argument("--z_entry_cap", type=float, default=1.0)
+    parser.add_argument("--z_entry_cap", type=float, default=0.85)
     parser.add_argument("--gate_require_corr", type=int, default=0)
     parser.add_argument("--gate_corr_min", type=float, default=0.60)
     parser.add_argument("--gate_corr_win", type=int, default=45)
@@ -164,8 +165,15 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--dd_stop", type=float, default=0.25)
     parser.add_argument("--fee_buy", type=float, default=0.0019)
     parser.add_argument("--fee_sell", type=float, default=0.0029)
-    parser.add_argument("--p_th", type=float, default=0.60)
+    parser.add_argument("--p_th", type=float, default=0.50)
     parser.add_argument("--regime_confirm", type=int, default=1)
+    parser.add_argument("--long_only", action="store_true", default=True)
+    parser.add_argument(
+        "--allow_short",
+        dest="long_only",
+        action="store_false",
+        help="Permit both legs instead of forcing long-only entries",
+    )
     parser.add_argument("--kelly_frac", type=float, default=0.5)
     parser.add_argument("--vol_cap", type=float, default=0.20)
     parser.add_argument("--ann_days", type=int, default=252)
@@ -212,6 +220,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         fee_sell=float(args.fee_sell),
         p_th=float(args.p_th),
         regime_confirm=int(args.regime_confirm),
+        long_only=bool(args.long_only),
         kelly_frac=float(args.kelly_frac),
         vol_cap=float(args.vol_cap),
         ann_days=int(args.ann_days),
@@ -716,8 +725,9 @@ def build_signals(
         signals["delta_score"] = delta_score.reindex(zect.index)
     if delta_mom12 is not None:
         signals["delta_mom12"] = delta_mom12.reindex(zect.index)
-    # Enforce long-only patch
-    signals["short"] = 0.0
+    # Enforce long-only patch when configured
+    if cfg.long_only:
+        signals["short"] = 0.0
     if cfg.mom_enable:
         LOGGER.info(
             "Momentum add-on enabled | z=%.2f, k=%d, gate_k=%d, cooldown=%d",
