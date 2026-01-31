@@ -61,7 +61,7 @@ def compute_pareto_nds(df: pd.DataFrame) -> pd.DataFrame:
     return clean.loc[mask].copy()
 
 
-def write_pareto_front(conn, run_id: str) -> pd.DataFrame:
+def write_pareto_front(conn: storage.DuckDBConnection, run_id: str) -> pd.DataFrame:
     """Persist the Pareto frontier rows into the ``pareto_front`` table."""
 
     trials = conn.execute(

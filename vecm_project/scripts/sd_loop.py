@@ -194,7 +194,7 @@ def persist_policy(
     run_id: str,
     policy_df: pd.DataFrame,
     *,
-    conn: Optional[storage.duckdb.DuckDBPyConnection] = None,
+    conn: Optional[storage.DuckDBConnection] = None,
 ) -> None:
     """Write the policy observations to DuckDB."""
 

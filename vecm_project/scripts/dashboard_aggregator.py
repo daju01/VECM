@@ -22,7 +22,9 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 def _fetch_scalar(
-    conn: Any, query: str, params: Iterable[Any] | None = None
+    conn: storage.DuckDBConnection,
+    query: str,
+    params: Iterable[Any] | None = None,
 ) -> Optional[Any]:
     row = conn.execute(query, params or []).fetchone()
     if row is None:
@@ -78,7 +80,7 @@ def _load_daily_panel_for_run(run_id: str) -> Optional[pd.DataFrame]:
     return daily
 
 
-def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
+def dashboard_aggregate(conn: storage.DuckDBConnection, run_id: str) -> Dict[str, Any]:
     """Compute and persist daily dashboard metrics for ``run_id``."""
 
     if not run_id:
@@ -262,7 +264,9 @@ def dashboard_aggregate(conn, run_id: str) -> Dict[str, Any]:
 
 
 def benchmark_storage(
-    conn, parquet_path: Path | str, run_id: Optional[str] = None
+    conn: storage.DuckDBConnection,
+    parquet_path: Path | str,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Optional[float]]:
     """Benchmark DuckDB and Parquet access latencies."""
 
