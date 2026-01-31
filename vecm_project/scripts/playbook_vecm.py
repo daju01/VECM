@@ -1056,19 +1056,133 @@ def run_playbook(
     zect = (ect - mect) / sect
     zect = zect.replace([np.inf, -np.inf], np.nan)
     zect_valid = zect.dropna()
+    min_spread_std = 1e-6
+    ect_std = float(ect.std()) if len(ect) else float("nan")
     if zect_valid.empty:
-        fallback_std_val = float(ect.std())
-        if np.isfinite(fallback_std_val) and fallback_std_val > 0:
+        fallback_std_val = ect_std
+        if np.isfinite(fallback_std_val) and fallback_std_val >= min_spread_std:
             LOGGER.warning(
                 "Z-score series empty after normalisation; falling back to global standard deviation"
             )
             fallback = (ect - ect.mean()) / fallback_std_val
             zect_valid = fallback.dropna()
     if zect_valid.empty:
-        LOGGER.warning(
-            "Z-score series still empty; synthesising flat spread to allow pipeline continuation"
+        LOGGER.error(
+            "Z-score series empty after normalisation; skipping pair %s~%s",
+            selected_l,
+            selected_r,
         )
-        zect_valid = pd.Series(0.0, index=lp.index)
+        empty_idx = lp.index
+        empty_signals = pd.DataFrame(
+            {"long": 0.0, "short": 0.0}, index=empty_idx, dtype=float
+        )
+        empty_series = pd.Series(0.0, index=empty_idx)
+        exec_res = ExecutionResult(
+            pos=empty_series.rename("pos"),
+            ret=empty_series.rename("ret"),
+            ret_core=empty_series.rename("ret_core"),
+            cost=empty_series.rename("cost"),
+            trades=pd.DataFrame(),
+        )
+        if cfg.oos_start:
+            oos_start_date = pd.to_datetime(cfg.oos_start).date()
+        else:
+            base_index = empty_idx
+            if not len(base_index):
+                oos_start_date = dt.datetime.utcnow().date()
+            else:
+                cutoff_idx = int(len(base_index) * 0.7)
+                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+                oos_start_date = base_index[cutoff_idx].date()
+        metrics = compute_metrics(exec_res, cfg, oos_start_date)
+        metrics["skip_reason"] = "zscore_empty"
+        result = {
+            "run_id": run_id,
+            "params": cfg.to_dict(),
+            "config": cfg.to_dict(),
+            "metrics": metrics,
+            "model_checks": {
+                "pair": f"{selected_l}~{selected_r}",
+                "rank": 1,
+                "deterministic": "ci",
+                "threshold": float("nan"),
+                "skipped": True,
+            },
+            "signals": empty_signals,
+            "execution": exec_res,
+            "horizon": {
+                "train_obs": int(len(lp) * 0.7),
+                "test_obs": len(lp) - int(len(lp) * 0.7),
+                "train_start": str(lp.index.min().date()) if len(lp) else "",
+                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_end": str(lp.index.max().date()) if len(lp) else "",
+            },
+            "skipped_reason": "zscore_empty",
+        }
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
+    if not np.isfinite(ect_std) or ect_std < min_spread_std:
+        LOGGER.error(
+            "Spread variance too low (std=%.6g); skipping pair %s~%s",
+            ect_std,
+            selected_l,
+            selected_r,
+        )
+        empty_idx = lp.index
+        empty_signals = pd.DataFrame(
+            {"long": 0.0, "short": 0.0}, index=empty_idx, dtype=float
+        )
+        empty_series = pd.Series(0.0, index=empty_idx)
+        exec_res = ExecutionResult(
+            pos=empty_series.rename("pos"),
+            ret=empty_series.rename("ret"),
+            ret_core=empty_series.rename("ret_core"),
+            cost=empty_series.rename("cost"),
+            trades=pd.DataFrame(),
+        )
+        if cfg.oos_start:
+            oos_start_date = pd.to_datetime(cfg.oos_start).date()
+        else:
+            base_index = empty_idx
+            if not len(base_index):
+                oos_start_date = dt.datetime.utcnow().date()
+            else:
+                cutoff_idx = int(len(base_index) * 0.7)
+                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+                oos_start_date = base_index[cutoff_idx].date()
+        metrics = compute_metrics(exec_res, cfg, oos_start_date)
+        metrics["skip_reason"] = "spread_variance_low"
+        result = {
+            "run_id": run_id,
+            "params": cfg.to_dict(),
+            "config": cfg.to_dict(),
+            "metrics": metrics,
+            "model_checks": {
+                "pair": f"{selected_l}~{selected_r}",
+                "rank": 1,
+                "deterministic": "ci",
+                "threshold": float("nan"),
+                "skipped": True,
+            },
+            "signals": empty_signals,
+            "execution": exec_res,
+            "horizon": {
+                "train_obs": int(len(lp) * 0.7),
+                "test_obs": len(lp) - int(len(lp) * 0.7),
+                "train_start": str(lp.index.min().date()) if len(lp) else "",
+                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_end": str(lp.index.max().date()) if len(lp) else "",
+            },
+            "skipped_reason": "spread_variance_low",
+        }
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
     zect = zect_valid
 
     delta_score: Optional[pd.Series] = None
