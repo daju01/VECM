@@ -634,9 +634,6 @@ def _adf_pvalue(spread: pd.Series) -> float:
     return float(pvalue)
 
 
-def select_pair(
-    df: pd.DataFrame, cfg: PlaybookConfig, outlier_ratios: Mapping[str, float]
-) -> Tuple[str, str, float]:
 class PairSelectionError(RuntimeError):
     def __init__(
         self,
@@ -650,9 +647,14 @@ class PairSelectionError(RuntimeError):
         self.observations = observations
 
 
-def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]:
+def select_pair(
+    df: pd.DataFrame,
+    cfg: PlaybookConfig,
+    outlier_ratios: Optional[Mapping[str, float]] = None,
+) -> Tuple[str, str, float]:
     tickers = list(df.columns)
     max_ratio = float(cfg.outlier_max_ratio)
+    outlier_ratios = outlier_ratios or {}
     if len(tickers) == 2:
         if any(outlier_ratios.get(t, 0.0) > max_ratio for t in tickers):
             raise RuntimeError(
@@ -1217,10 +1219,8 @@ def run_playbook(
         LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
 
     df_clean, tickers, outlier_ratios = preprocess_data(df, cfg)
-    selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
-    df_clean, tickers = preprocess_data(df, cfg)
     try:
-        selected_l, selected_r, beta0 = select_pair(df_clean, cfg)
+        selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
     except PairSelectionError as exc:
         LOGGER.warning("Pair selection failed: %s", exc)
         result = _build_invalid_result(

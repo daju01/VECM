@@ -124,18 +124,41 @@ def fit_ms_spread(
 
     params = res.params
     sigma2_vals = []
+    param_index = getattr(params, "index", None)
+    param_names = getattr(res, "param_names", None)
     for i in range(k_regimes):
         key = f"sigma2[{i}]"
-        if key in params.index:
+        if param_index is not None and key in param_index:
             sigma2_vals.append(float(params[key]))
+        elif param_names and key in param_names:
+            sigma2_vals.append(float(params[param_names.index(key)]))
         else:
             sigma2_vals.append(np.nan)
 
     regime_mr = int(np.nanargmin(sigma2_vals)) if np.isfinite(np.nanmin(sigma2_vals)) else 0
 
     try:
-        probs = res.filtered_marginal_probabilities[regime_mr]
-        p = pd.Series(probs, index=z.index)
+        probs = res.filtered_marginal_probabilities
+        if isinstance(probs, pd.DataFrame):
+            if regime_mr in probs.columns:
+                series = probs[regime_mr]
+            elif probs.shape[1] >= k_regimes:
+                series = probs.iloc[:, regime_mr]
+            else:
+                series = probs.iloc[regime_mr]
+            p = pd.Series(series, index=z.index)
+        else:
+            arr = np.asarray(probs)
+            if arr.ndim == 2:
+                if arr.shape[0] == k_regimes and arr.shape[1] != k_regimes:
+                    values = arr[regime_mr]
+                elif arr.shape[1] >= k_regimes:
+                    values = arr[:, regime_mr]
+                else:
+                    values = arr[regime_mr]
+            else:
+                values = arr
+            p = pd.Series(values, index=z.index)
     except Exception as exc:  # pragma: no cover
         LOGGER.warning("Failed to extract filtered probabilities: %s", exc)
         p = pd.Series(0.7, index=z.index)
@@ -145,7 +168,7 @@ def fit_ms_spread(
             "success": False,
             "result": res,
             "error": str(exc),
-            "skipped": False,
+            "skipped": True,
         }
 
     p_full = p.reindex(z_series.index)
