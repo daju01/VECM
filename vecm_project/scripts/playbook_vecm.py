@@ -1246,25 +1246,26 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
 
     # Persist model checks to DuckDB
     with storage.managed_storage(cfg.tag) as conn:
-        storage.write_model_checks(
-            conn,
-            run_id,
-            pair=result["model_checks"]["pair"],
-            johansen_rank=1,
-            det_term="ci",
-            tvecm_thresholds={
-                "z_exit": cfg.z_exit,
-                "z_stop": cfg.z_stop,
-                "z_th": result["metrics"].get("z_th"),
-            },
-            spec_ok=True,
-        )
-        storage.write_regime_stats(
-            conn,
-            run_id,
-            p_mr_mean=float(result["metrics"].get("p_mr_mean", math.nan)),
-            p_mr_inpos_mean=float(result["metrics"].get("p_mr_inpos_mean", math.nan)),
-        )
+        with storage.with_transaction(conn):
+            storage.write_model_checks(
+                conn,
+                run_id,
+                pair=result["model_checks"]["pair"],
+                johansen_rank=1,
+                det_term="ci",
+                tvecm_thresholds={
+                    "z_exit": cfg.z_exit,
+                    "z_stop": cfg.z_stop,
+                    "z_th": result["metrics"].get("z_th"),
+                },
+                spec_ok=True,
+            )
+            storage.write_regime_stats(
+                conn,
+                run_id,
+                p_mr_mean=float(result["metrics"].get("p_mr_mean", math.nan)),
+                p_mr_inpos_mean=float(result["metrics"].get("p_mr_inpos_mean", math.nan)),
+            )
 
 
 def _append_manifest(path: pathlib.Path, row: Mapping[str, object]) -> None:

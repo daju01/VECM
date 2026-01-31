@@ -227,54 +227,55 @@ def run_successive_halving(
     )
 
     with storage.managed_storage("stage2_sh") as conn:
-        storage.write_run(
-            conn,
-            study_run_id,
-            started_at=start_wall,
-            finished_at=finish_wall,
-            n_workers=n_jobs,
-            plan="optuna_hyperband",
-            seed_method="hyperband",
-            notes=json.dumps({"pair": pair, "method": method, "eta": eta}),
-        )
-
-        for trial in study.trials:
-            params = trial.user_attrs.get("params", {})
-            rung_records = trial.user_attrs.get("records", [])
-            is_pruned = trial.user_attrs.get(
-                "pruned", trial.state == optuna.trial.TrialState.PRUNED
+        with storage.with_transaction(conn):
+            storage.write_run(
+                conn,
+                study_run_id,
+                started_at=start_wall,
+                finished_at=finish_wall,
+                n_workers=n_jobs,
+                plan="optuna_hyperband",
+                seed_method="hyperband",
+                notes=json.dumps({"pair": pair, "method": method, "eta": eta}),
             )
-            for record in rung_records:
-                diagnostics = record["diagnostics"]
-                horizon = record["horizon"]
-                step = record["step"]
-                trial_id = (
-                    f"{pair.replace(',', '-')}" f":sh:{trial.number:03d}:step{step}"
-                )
-                params_payload = {
-                    **params,
-                    "trial_run_id": record["trial_run_id"],
-                    "step": step,
-                }
-                storage.write_trial(
-                    conn,
-                    run_id=study_run_id,
-                    trial_id=trial_id,
-                    stage=2,
-                    pair=pair,
-                    method=method,
-                    params=params_payload,
-                    horizon={"horizon": horizon},
-                    eval_time_s=diagnostics["eval_time_s"],
-                    sharpe_oos=diagnostics["sharpe_oos"],
-                    maxdd=diagnostics["maxdd"],
-                    turnover=diagnostics["turnover"],
-                    alpha_ec=diagnostics.get("alpha_ec"),
-                    half_life_full=diagnostics.get("half_life_full"),
-                    pruned=bool(is_pruned and step == rung_records[-1]["step"]),
-                )
 
-        storage.mark_run_finished(conn, study_run_id, finished_at=finish_wall)
+            for trial in study.trials:
+                params = trial.user_attrs.get("params", {})
+                rung_records = trial.user_attrs.get("records", [])
+                is_pruned = trial.user_attrs.get(
+                    "pruned", trial.state == optuna.trial.TrialState.PRUNED
+                )
+                for record in rung_records:
+                    diagnostics = record["diagnostics"]
+                    horizon = record["horizon"]
+                    step = record["step"]
+                    trial_id = (
+                        f"{pair.replace(',', '-')}" f":sh:{trial.number:03d}:step{step}"
+                    )
+                    params_payload = {
+                        **params,
+                        "trial_run_id": record["trial_run_id"],
+                        "step": step,
+                    }
+                    storage.write_trial(
+                        conn,
+                        run_id=study_run_id,
+                        trial_id=trial_id,
+                        stage=2,
+                        pair=pair,
+                        method=method,
+                        params=params_payload,
+                        horizon={"horizon": horizon},
+                        eval_time_s=diagnostics["eval_time_s"],
+                        sharpe_oos=diagnostics["sharpe_oos"],
+                        maxdd=diagnostics["maxdd"],
+                        turnover=diagnostics["turnover"],
+                        alpha_ec=diagnostics.get("alpha_ec"),
+                        half_life_full=diagnostics.get("half_life_full"),
+                        pruned=bool(is_pruned and step == rung_records[-1]["step"]),
+                    )
+
+            storage.mark_run_finished(conn, study_run_id, finished_at=finish_wall)
 
     return study
 

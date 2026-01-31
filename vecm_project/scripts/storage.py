@@ -212,24 +212,25 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
         );
         """,
     ]
-    for sql in statements:
-        conn.execute(sql)
+    with with_transaction(conn):
+        for sql in statements:
+            conn.execute(sql)
 
-    index_specs = {
-        "runs": ("run_id",),
-        "trials": ("run_id", "trial_id"),
-        "exec_metrics": ("run_id",),
-        "trade_stats": ("run_id",),
-        "regime_stats": ("run_id",),
-        "storage_metrics": ("run_id",),
-        "model_checks": ("run_id", "pair"),
-        "pareto_front": ("run_id",),
-        "sd_loop": ("run_id", "date"),
-        "dashboard_daily": ("run_id", "date"),
-    }
-    for table, columns in index_specs.items():
-        storage_create_index(conn, table, columns)
-    _bootstrap_dirty_meta(conn)
+        index_specs = {
+            "runs": ("run_id",),
+            "trials": ("run_id", "trial_id"),
+            "exec_metrics": ("run_id",),
+            "trade_stats": ("run_id",),
+            "regime_stats": ("run_id",),
+            "storage_metrics": ("run_id",),
+            "model_checks": ("run_id", "pair"),
+            "pareto_front": ("run_id",),
+            "sd_loop": ("run_id", "date"),
+            "dashboard_daily": ("run_id", "date"),
+        }
+        for table, columns in index_specs.items():
+            storage_create_index(conn, table, columns)
+        _bootstrap_dirty_meta(conn)
 
 
 def storage_create_index(
