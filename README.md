@@ -94,6 +94,25 @@ Yahoo Finance. Gunakan opsi `--subset` untuk memberi tahu playbook pasangan mana
 yang ingin dianalisis tanpa perlu mengubah kode ataupun daftar default pada
 `parallel_run`.
 
+### Mengelola daftar ticker default
+
+Daftar ticker bawaan kini disimpan di `vecm_project/config/ticker_groups.json`.
+Untuk menambah atau mengganti ticker, cukup edit file JSON tersebut tanpa
+menyentuh kode Python. Setiap kunci berisi daftar ticker untuk satu kelompok
+(misalnya `banking_group`, `coal_group`). Jika ingin memakai lokasi lain,
+set variabel lingkungan `VECM_TICKER_CONFIG` ke path JSON yang Anda pilih.
+Apabila file konfigurasi tidak ditemukan atau invalid, pipeline akan kembali
+ke daftar default yang dibundel dalam skrip.
+
+Konfigurasi kustom akan menimpa hanya kunci yang Anda tulis; kunci lain tetap
+menggunakan default. Contoh menambah ticker ke kelompok perbankan:
+
+```json
+{
+  "banking_group": ["BBCA.JK", "BMRI.JK", "BBRI.JK", "BBNI.JK", "ARTO.JK", "BBKP.JK"]
+}
+```
+
 ### Contoh satu pasangan (playbook_vecm)
 
 Perintah berikut memuat cache `adj_close_data.csv`, memastikan harga BBRI/BBNI

@@ -8,6 +8,7 @@ import os
 import pathlib
 import time
 from functools import lru_cache
+from itertools import chain
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
@@ -29,6 +30,8 @@ BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
 CACHE_META_PATH = DATA_DIR / "adj_close_data.meta.json"
+TICKER_CONFIG_PATH = BASE_DIR / "config" / "ticker_groups.json"
+TICKER_CONFIG_ENV = "VECM_TICKER_CONFIG"
 OFFLINE_FALLBACK_PATH = pathlib.Path(
     os.getenv("OFFLINE_FALLBACK_PATH", str(DATA_DIR / "offline_prices.csv"))
 )
@@ -55,168 +58,156 @@ _REQUESTS_SESSION: Any = None
 _REQUESTS_SESSION_PID: Optional[int] = None
 
 
-# ---------------------------------------------------------------------------
-# Ticker universe replicated from the R reference script
-# ---------------------------------------------------------------------------
-MACRO_TICKERS = ["^JKSE", "USDIDR=X"]
-COMMODITY_PRICE = ["GC=F"]
+DEFAULT_TICKER_CONFIG: Dict[str, List[str]] = {
+    "macro_tickers": ["^JKSE", "USDIDR=X"],
+    "commodity_price": ["GC=F"],
+    "banking_group": [
+        "BBCA.JK",
+        "BMRI.JK",
+        "BBRI.JK",
+        "BBNI.JK",
+        "BNLI.JK",
+        "MEGA.JK",
+        "BNGA.JK",
+        "PNBN.JK",
+        "BRIS.JK",
+        "BDMN.JK",
+        "ARTO.JK",
+    ],
+    "telco_group": ["TLKM.JK", "ISAT.JK", "EXCL.JK", "FREN.JK", "MTEL.JK", "TOWR.JK", "TBIG.JK"],
+    "datacenter_group": ["DCII.JK", "EDGE.JK"],
+    "digital_platform_group": [
+        "BUKA.JK",
+        "GOTO.JK",
+        "EMTK.JK",
+        "MCAS.JK",
+        "SCMA.JK",
+        "TECH.JK",
+        "BELI.JK",
+    ],
+    "coal_group": [
+        "ADRO.JK",
+        "PTBA.JK",
+        "HRUM.JK",
+        "BYAN.JK",
+        "BUMI.JK",
+        "ITMG.JK",
+        "DSSA.JK",
+        "CUAN.JK",
+        "TOBA.JK",
+        "GEMS.JK",
+        "SMMT.JK",
+        "INDY.JK",
+    ],
+    "mineral_group": ["TINS.JK", "BRMS.JK", "NICL.JK"],
+    "strategic_resource_group": ["MDKA.JK", "AMMN.JK", "ANTM.JK", "INCO.JK", "MBMA.JK", "NCKL.JK"],
+    "energy_chemical_group": ["ESSA.JK", "RAJA.JK", "BRPT.JK", "BREN.JK", "DSSA.JK", "PGAS.JK", "INDY.JK"],
+    "food_beverage_group": ["ICBP.JK", "INDF.JK", "MYOR.JK", "ULTJ.JK", "CMRY.JK", "CLEO.JK", "ROTI.JK", "JPFA.JK"],
+    "non_food_consumer_group": ["UNVR.JK", "HMSP.JK", "GGRM.JK", "KLBF.JK", "SIDO.JK", "WIIM.JK"],
+    "industry_infra_group": [
+        "ASII.JK",
+        "UNTR.JK",
+        "SMGR.JK",
+        "WTON.JK",
+        "PTPP.JK",
+        "JSMR.JK",
+        "AKRA.JK",
+        "KRAS.JK",
+        "SMBR.JK",
+        "WIKA.JK",
+    ],
+    "investment_group": ["SRTG.JK", "MIDI.JK", "SCMA.JK", "FILM.JK", "MNCN.JK", "LPPF.JK"],
+    "petrochemical_group": ["TPIA.JK", "BRPT.JK"],
+    "palmoil_group": ["AALI.JK", "LSIP.JK", "SIMP.JK", "DSNG.JK", "SMAR.JK", "TBLA.JK", "BWPT.JK", "TAPG.JK", "PALM.JK"],
+    "multifinance_group": ["ADMF.JK", "BFIN.JK", "MFIN.JK", "IMJS.JK", "TIFA.JK", "CFIN.JK", "TFCM.JK", "BCAP.JK"],
+    "media_retail_group": ["SCMA.JK", "MNCN.JK", "FILM.JK", "LPPF.JK"],
+    "consumer_retail_group": ["AMRT.JK", "MDIY.JK", "DNET.JK"],
+    "property_group": ["PANI.JK", "BSDE.JK", "CTRA.JK", "SMRA.JK", "ASRI.JK", "BKSL.JK", "DMAS.JK", "LPKR.JK", "LCGP.JK"],
+    "healthcare_providers": ["MIKA.JK", "PRDA.JK", "SAME.JK", "SILO.JK", "HEAL.JK"],
+    "logistics_transport": ["ASSA.JK", "BIRD.JK"],
+    "shipping": ["SMDR.JK"],
+    "aviation": ["GIAA.JK"],
+    "cement_materials": ["INTP.JK"],
+    "specialty_retail": ["RALS.JK", "ERAA.JK", "MAPI.JK", "ACES.JK"],
+    "poultry_feed": ["MAIN.JK", "CPIN.JK"],
+    "banking_additional": ["BTPS.JK", "BTPN.JK"],
+    "industrial_property": ["SSIA.JK", "BEST.JK"],
+    "pulp_paper": ["INKP.JK", "TKIM.JK"],
+    "energy_resources": ["MEDC.JK"],
+    "renewables_utilities": ["KEEN.JK", "ARKO.JK", "PGEO.JK"],
+}
 
-BANKING_GROUP = [
-    "BBCA.JK",
-    "BMRI.JK",
-    "BBRI.JK",
-    "BBNI.JK",
-    "BNLI.JK",
-    "MEGA.JK",
-    "BNGA.JK",
-    "PNBN.JK",
-    "BRIS.JK",
-    "BDMN.JK",
-    "ARTO.JK",
-]
 
-TELCO_GROUP = ["TLKM.JK", "ISAT.JK", "EXCL.JK", "FREN.JK", "MTEL.JK", "TOWR.JK", "TBIG.JK"]
+def _normalise_ticker_config(config: Dict[str, Any]) -> Dict[str, List[str]]:
+    cleaned: Dict[str, List[str]] = {}
+    for key, value in config.items():
+        if isinstance(value, (list, tuple)):
+            cleaned[key] = [str(item) for item in value if str(item).strip()]
+    return cleaned
 
-DATACENTER_GROUP = ["DCII.JK", "EDGE.JK"]
 
-DIGITAL_PLATFORM_GROUP = [
-    "BUKA.JK",
-    "GOTO.JK",
-    "EMTK.JK",
-    "MCAS.JK",
-    "SCMA.JK",
-    "TECH.JK",
-    "BELI.JK",
-]
+def _copy_ticker_config(config: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    return {key: list(values) for key, values in config.items()}
 
-COAL_GROUP = [
-    "ADRO.JK",
-    "PTBA.JK",
-    "HRUM.JK",
-    "BYAN.JK",
-    "BUMI.JK",
-    "ITMG.JK",
-    "DSSA.JK",
-    "CUAN.JK",
-    "TOBA.JK",
-    "GEMS.JK",
-    "SMMT.JK",
-    "INDY.JK",
-]
 
-MINERAL_GROUP = ["TINS.JK", "BRMS.JK", "NICL.JK"]
+def load_ticker_config(config_path: Optional[pathlib.Path] = None) -> Dict[str, List[str]]:
+    path = config_path or pathlib.Path(os.getenv(TICKER_CONFIG_ENV, str(TICKER_CONFIG_PATH)))
+    if not path.exists():
+        LOGGER.warning("Ticker config not found at %s; using defaults", path)
+        return _copy_ticker_config(DEFAULT_TICKER_CONFIG)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Failed to read ticker config at %s: %s; using defaults", path, exc)
+        return _copy_ticker_config(DEFAULT_TICKER_CONFIG)
+    if not isinstance(payload, dict):
+        LOGGER.warning("Ticker config at %s must be a JSON object; using defaults", path)
+        return _copy_ticker_config(DEFAULT_TICKER_CONFIG)
+    cleaned = _normalise_ticker_config(payload)
+    if not cleaned:
+        LOGGER.warning("Ticker config at %s is empty after normalisation; using defaults", path)
+        return _copy_ticker_config(DEFAULT_TICKER_CONFIG)
+    merged = _copy_ticker_config(DEFAULT_TICKER_CONFIG)
+    merged.update(cleaned)
+    return merged
 
-STRATEGIC_RESOURCE_GROUP = [
-    "MDKA.JK",
-    "AMMN.JK",
-    "ANTM.JK",
-    "INCO.JK",
-    "MBMA.JK",
-    "NCKL.JK",
-]
 
-ENERGY_CHEMICAL_GROUP = ["ESSA.JK", "RAJA.JK", "BRPT.JK", "BREN.JK", "DSSA.JK", "PGAS.JK", "INDY.JK"]
+TICKER_CONFIG = load_ticker_config()
+MACRO_TICKERS = TICKER_CONFIG.get("macro_tickers", [])
+COMMODITY_PRICE = TICKER_CONFIG.get("commodity_price", [])
+BANKING_GROUP = TICKER_CONFIG.get("banking_group", [])
+TELCO_GROUP = TICKER_CONFIG.get("telco_group", [])
+DATACENTER_GROUP = TICKER_CONFIG.get("datacenter_group", [])
+DIGITAL_PLATFORM_GROUP = TICKER_CONFIG.get("digital_platform_group", [])
+COAL_GROUP = TICKER_CONFIG.get("coal_group", [])
+MINERAL_GROUP = TICKER_CONFIG.get("mineral_group", [])
+STRATEGIC_RESOURCE_GROUP = TICKER_CONFIG.get("strategic_resource_group", [])
+ENERGY_CHEMICAL_GROUP = TICKER_CONFIG.get("energy_chemical_group", [])
+FOOD_BEVERAGE_GROUP = TICKER_CONFIG.get("food_beverage_group", [])
+NON_FOOD_CONSUMER_GROUP = TICKER_CONFIG.get("non_food_consumer_group", [])
+INDUSTRY_INFRA_GROUP = TICKER_CONFIG.get("industry_infra_group", [])
+INVESTMENT_GROUP = TICKER_CONFIG.get("investment_group", [])
+PETROCHEMICAL_GROUP = TICKER_CONFIG.get("petrochemical_group", [])
+PALMOIL_GROUP = TICKER_CONFIG.get("palmoil_group", [])
+MULTIFINANCE_GROUP = TICKER_CONFIG.get("multifinance_group", [])
+MEDIA_RETAIL_GROUP = TICKER_CONFIG.get("media_retail_group", [])
+CONSUMER_RETAIL_GROUP = TICKER_CONFIG.get("consumer_retail_group", [])
+PROPERTY_GROUP = TICKER_CONFIG.get("property_group", [])
+HEALTHCARE_PROVIDERS = TICKER_CONFIG.get("healthcare_providers", [])
+LOGISTICS_TRANSPORT = TICKER_CONFIG.get("logistics_transport", [])
+SHIPPING = TICKER_CONFIG.get("shipping", [])
+AVIATION = TICKER_CONFIG.get("aviation", [])
+CEMENT_MATERIALS = TICKER_CONFIG.get("cement_materials", [])
+SPECIALTY_RETAIL = TICKER_CONFIG.get("specialty_retail", [])
+POULTRY_FEED = TICKER_CONFIG.get("poultry_feed", [])
+BANKING_ADDITIONAL = TICKER_CONFIG.get("banking_additional", [])
+INDUSTRIAL_PROPERTY = TICKER_CONFIG.get("industrial_property", [])
+PULP_PAPER = TICKER_CONFIG.get("pulp_paper", [])
+ENERGY_RESOURCES = TICKER_CONFIG.get("energy_resources", [])
+RENEWABLES_UTILITIES = TICKER_CONFIG.get("renewables_utilities", [])
 
-FOOD_BEVERAGE_GROUP = ["ICBP.JK", "INDF.JK", "MYOR.JK", "ULTJ.JK", "CMRY.JK", "CLEO.JK", "ROTI.JK", "JPFA.JK"]
-
-NON_FOOD_CONSUMER_GROUP = ["UNVR.JK", "HMSP.JK", "GGRM.JK", "KLBF.JK", "SIDO.JK", "WIIM.JK"]
-
-INDUSTRY_INFRA_GROUP = [
-    "ASII.JK",
-    "UNTR.JK",
-    "SMGR.JK",
-    "WTON.JK",
-    "PTPP.JK",
-    "JSMR.JK",
-    "AKRA.JK",
-    "KRAS.JK",
-    "SMBR.JK",
-    "WIKA.JK",
-]
-
-INVESTMENT_GROUP = ["SRTG.JK", "MIDI.JK", "SCMA.JK", "FILM.JK", "MNCN.JK", "LPPF.JK"]
-
-PETROCHEMICAL_GROUP = ["TPIA.JK", "BRPT.JK"]
-
-PALMOIL_GROUP = [
-    "AALI.JK",
-    "LSIP.JK",
-    "SIMP.JK",
-    "DSNG.JK",
-    "SMAR.JK",
-    "TBLA.JK",
-    "BWPT.JK",
-    "TAPG.JK",
-    "PALM.JK",
-]
-
-MULTIFINANCE_GROUP = ["ADMF.JK", "BFIN.JK", "MFIN.JK", "IMJS.JK", "TIFA.JK", "CFIN.JK", "TFCM.JK", "BCAP.JK"]
-
-MEDIA_RETAIL_GROUP = ["SCMA.JK", "MNCN.JK", "FILM.JK", "LPPF.JK"]
-
-CONSUMER_RETAIL_GROUP = ["AMRT.JK", "MDIY.JK", "DNET.JK"]
-
-PROPERTY_GROUP = [
-    "PANI.JK",
-    "BSDE.JK",
-    "CTRA.JK",
-    "SMRA.JK",
-    "ASRI.JK",
-    "BKSL.JK",
-    "DMAS.JK",
-    "LPKR.JK",
-    "LCGP.JK",
-]
-
-HEALTHCARE_PROVIDERS = ["MIKA.JK", "PRDA.JK", "SAME.JK", "SILO.JK", "HEAL.JK"]
-LOGISTICS_TRANSPORT = ["ASSA.JK", "BIRD.JK"]
-SHIPPING = ["SMDR.JK"]
-AVIATION = ["GIAA.JK"]
-CEMENT_MATERIALS = ["INTP.JK"]
-SPECIALTY_RETAIL = ["RALS.JK", "ERAA.JK", "MAPI.JK", "ACES.JK"]
-POULTRY_FEED = ["MAIN.JK", "CPIN.JK"]
-BANKING_ADDITIONAL = ["BTPS.JK", "BTPN.JK"]
-INDUSTRIAL_PROPERTY = ["SSIA.JK", "BEST.JK"]
-PULP_PAPER = ["INKP.JK", "TKIM.JK"]
-ENERGY_RESOURCES = ["MEDC.JK"]
-RENEWABLES_UTILITIES = ["KEEN.JK", "ARKO.JK", "PGEO.JK"]
-
-ALL_TICKERS = sorted(
-    set(
-        MACRO_TICKERS
-        + COMMODITY_PRICE
-        + BANKING_GROUP
-        + TELCO_GROUP
-        + DATACENTER_GROUP
-        + DIGITAL_PLATFORM_GROUP
-        + COAL_GROUP
-        + MINERAL_GROUP
-        + STRATEGIC_RESOURCE_GROUP
-        + ENERGY_CHEMICAL_GROUP
-        + FOOD_BEVERAGE_GROUP
-        + NON_FOOD_CONSUMER_GROUP
-        + INDUSTRY_INFRA_GROUP
-        + INVESTMENT_GROUP
-        + PETROCHEMICAL_GROUP
-        + PALMOIL_GROUP
-        + MULTIFINANCE_GROUP
-        + MEDIA_RETAIL_GROUP
-        + CONSUMER_RETAIL_GROUP
-        + PROPERTY_GROUP
-        + HEALTHCARE_PROVIDERS
-        + LOGISTICS_TRANSPORT
-        + SHIPPING
-        + AVIATION
-        + CEMENT_MATERIALS
-        + SPECIALTY_RETAIL
-        + POULTRY_FEED
-        + BANKING_ADDITIONAL
-        + INDUSTRIAL_PROPERTY
-        + PULP_PAPER
-        + ENERGY_RESOURCES
-        + RENEWABLES_UTILITIES
-    )
-)
+ALL_TICKERS = sorted(set(chain.from_iterable(TICKER_CONFIG.values())))
 
 
 def _ensure_data_dir() -> None:
