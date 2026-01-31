@@ -592,6 +592,7 @@ def ensure_price_data(
 
     new_frames: List[pd.DataFrame] = []
     refreshed_tickers: List[str] = []
+    failed_tickers: List[str] = []
     meta_changed = False
     if download_plan:
         max_workers = max(1, min(MAX_WORKERS, len(download_plan)))
@@ -613,6 +614,7 @@ def ensure_price_data(
                 except Exception as exc:  # pragma: no cover - network/runtime errors
                     LOGGER.warning("Download task failed for %s: %s", ticker, exc)
                     _update_meta_record(meta, ticker, refreshed=False)
+                    failed_tickers.append(ticker)
                     meta_changed = True
                     continue
                 if not frame.empty:
@@ -621,6 +623,7 @@ def ensure_price_data(
                     _update_meta_record(meta, ticker, refreshed=True)
                 else:
                     _update_meta_record(meta, ticker, refreshed=False)
+                    failed_tickers.append(ticker)
                 meta_changed = True
     else:
         LOGGER.info("No tickers required download; cache is up to date")
@@ -640,6 +643,14 @@ def ensure_price_data(
         LOGGER.info("Refreshed %d tickers: %s", len(refreshed_tickers), ", ".join(sorted(refreshed_tickers)[:10]))
         if len(refreshed_tickers) > 10:
             LOGGER.info("...and %d more", len(refreshed_tickers) - 10)
+    if failed_tickers:
+        LOGGER.warning(
+            "Failed to refresh %d tickers: %s",
+            len(failed_tickers),
+            ", ".join(sorted(failed_tickers)[:10]),
+        )
+        if len(failed_tickers) > 10:
+            LOGGER.warning("...and %d more", len(failed_tickers) - 10)
     return wide
 
 

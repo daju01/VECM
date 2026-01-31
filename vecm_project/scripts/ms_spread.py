@@ -79,12 +79,21 @@ def fit_ms_spread(
 
     z = z_series.dropna().astype(float)
     if len(z) < min_len or MarkovRegression is None:
+        reason = "insufficient_data" if len(z) < min_len else "statsmodels_unavailable"
         LOGGER.info(
             "MS spread fit skipped (len=%d, has_markov=%s)",
             len(z),
             MarkovRegression is not None,
         )
         p = pd.Series(0.7, index=z_series.index)
+        return {
+            "p_mr": p,
+            "regime_mr": None,
+            "success": False,
+            "result": None,
+            "error": reason,
+            "skipped": True,
+        }
         model = {"p_mr": p, "regime_mr": None, "success": False, "result": None}
         _MS_SPREAD_CACHE[cache_key_tuple] = model
         return model
@@ -101,6 +110,14 @@ def fit_ms_spread(
     except Exception as exc:  # pragma: no cover
         LOGGER.warning("MS spread fit failed: %s", exc)
         p = pd.Series(0.7, index=z_series.index)
+        return {
+            "p_mr": p,
+            "regime_mr": None,
+            "success": False,
+            "result": None,
+            "error": str(exc),
+            "skipped": False,
+        }
         model = {"p_mr": p, "regime_mr": None, "success": False, "result": None}
         _MS_SPREAD_CACHE[cache_key_tuple] = model
         return model
@@ -122,6 +139,14 @@ def fit_ms_spread(
     except Exception as exc:  # pragma: no cover
         LOGGER.warning("Failed to extract filtered probabilities: %s", exc)
         p = pd.Series(0.7, index=z.index)
+        return {
+            "p_mr": p,
+            "regime_mr": None,
+            "success": False,
+            "result": res,
+            "error": str(exc),
+            "skipped": False,
+        }
 
     p_full = p.reindex(z_series.index)
     if p_full.isna().any():
@@ -132,6 +157,8 @@ def fit_ms_spread(
         "regime_mr": regime_mr,
         "success": True,
         "result": res,
+        "error": "",
+        "skipped": False,
     }
     _MS_SPREAD_CACHE[cache_key_tuple] = model
     return model

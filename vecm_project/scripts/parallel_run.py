@@ -968,6 +968,29 @@ def _write_stage_summary(statuses: List[Dict[str, Any]], config: RunnerConfig) -
     LOGGER.info("Stage summary written to %s", path)
 
 
+def _report_failed_pairs(statuses: List[Dict[str, Any]], config: RunnerConfig) -> None:
+    df = pd.DataFrame(statuses)
+    if df.empty:
+        return
+    def _status(row: pd.Series) -> str:
+        rc = row.get("rc")
+        if pd.isna(rc):
+            return "skipped"
+        return "ok" if rc == 0 else "failed"
+    df = df.assign(status=df.apply(_status, axis=1))
+    failed = df[df["status"] != "ok"].copy()
+    if failed.empty:
+        LOGGER.info("No failed/skipped pairs detected")
+        return
+    cols = [col for col in ["subset", "tag", "run_id", "status", "error"] if col in failed.columns]
+    report_path = config.out_dir / f"failed_pairs_{config.stage}.csv"
+    failed[cols].to_csv(report_path, index=False)
+    LOGGER.warning("Recorded %d failed/skipped pairs to %s", len(failed), report_path)
+    preview = failed[cols].head(5)
+    for _, row in preview.iterrows():
+        LOGGER.warning("Pair status: %s | %s | %s", row.get("status"), row.get("subset"), row.get("error"))
+
+
 def _cli_subset_override(args: argparse.Namespace) -> Optional[List[str]]:
     entries: List[str] = []
     if args.subs:
@@ -1001,6 +1024,7 @@ def run_parallel(
     statuses = _execute_jobs(jobs, config)
     _aggregate_exec_metrics(statuses, config)
     _write_stage_summary(statuses, config)
+    _report_failed_pairs(statuses, config)
     completed = [s for s in statuses if s.get("rc") == 0]
     LOGGER.info("Completed %s/%s jobs", len(completed), len(jobs))
 

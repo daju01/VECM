@@ -1404,12 +1404,23 @@ def run_playbook(
             LOGGER.info("No z_mom12 panel found in short_term_signals attrs; skip delta_mom12")
 
     # Regime switching model on the spread to infer mean-reverting regime probability
-    try:
-        ms_model = fit_ms_spread(zect)
+    ms_status = "ok"
+    ms_error = ""
+    ms_model = fit_ms_spread(zect)
+    if not ms_model.get("success", False):
+        ms_error = str(ms_model.get("error") or "unknown")
+        if ms_model.get("skipped", False):
+            ms_status = "skipped"
+            LOGGER.warning(
+                "MS spread model skipped (%s); continuing with flat regime probability",
+                ms_error,
+            )
+            p_mr_series = pd.Series(0.7, index=zect.index)
+        else:
+            LOGGER.error("MS spread model failed: %s", ms_error)
+            raise RuntimeError(f"MS spread model failed: {ms_error}")
+    else:
         p_mr_series = compute_regime_prob(ms_model, zect)
-    except Exception as exc:
-        LOGGER.warning("MS spread modelling failed; falling back to flat regime prob: %s", exc)
-        p_mr_series = pd.Series(0.7, index=zect.index)
 
     # Estimasi parameter konvergensi spread pada full sample
     alpha_ec, half_life_full = _convergence_stats(zect)
@@ -1456,6 +1467,9 @@ def run_playbook(
     metrics["alpha_ec"] = alpha_ec
     metrics["half_life_full"] = half_life_full
     metrics["z_th"] = z_th
+    metrics["ms_regime_status"] = ms_status
+    if ms_error:
+        metrics["ms_regime_error"] = ms_error
     if cfg.z_entry is not None and np.isfinite(cfg.z_entry):
         metrics["z_entry"] = float(cfg.z_entry)
     result = {
