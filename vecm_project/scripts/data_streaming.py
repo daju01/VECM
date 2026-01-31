@@ -29,6 +29,9 @@ BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
 CACHE_META_PATH = DATA_DIR / "adj_close_data.meta.json"
+OFFLINE_FALLBACK_PATH = pathlib.Path(
+    os.getenv("OFFLINE_FALLBACK_PATH", str(DATA_DIR / "offline_prices.csv"))
+)
 DEFAULT_START_DATE = dt.date(2013, 1, 1)
 MAX_WORKERS = 4
 MAX_RETRIES = 3
@@ -305,6 +308,8 @@ def _read_existing_prices() -> Optional[pd.DataFrame]:
 
 @lru_cache(maxsize=1)
 def _load_offline_table() -> pd.DataFrame:
+    if os.getenv("OFFLINE_FALLBACK_PATH") is None:
+        LOGGER.info("Using default offline fallback path at %s", OFFLINE_FALLBACK_PATH)
     if not OFFLINE_FALLBACK_PATH.exists():
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     try:
