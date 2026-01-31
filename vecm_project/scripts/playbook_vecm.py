@@ -63,6 +63,9 @@ RUN_ID_FMT = "%Y%m%d_%H%M%S"
 LOGGER = storage.configure_logging("playbook_vecm")
 
 
+_DATAFRAME_CACHE: Dict[str, Tuple[float, pd.DataFrame]] = {}
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses & configuration ------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -400,11 +403,17 @@ def _mfpt_threshold(z_series: pd.Series, z_grid: Iterable[float], z_exit: float,
 # Data loading & preprocessing ----------------------------------------------
 # ---------------------------------------------------------------------------
 def load_and_validate_data(path: str) -> pd.DataFrame:
+    cached = _DATAFRAME_CACHE.get(path)
     if not os.path.exists(path):
         LOGGER.info("Input file %s missing; invoking streaming loader", path)
         ensure_price_data(force_refresh=False)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Input file not found: {path}")
+    mtime = os.path.getmtime(path)
+    if cached is not None:
+        cached_mtime, cached_df = cached
+        if mtime == cached_mtime:
+            return cached_df.copy(deep=True)
     df = pd.read_csv(path)
     if df.empty:
         raise ValueError("Input CSV has no rows")
@@ -429,6 +438,7 @@ def load_and_validate_data(path: str) -> pd.DataFrame:
     if len(price_cols) < 2:
         raise ValueError("Need at least two price columns")
     df = df.reset_index(drop=True)
+    _DATAFRAME_CACHE[path] = (mtime, df.copy(deep=True))
     return df
 
 
@@ -582,6 +592,20 @@ def _adf_pvalue(spread: pd.Series) -> float:
 def select_pair(
     df: pd.DataFrame, cfg: PlaybookConfig, outlier_ratios: Mapping[str, float]
 ) -> Tuple[str, str, float]:
+class PairSelectionError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        pair: Optional[str] = None,
+        observations: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.pair = pair
+        self.observations = observations
+
+
+def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]:
     tickers = list(df.columns)
     max_ratio = float(cfg.outlier_max_ratio)
     if len(tickers) == 2:
@@ -591,6 +615,21 @@ def select_pair(
                 f"({max_ratio:.2%})."
             )
         beta = _johansen_beta(np.log(df.iloc[:, :2]))
+        lp = np.log(df.iloc[:, :2].dropna())
+        obs = len(lp)
+        if obs < 120:
+            LOGGER.warning(
+                "Insufficient log-price observations for %s~%s (%d < 120); marking pair invalid",
+                tickers[0],
+                tickers[1],
+                obs,
+            )
+            raise PairSelectionError(
+                "Insufficient log-price observations for Johansen beta",
+                pair=f"{tickers[0]}~{tickers[1]}",
+                observations=obs,
+            )
+        beta = _johansen_beta(lp)
         if not np.isfinite(beta):
             beta = 1.0
         return tickers[0], tickers[1], beta
@@ -600,6 +639,7 @@ def select_pair(
     rng = np.random.default_rng(123)
     if len(combos) > 200:
         combos = rng.choice(combos, size=200, replace=False)
+    skipped_obs = 0
     for idx0, idx1 in combos:
         t1, t2 = tickers[idx0], tickers[idx1]
         if outlier_ratios.get(t1, 0.0) > max_ratio or outlier_ratios.get(t2, 0.0) > max_ratio:
@@ -613,6 +653,13 @@ def select_pair(
             continue
         lp = np.log(df[[t1, t2]].dropna())
         if len(lp) < 120:
+            LOGGER.info(
+                "Skipping pair %s~%s due to insufficient log-price observations (%d < 120)",
+                t1,
+                t2,
+                len(lp),
+            )
+            skipped_obs += 1
             continue
         beta = _johansen_beta(lp)
         if not np.isfinite(beta):
@@ -627,6 +674,15 @@ def select_pair(
             best_score = score
             best_pair = (t1, t2, beta)
     if best_pair is None:
+        if skipped_obs:
+            LOGGER.warning(
+                "No valid pairs found; %d pairs skipped due to <120 observations",
+                skipped_obs,
+            )
+            raise PairSelectionError(
+                "No valid pairs available after minimum observation filter",
+                observations=skipped_obs,
+            )
         raise RuntimeError("Pair selection failed. Try specifying --subset")
     return best_pair
 
@@ -1021,6 +1077,57 @@ def compute_metrics(
     }
 
 
+def _build_invalid_result(
+    *,
+    run_id: str,
+    cfg: PlaybookConfig,
+    reason: str,
+    pair: Optional[str] = None,
+    observations: Optional[int] = None,
+) -> Dict[str, object]:
+    empty_index = pd.DatetimeIndex([])
+    empty_series = pd.Series(dtype=float, index=empty_index)
+    exec_res = ExecutionResult(
+        pos=empty_series,
+        ret=empty_series,
+        ret_core=empty_series,
+        cost=empty_series,
+        trades=pd.DataFrame(),
+    )
+    metrics = {
+        "status": reason,
+        "z_th": float("nan"),
+    }
+    model_checks = {
+        "pair": pair or "",
+        "rank": 0,
+        "deterministic": "ci",
+        "threshold": float("nan"),
+        "spec_ok": False,
+        "status": reason,
+    }
+    if observations is not None:
+        model_checks["observations"] = int(observations)
+    return {
+        "run_id": run_id,
+        "params": cfg.to_dict(),
+        "config": cfg.to_dict(),
+        "status": reason,
+        "metrics": metrics,
+        "model_checks": model_checks,
+        "signals": pd.DataFrame(),
+        "execution": exec_res,
+        "horizon": {
+            "train_obs": 0,
+            "test_obs": 0,
+            "train_start": "",
+            "train_end": "",
+            "test_start": "",
+            "test_end": "",
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline -------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -1066,6 +1173,21 @@ def run_playbook(
 
     df_clean, tickers, outlier_ratios = preprocess_data(df, cfg)
     selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
+    df_clean, tickers = preprocess_data(df, cfg)
+    try:
+        selected_l, selected_r, beta0 = select_pair(df_clean, cfg)
+    except PairSelectionError as exc:
+        LOGGER.warning("Pair selection failed: %s", exc)
+        result = _build_invalid_result(
+            run_id=run_id,
+            cfg=cfg,
+            reason="INVALID_PAIR_OBSERVATIONS",
+            pair=exc.pair,
+            observations=exc.observations,
+        )
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        return result
     LOGGER.info("Selected pair: %s ~ %s | beta0=%.4f", selected_l, selected_r, beta0)
     pair_prices = df_clean[[selected_l, selected_r]].dropna()
     lp = np.log(pair_prices)
@@ -1076,19 +1198,133 @@ def run_playbook(
     zect = (ect - mect) / sect
     zect = zect.replace([np.inf, -np.inf], np.nan)
     zect_valid = zect.dropna()
+    min_spread_std = 1e-6
+    ect_std = float(ect.std()) if len(ect) else float("nan")
     if zect_valid.empty:
-        fallback_std_val = float(ect.std())
-        if np.isfinite(fallback_std_val) and fallback_std_val > 0:
+        fallback_std_val = ect_std
+        if np.isfinite(fallback_std_val) and fallback_std_val >= min_spread_std:
             LOGGER.warning(
                 "Z-score series empty after normalisation; falling back to global standard deviation"
             )
             fallback = (ect - ect.mean()) / fallback_std_val
             zect_valid = fallback.dropna()
     if zect_valid.empty:
-        LOGGER.warning(
-            "Z-score series still empty; synthesising flat spread to allow pipeline continuation"
+        LOGGER.error(
+            "Z-score series empty after normalisation; skipping pair %s~%s",
+            selected_l,
+            selected_r,
         )
-        zect_valid = pd.Series(0.0, index=lp.index)
+        empty_idx = lp.index
+        empty_signals = pd.DataFrame(
+            {"long": 0.0, "short": 0.0}, index=empty_idx, dtype=float
+        )
+        empty_series = pd.Series(0.0, index=empty_idx)
+        exec_res = ExecutionResult(
+            pos=empty_series.rename("pos"),
+            ret=empty_series.rename("ret"),
+            ret_core=empty_series.rename("ret_core"),
+            cost=empty_series.rename("cost"),
+            trades=pd.DataFrame(),
+        )
+        if cfg.oos_start:
+            oos_start_date = pd.to_datetime(cfg.oos_start).date()
+        else:
+            base_index = empty_idx
+            if not len(base_index):
+                oos_start_date = dt.datetime.utcnow().date()
+            else:
+                cutoff_idx = int(len(base_index) * 0.7)
+                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+                oos_start_date = base_index[cutoff_idx].date()
+        metrics = compute_metrics(exec_res, cfg, oos_start_date)
+        metrics["skip_reason"] = "zscore_empty"
+        result = {
+            "run_id": run_id,
+            "params": cfg.to_dict(),
+            "config": cfg.to_dict(),
+            "metrics": metrics,
+            "model_checks": {
+                "pair": f"{selected_l}~{selected_r}",
+                "rank": 1,
+                "deterministic": "ci",
+                "threshold": float("nan"),
+                "skipped": True,
+            },
+            "signals": empty_signals,
+            "execution": exec_res,
+            "horizon": {
+                "train_obs": int(len(lp) * 0.7),
+                "test_obs": len(lp) - int(len(lp) * 0.7),
+                "train_start": str(lp.index.min().date()) if len(lp) else "",
+                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_end": str(lp.index.max().date()) if len(lp) else "",
+            },
+            "skipped_reason": "zscore_empty",
+        }
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
+    if not np.isfinite(ect_std) or ect_std < min_spread_std:
+        LOGGER.error(
+            "Spread variance too low (std=%.6g); skipping pair %s~%s",
+            ect_std,
+            selected_l,
+            selected_r,
+        )
+        empty_idx = lp.index
+        empty_signals = pd.DataFrame(
+            {"long": 0.0, "short": 0.0}, index=empty_idx, dtype=float
+        )
+        empty_series = pd.Series(0.0, index=empty_idx)
+        exec_res = ExecutionResult(
+            pos=empty_series.rename("pos"),
+            ret=empty_series.rename("ret"),
+            ret_core=empty_series.rename("ret_core"),
+            cost=empty_series.rename("cost"),
+            trades=pd.DataFrame(),
+        )
+        if cfg.oos_start:
+            oos_start_date = pd.to_datetime(cfg.oos_start).date()
+        else:
+            base_index = empty_idx
+            if not len(base_index):
+                oos_start_date = dt.datetime.utcnow().date()
+            else:
+                cutoff_idx = int(len(base_index) * 0.7)
+                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+                oos_start_date = base_index[cutoff_idx].date()
+        metrics = compute_metrics(exec_res, cfg, oos_start_date)
+        metrics["skip_reason"] = "spread_variance_low"
+        result = {
+            "run_id": run_id,
+            "params": cfg.to_dict(),
+            "config": cfg.to_dict(),
+            "metrics": metrics,
+            "model_checks": {
+                "pair": f"{selected_l}~{selected_r}",
+                "rank": 1,
+                "deterministic": "ci",
+                "threshold": float("nan"),
+                "skipped": True,
+            },
+            "signals": empty_signals,
+            "execution": exec_res,
+            "horizon": {
+                "train_obs": int(len(lp) * 0.7),
+                "test_obs": len(lp) - int(len(lp) * 0.7),
+                "train_start": str(lp.index.min().date()) if len(lp) else "",
+                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_end": str(lp.index.max().date()) if len(lp) else "",
+            },
+            "skipped_reason": "spread_variance_low",
+        }
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
     zect = zect_valid
 
     delta_score: Optional[pd.Series] = None
@@ -1187,6 +1423,7 @@ def run_playbook(
             "rank": 1,
             "deterministic": "ci",
             "threshold": float(z_th),
+            "spec_ok": True,
         },
         "signals": signals,
         "execution": exec_res,
@@ -1248,6 +1485,9 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
     with open(artifacts_path, "w", encoding="utf-8") as fh:
         json.dump({"params": cfg.to_dict(), "run_id": run_id}, fh, indent=2, default=str)
 
+    status = result.get("status")
+    if not status:
+        status = "OK_HAS_TRADES" if exec_res.trades.shape[0] else "OK_NO_TRADES"
     manifest_row = {
         "run_id": run_id,
         "ts_utc": _now_utc().isoformat(),
@@ -1256,7 +1496,7 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
         "pair": result["model_checks"]["pair"],
         "z_source": cfg.z_auto_method,
         "z_th": result["metrics"].get("z_th"),
-        "status": "OK_HAS_TRADES" if exec_res.trades.shape[0] else "OK_NO_TRADES",
+        "status": status,
         "trades": int(exec_res.trades.shape[0]),
         "Sharpe": float(result["metrics"].get("sharpe_oos", 0.0)),
         "CAGR": float(result["metrics"].get("cagr", 0.0)),
@@ -1287,7 +1527,7 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
                 "z_stop": cfg.z_stop,
                 "z_th": result["metrics"].get("z_th"),
             },
-            spec_ok=True,
+            spec_ok=bool(result["model_checks"].get("spec_ok", True)),
         )
         storage.write_regime_stats(
             conn,
