@@ -38,6 +38,7 @@ GLOBAL_CONFIG: Optional["RunnerConfig"] = None
 BASE_DIR = Path(__file__).resolve().parents[1]
 _DEFAULT_CFG_DICT: Optional[Dict[str, Any]] = None
 _DATA_CACHE: Dict[str, pd.DataFrame] = {}
+_RAW_DATA_CACHE: Dict[str, pd.DataFrame] = {}
 _PLAYBOOK_FIELDS = {field.name for field in fields(PlaybookConfig)}
 _GRID_PARAM_MAPPING = {
     "p": "p_th",
@@ -170,6 +171,15 @@ def _cached_frame(path: Path) -> pd.DataFrame:
     return frame
 
 
+def _cached_csv_frame(path: Path) -> pd.DataFrame:
+    key = str(path)
+    frame = _RAW_DATA_CACHE.get(key)
+    if frame is None:
+        frame = pd.read_csv(path)
+        _RAW_DATA_CACHE[key] = frame
+    return frame
+
+
 def _playbook_payload(job: "JobSpec", config: "RunnerConfig") -> Dict[str, Any]:
     payload = _default_cfg_dict()
     input_path = job.aligned_path or config.input_csv
@@ -263,7 +273,7 @@ def _prefilter_pairs(
     top_k: int = 80,
 ) -> List[str]:
     try:
-        df = pd.read_csv(csv_path)
+        df = _cached_csv_frame(csv_path).copy()
     except FileNotFoundError:
         return []
     if df.shape[1] < 3:
@@ -401,7 +411,7 @@ def _align_pair(
     min_obs: int,
 ) -> Optional[Path]:
     try:
-        df = pd.read_csv(csv_path)
+        df = _cached_csv_frame(csv_path).copy()
     except FileNotFoundError:
         LOGGER.warning("Cannot align %s: input CSV %s missing", subset, csv_path)
         return None
