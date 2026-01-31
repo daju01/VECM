@@ -47,7 +47,7 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import VECM
 
 from . import storage
-from .data_streaming import ensure_price_data
+from .data_streaming import ensure_price_data, load_cached_prices
 from .ms_spread import compute_regime_prob, fit_ms_spread
 from .short_term_signals import build_short_term_signals
 
@@ -128,15 +128,36 @@ def _default_input_path() -> str:
     return str(data_path)
 
 
+def _safe_ensure_price_cache(
+    *,
+    tickers: Optional[Iterable[str]] = None,
+    force_refresh: bool = False,
+    cache_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Refresh the price cache and return a normalized DataFrame.
+
+    This wrapper centralises error handling so callers do not depend on the
+    details of ``data_streaming.ensure_price_data`` and always receive a
+    DataFrame with a ``date`` column when available.
+    """
+
+    try:
+        ensure_price_data(tickers=list(tickers) if tickers else None, force_refresh=force_refresh)
+    except Exception as exc:  # pragma: no cover - download/runtime errors
+        LOGGER.warning("Price streaming refresh failed: %s", exc)
+    try:
+        return load_cached_prices(cache_path)
+    except Exception as exc:  # pragma: no cover - missing cache/runtime errors
+        LOGGER.warning("Price cache unavailable after refresh: %s", exc)
+        return pd.DataFrame()
+
+
 def _ensure_default_input(path: str) -> str:
     """Ensure the default price cache exists before returning it."""
 
     if not os.path.exists(path):
         LOGGER.info("Default input %s missing; invoking streaming loader", path)
-        try:
-            ensure_price_data(force_refresh=False)
-        except Exception as exc:  # pragma: no cover - download/runtime issues
-            LOGGER.warning("Price streaming failed when populating default input: %s", exc)
+        _safe_ensure_price_cache(force_refresh=False)
     return path
 
 
@@ -406,7 +427,7 @@ def load_and_validate_data(path: str) -> pd.DataFrame:
     cached = _DATAFRAME_CACHE.get(path)
     if not os.path.exists(path):
         LOGGER.info("Input file %s missing; invoking streaming loader", path)
-        ensure_price_data(force_refresh=False)
+        _safe_ensure_price_cache(force_refresh=False)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Input file not found: {path}")
     mtime = os.path.getmtime(path)
@@ -449,19 +470,9 @@ def _maybe_attach_market_index(df: pd.DataFrame) -> pd.DataFrame:
     if market_col in df.columns:
         return df
 
-    try:
-        market = ensure_price_data(tickers=[market_col], force_refresh=False)
-    except Exception as exc:  # pragma: no cover - download/runtime errors
-        LOGGER.warning("Gagal mengunduh %s: %s", market_col, exc)
-        return df
-
-    if market.empty or market_col not in market.columns:
-        LOGGER.warning("Unduhan %s kosong atau tidak memuat kolom harga", market_col)
-        return df
-
-    market = market.rename(columns={"Date": "date"})
-    if "date" not in market.columns:
-        LOGGER.warning("Unduhan %s tidak memiliki kolom tanggal", market_col)
+    market = _safe_ensure_price_cache(tickers=[market_col], force_refresh=False)
+    if market.empty or market_col not in market.columns or "date" not in market.columns:
+        LOGGER.warning("Unduhan %s kosong atau tidak memuat kolom tanggal/harga", market_col)
         return df
 
     market = market[["date", market_col]].copy()
