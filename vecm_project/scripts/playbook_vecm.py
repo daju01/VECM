@@ -111,6 +111,8 @@ class PlaybookConfig:
     mom_k: int = 2
     mom_gate_k: int = 3
     mom_cooldown: int = 2
+    outlier_iqr_mult: float = 3.0
+    outlier_max_ratio: float = 0.02
 
     def to_dict(self) -> Dict[str, object]:
         return dataclasses.asdict(self)
@@ -186,6 +188,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--mom_k", type=int, default=2)
     parser.add_argument("--mom_gate_k", type=int, default=3)
     parser.add_argument("--mom_cooldown", type=int, default=2)
+    parser.add_argument("--outlier_iqr_mult", type=float, default=3.0)
+    parser.add_argument("--outlier_max_ratio", type=float, default=0.02)
     args = parser.parse_args(argv)
     input_path = str(args.input_file) if args.input_file else _ensure_default_input(_default_input_path())
 
@@ -233,6 +237,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         mom_k=int(args.mom_k),
         mom_gate_k=int(args.mom_gate_k),
         mom_cooldown=int(args.mom_cooldown),
+        outlier_iqr_mult=float(args.outlier_iqr_mult),
+        outlier_max_ratio=float(args.outlier_max_ratio),
     )
 
     # Allow quick overrides via environment variables without touching CLI defaults.
@@ -459,7 +465,9 @@ def _maybe_attach_market_index(df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame, List[str]]:
+def preprocess_data(
+    df: pd.DataFrame, cfg: PlaybookConfig
+) -> Tuple[pd.DataFrame, List[str], Dict[str, float]]:
     LOGGER.info("Pre-processing data (rows=%d, cols=%d)", len(df), len(df.columns))
     if cfg.subset:
         raw_tokens = [token.strip() for token in cfg.subset.split(",") if token.strip()]
@@ -482,18 +490,23 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
     df = df.loc[:, df.columns.notnull()]
     df = df.dropna(how="all")
     # Clean zero/negative values and light outlier treatment
+    outlier_ratios: Dict[str, float] = {}
     for col in df.columns:
         series = df[col]
         series = series.where(series > 0)
         q1 = series.quantile(0.25)
         q3 = series.quantile(0.75)
         iqr = q3 - q1
+        outlier_ratio = 0.0
         if np.isfinite(iqr) and iqr > 0:
-            lower = q1 - 3 * iqr
-            upper = q3 + 3 * iqr
+            iqr_mult = float(cfg.outlier_iqr_mult)
+            lower = q1 - iqr_mult * iqr
+            upper = q3 + iqr_mult * iqr
             mask = (series < lower) | (series > upper)
-            if mask.sum() and mask.sum() < 0.01 * len(series):
-                series = series.mask(mask)
+            if mask.any():
+                outlier_ratio = float(mask.sum() / max(series.notna().sum(), 1))
+                series = series.clip(lower=lower, upper=upper)
+        outlier_ratios[col] = outlier_ratio
         df[col] = series.interpolate(limit=5)
     # If some tickers stop updating (e.g. due to offline cache issues) the tail of
     # the dataset can be filled with NaNs for those symbols. Trim the history to
@@ -522,7 +535,7 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
         raise ValueError("Insufficient columns after cleaning")
     if len(df) < 100:
         raise ValueError("Insufficient history after preprocessing")
-    return df, list(df.columns)
+    return df, list(df.columns), outlier_ratios
 
 
 # ---------------------------------------------------------------------------
@@ -566,9 +579,17 @@ def _adf_pvalue(spread: pd.Series) -> float:
     return float(pvalue)
 
 
-def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]:
+def select_pair(
+    df: pd.DataFrame, cfg: PlaybookConfig, outlier_ratios: Mapping[str, float]
+) -> Tuple[str, str, float]:
     tickers = list(df.columns)
+    max_ratio = float(cfg.outlier_max_ratio)
     if len(tickers) == 2:
+        if any(outlier_ratios.get(t, 0.0) > max_ratio for t in tickers):
+            raise RuntimeError(
+                "Pair rejected due to extreme-value ratio exceeding threshold "
+                f"({max_ratio:.2%})."
+            )
         beta = _johansen_beta(np.log(df.iloc[:, :2]))
         if not np.isfinite(beta):
             beta = 1.0
@@ -581,6 +602,15 @@ def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]
         combos = rng.choice(combos, size=200, replace=False)
     for idx0, idx1 in combos:
         t1, t2 = tickers[idx0], tickers[idx1]
+        if outlier_ratios.get(t1, 0.0) > max_ratio or outlier_ratios.get(t2, 0.0) > max_ratio:
+            LOGGER.info(
+                "Skipping pair %s/%s due to extreme-value ratio (%.2f%%, %.2f%%)",
+                t1,
+                t2,
+                outlier_ratios.get(t1, 0.0) * 100.0,
+                outlier_ratios.get(t2, 0.0) * 100.0,
+            )
+            continue
         lp = np.log(df[[t1, t2]].dropna())
         if len(lp) < 120:
             continue
@@ -1034,8 +1064,8 @@ def run_playbook(
     except Exception as exc:
         LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
 
-    df_clean, tickers = preprocess_data(df, cfg)
-    selected_l, selected_r, beta0 = select_pair(df_clean, cfg)
+    df_clean, tickers, outlier_ratios = preprocess_data(df, cfg)
+    selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
     LOGGER.info("Selected pair: %s ~ %s | beta0=%.4f", selected_l, selected_r, beta0)
     pair_prices = df_clean[[selected_l, selected_r]].dropna()
     lp = np.log(pair_prices)
