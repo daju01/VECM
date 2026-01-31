@@ -47,7 +47,7 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import VECM
 
 from . import storage
-from .data_streaming import ensure_price_data
+from .data_streaming import ensure_price_data, load_cached_prices
 from .ms_spread import compute_regime_prob, fit_ms_spread
 from .short_term_signals import build_short_term_signals
 
@@ -61,6 +61,9 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 RUN_ID_FMT = "%Y%m%d_%H%M%S"
 
 LOGGER = storage.configure_logging("playbook_vecm")
+
+
+_DATAFRAME_CACHE: Dict[str, Tuple[float, pd.DataFrame]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +114,8 @@ class PlaybookConfig:
     mom_k: int = 2
     mom_gate_k: int = 3
     mom_cooldown: int = 2
+    outlier_iqr_mult: float = 3.0
+    outlier_max_ratio: float = 0.02
 
     def to_dict(self) -> Dict[str, object]:
         return dataclasses.asdict(self)
@@ -123,15 +128,36 @@ def _default_input_path() -> str:
     return str(data_path)
 
 
+def _safe_ensure_price_cache(
+    *,
+    tickers: Optional[Iterable[str]] = None,
+    force_refresh: bool = False,
+    cache_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Refresh the price cache and return a normalized DataFrame.
+
+    This wrapper centralises error handling so callers do not depend on the
+    details of ``data_streaming.ensure_price_data`` and always receive a
+    DataFrame with a ``date`` column when available.
+    """
+
+    try:
+        ensure_price_data(tickers=list(tickers) if tickers else None, force_refresh=force_refresh)
+    except Exception as exc:  # pragma: no cover - download/runtime errors
+        LOGGER.warning("Price streaming refresh failed: %s", exc)
+    try:
+        return load_cached_prices(cache_path)
+    except Exception as exc:  # pragma: no cover - missing cache/runtime errors
+        LOGGER.warning("Price cache unavailable after refresh: %s", exc)
+        return pd.DataFrame()
+
+
 def _ensure_default_input(path: str) -> str:
     """Ensure the default price cache exists before returning it."""
 
     if not os.path.exists(path):
         LOGGER.info("Default input %s missing; invoking streaming loader", path)
-        try:
-            ensure_price_data(force_refresh=False)
-        except Exception as exc:  # pragma: no cover - download/runtime issues
-            LOGGER.warning("Price streaming failed when populating default input: %s", exc)
+        _safe_ensure_price_cache(force_refresh=False)
     return path
 
 
@@ -186,6 +212,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--mom_k", type=int, default=2)
     parser.add_argument("--mom_gate_k", type=int, default=3)
     parser.add_argument("--mom_cooldown", type=int, default=2)
+    parser.add_argument("--outlier_iqr_mult", type=float, default=3.0)
+    parser.add_argument("--outlier_max_ratio", type=float, default=0.02)
     args = parser.parse_args(argv)
     input_path = str(args.input_file) if args.input_file else _ensure_default_input(_default_input_path())
 
@@ -233,6 +261,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         mom_k=int(args.mom_k),
         mom_gate_k=int(args.mom_gate_k),
         mom_cooldown=int(args.mom_cooldown),
+        outlier_iqr_mult=float(args.outlier_iqr_mult),
+        outlier_max_ratio=float(args.outlier_max_ratio),
     )
 
     # Allow quick overrides via environment variables without touching CLI defaults.
@@ -394,11 +424,17 @@ def _mfpt_threshold(z_series: pd.Series, z_grid: Iterable[float], z_exit: float,
 # Data loading & preprocessing ----------------------------------------------
 # ---------------------------------------------------------------------------
 def load_and_validate_data(path: str) -> pd.DataFrame:
+    cached = _DATAFRAME_CACHE.get(path)
     if not os.path.exists(path):
         LOGGER.info("Input file %s missing; invoking streaming loader", path)
-        ensure_price_data(force_refresh=False)
+        _safe_ensure_price_cache(force_refresh=False)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Input file not found: {path}")
+    mtime = os.path.getmtime(path)
+    if cached is not None:
+        cached_mtime, cached_df = cached
+        if mtime == cached_mtime:
+            return cached_df.copy(deep=True)
     df = pd.read_csv(path)
     if df.empty:
         raise ValueError("Input CSV has no rows")
@@ -423,6 +459,7 @@ def load_and_validate_data(path: str) -> pd.DataFrame:
     if len(price_cols) < 2:
         raise ValueError("Need at least two price columns")
     df = df.reset_index(drop=True)
+    _DATAFRAME_CACHE[path] = (mtime, df.copy(deep=True))
     return df
 
 
@@ -433,19 +470,9 @@ def _maybe_attach_market_index(df: pd.DataFrame) -> pd.DataFrame:
     if market_col in df.columns:
         return df
 
-    try:
-        market = ensure_price_data(tickers=[market_col], force_refresh=False)
-    except Exception as exc:  # pragma: no cover - download/runtime errors
-        LOGGER.warning("Gagal mengunduh %s: %s", market_col, exc)
-        return df
-
-    if market.empty or market_col not in market.columns:
-        LOGGER.warning("Unduhan %s kosong atau tidak memuat kolom harga", market_col)
-        return df
-
-    market = market.rename(columns={"Date": "date"})
-    if "date" not in market.columns:
-        LOGGER.warning("Unduhan %s tidak memiliki kolom tanggal", market_col)
+    market = _safe_ensure_price_cache(tickers=[market_col], force_refresh=False)
+    if market.empty or market_col not in market.columns or "date" not in market.columns:
+        LOGGER.warning("Unduhan %s kosong atau tidak memuat kolom tanggal/harga", market_col)
         return df
 
     market = market[["date", market_col]].copy()
@@ -459,7 +486,9 @@ def _maybe_attach_market_index(df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame, List[str]]:
+def preprocess_data(
+    df: pd.DataFrame, cfg: PlaybookConfig
+) -> Tuple[pd.DataFrame, List[str], Dict[str, float]]:
     LOGGER.info("Pre-processing data (rows=%d, cols=%d)", len(df), len(df.columns))
     if cfg.subset:
         raw_tokens = [token.strip() for token in cfg.subset.split(",") if token.strip()]
@@ -482,18 +511,23 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
     df = df.loc[:, df.columns.notnull()]
     df = df.dropna(how="all")
     # Clean zero/negative values and light outlier treatment
+    outlier_ratios: Dict[str, float] = {}
     for col in df.columns:
         series = df[col]
         series = series.where(series > 0)
         q1 = series.quantile(0.25)
         q3 = series.quantile(0.75)
         iqr = q3 - q1
+        outlier_ratio = 0.0
         if np.isfinite(iqr) and iqr > 0:
-            lower = q1 - 3 * iqr
-            upper = q3 + 3 * iqr
+            iqr_mult = float(cfg.outlier_iqr_mult)
+            lower = q1 - iqr_mult * iqr
+            upper = q3 + iqr_mult * iqr
             mask = (series < lower) | (series > upper)
-            if mask.sum() and mask.sum() < 0.01 * len(series):
-                series = series.mask(mask)
+            if mask.any():
+                outlier_ratio = float(mask.sum() / max(series.notna().sum(), 1))
+                series = series.clip(lower=lower, upper=upper)
+        outlier_ratios[col] = outlier_ratio
         df[col] = series.interpolate(limit=5)
     # If some tickers stop updating (e.g. due to offline cache issues) the tail of
     # the dataset can be filled with NaNs for those symbols. Trim the history to
@@ -513,6 +547,40 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
     if drop_cols:
         LOGGER.warning("Dropping >20%% NA series: %s", ", ".join(drop_cols))
         df = df.drop(columns=drop_cols)
+    rolling_window = min(60, len(df))
+    critical_window = min(30, len(df))
+    rolling_threshold = 0.35
+    critical_threshold = 0.25
+    density_drop_cols: List[str] = []
+    if rolling_window >= 10 or critical_window >= 5:
+        for col in df.columns:
+            series = df[col]
+            rolling_ratio = np.nan
+            if rolling_window >= 10:
+                rolling_ratio = (
+                    series.isna()
+                    .rolling(window=rolling_window, min_periods=rolling_window)
+                    .mean()
+                    .max()
+                )
+            tail_ratio = np.nan
+            if critical_window >= 5:
+                tail_ratio = series.isna().tail(critical_window).mean()
+            if (
+                (np.isfinite(rolling_ratio) and rolling_ratio > rolling_threshold)
+                or (np.isfinite(tail_ratio) and tail_ratio > critical_threshold)
+            ):
+                density_drop_cols.append(col)
+                LOGGER.warning(
+                    "Dropping %s due to poor density (rolling_na=%.2f over %d, tail_na=%.2f over %d)",
+                    col,
+                    float(rolling_ratio) if np.isfinite(rolling_ratio) else float("nan"),
+                    rolling_window,
+                    float(tail_ratio) if np.isfinite(tail_ratio) else float("nan"),
+                    critical_window,
+                )
+    if density_drop_cols:
+        df = df.drop(columns=density_drop_cols)
     if cfg.roll_years > 0 and not df.empty:
         window = int(cfg.roll_years * 365.25)
         cutoff = df.index.max() - pd.Timedelta(days=window)
@@ -522,7 +590,7 @@ def preprocess_data(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[pd.DataFrame
         raise ValueError("Insufficient columns after cleaning")
     if len(df) < 100:
         raise ValueError("Insufficient history after preprocessing")
-    return df, list(df.columns)
+    return df, list(df.columns), outlier_ratios
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +634,47 @@ def _adf_pvalue(spread: pd.Series) -> float:
     return float(pvalue)
 
 
+def select_pair(
+    df: pd.DataFrame, cfg: PlaybookConfig, outlier_ratios: Mapping[str, float]
+) -> Tuple[str, str, float]:
+class PairSelectionError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        pair: Optional[str] = None,
+        observations: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.pair = pair
+        self.observations = observations
+
+
 def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]:
     tickers = list(df.columns)
+    max_ratio = float(cfg.outlier_max_ratio)
     if len(tickers) == 2:
+        if any(outlier_ratios.get(t, 0.0) > max_ratio for t in tickers):
+            raise RuntimeError(
+                "Pair rejected due to extreme-value ratio exceeding threshold "
+                f"({max_ratio:.2%})."
+            )
         beta = _johansen_beta(np.log(df.iloc[:, :2]))
+        lp = np.log(df.iloc[:, :2].dropna())
+        obs = len(lp)
+        if obs < 120:
+            LOGGER.warning(
+                "Insufficient log-price observations for %s~%s (%d < 120); marking pair invalid",
+                tickers[0],
+                tickers[1],
+                obs,
+            )
+            raise PairSelectionError(
+                "Insufficient log-price observations for Johansen beta",
+                pair=f"{tickers[0]}~{tickers[1]}",
+                observations=obs,
+            )
+        beta = _johansen_beta(lp)
         if not np.isfinite(beta):
             beta = 1.0
         return tickers[0], tickers[1], beta
@@ -579,10 +684,27 @@ def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]
     rng = np.random.default_rng(123)
     if len(combos) > 200:
         combos = rng.choice(combos, size=200, replace=False)
+    skipped_obs = 0
     for idx0, idx1 in combos:
         t1, t2 = tickers[idx0], tickers[idx1]
+        if outlier_ratios.get(t1, 0.0) > max_ratio or outlier_ratios.get(t2, 0.0) > max_ratio:
+            LOGGER.info(
+                "Skipping pair %s/%s due to extreme-value ratio (%.2f%%, %.2f%%)",
+                t1,
+                t2,
+                outlier_ratios.get(t1, 0.0) * 100.0,
+                outlier_ratios.get(t2, 0.0) * 100.0,
+            )
+            continue
         lp = np.log(df[[t1, t2]].dropna())
         if len(lp) < 120:
+            LOGGER.info(
+                "Skipping pair %s~%s due to insufficient log-price observations (%d < 120)",
+                t1,
+                t2,
+                len(lp),
+            )
+            skipped_obs += 1
             continue
         beta = _johansen_beta(lp)
         if not np.isfinite(beta):
@@ -597,6 +719,15 @@ def select_pair(df: pd.DataFrame, cfg: PlaybookConfig) -> Tuple[str, str, float]
             best_score = score
             best_pair = (t1, t2, beta)
     if best_pair is None:
+        if skipped_obs:
+            LOGGER.warning(
+                "No valid pairs found; %d pairs skipped due to <120 observations",
+                skipped_obs,
+            )
+            raise PairSelectionError(
+                "No valid pairs available after minimum observation filter",
+                observations=skipped_obs,
+            )
         raise RuntimeError("Pair selection failed. Try specifying --subset")
     return best_pair
 
@@ -991,6 +1122,57 @@ def compute_metrics(
     }
 
 
+def _build_invalid_result(
+    *,
+    run_id: str,
+    cfg: PlaybookConfig,
+    reason: str,
+    pair: Optional[str] = None,
+    observations: Optional[int] = None,
+) -> Dict[str, object]:
+    empty_index = pd.DatetimeIndex([])
+    empty_series = pd.Series(dtype=float, index=empty_index)
+    exec_res = ExecutionResult(
+        pos=empty_series,
+        ret=empty_series,
+        ret_core=empty_series,
+        cost=empty_series,
+        trades=pd.DataFrame(),
+    )
+    metrics = {
+        "status": reason,
+        "z_th": float("nan"),
+    }
+    model_checks = {
+        "pair": pair or "",
+        "rank": 0,
+        "deterministic": "ci",
+        "threshold": float("nan"),
+        "spec_ok": False,
+        "status": reason,
+    }
+    if observations is not None:
+        model_checks["observations"] = int(observations)
+    return {
+        "run_id": run_id,
+        "params": cfg.to_dict(),
+        "config": cfg.to_dict(),
+        "status": reason,
+        "metrics": metrics,
+        "model_checks": model_checks,
+        "signals": pd.DataFrame(),
+        "execution": exec_res,
+        "horizon": {
+            "train_obs": 0,
+            "test_obs": 0,
+            "train_start": "",
+            "train_end": "",
+            "test_start": "",
+            "test_end": "",
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline -------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -1034,8 +1216,23 @@ def run_playbook(
     except Exception as exc:
         LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
 
+    df_clean, tickers, outlier_ratios = preprocess_data(df, cfg)
+    selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
     df_clean, tickers = preprocess_data(df, cfg)
-    selected_l, selected_r, beta0 = select_pair(df_clean, cfg)
+    try:
+        selected_l, selected_r, beta0 = select_pair(df_clean, cfg)
+    except PairSelectionError as exc:
+        LOGGER.warning("Pair selection failed: %s", exc)
+        result = _build_invalid_result(
+            run_id=run_id,
+            cfg=cfg,
+            reason="INVALID_PAIR_OBSERVATIONS",
+            pair=exc.pair,
+            observations=exc.observations,
+        )
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        return result
     LOGGER.info("Selected pair: %s ~ %s | beta0=%.4f", selected_l, selected_r, beta0)
     pair_prices = df_clean[[selected_l, selected_r]].dropna()
     lp = np.log(pair_prices)
@@ -1046,19 +1243,133 @@ def run_playbook(
     zect = (ect - mect) / sect
     zect = zect.replace([np.inf, -np.inf], np.nan)
     zect_valid = zect.dropna()
+    min_spread_std = 1e-6
+    ect_std = float(ect.std()) if len(ect) else float("nan")
     if zect_valid.empty:
-        fallback_std_val = float(ect.std())
-        if np.isfinite(fallback_std_val) and fallback_std_val > 0:
+        fallback_std_val = ect_std
+        if np.isfinite(fallback_std_val) and fallback_std_val >= min_spread_std:
             LOGGER.warning(
                 "Z-score series empty after normalisation; falling back to global standard deviation"
             )
             fallback = (ect - ect.mean()) / fallback_std_val
             zect_valid = fallback.dropna()
     if zect_valid.empty:
-        LOGGER.warning(
-            "Z-score series still empty; synthesising flat spread to allow pipeline continuation"
+        LOGGER.error(
+            "Z-score series empty after normalisation; skipping pair %s~%s",
+            selected_l,
+            selected_r,
         )
-        zect_valid = pd.Series(0.0, index=lp.index)
+        empty_idx = lp.index
+        empty_signals = pd.DataFrame(
+            {"long": 0.0, "short": 0.0}, index=empty_idx, dtype=float
+        )
+        empty_series = pd.Series(0.0, index=empty_idx)
+        exec_res = ExecutionResult(
+            pos=empty_series.rename("pos"),
+            ret=empty_series.rename("ret"),
+            ret_core=empty_series.rename("ret_core"),
+            cost=empty_series.rename("cost"),
+            trades=pd.DataFrame(),
+        )
+        if cfg.oos_start:
+            oos_start_date = pd.to_datetime(cfg.oos_start).date()
+        else:
+            base_index = empty_idx
+            if not len(base_index):
+                oos_start_date = dt.datetime.utcnow().date()
+            else:
+                cutoff_idx = int(len(base_index) * 0.7)
+                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+                oos_start_date = base_index[cutoff_idx].date()
+        metrics = compute_metrics(exec_res, cfg, oos_start_date)
+        metrics["skip_reason"] = "zscore_empty"
+        result = {
+            "run_id": run_id,
+            "params": cfg.to_dict(),
+            "config": cfg.to_dict(),
+            "metrics": metrics,
+            "model_checks": {
+                "pair": f"{selected_l}~{selected_r}",
+                "rank": 1,
+                "deterministic": "ci",
+                "threshold": float("nan"),
+                "skipped": True,
+            },
+            "signals": empty_signals,
+            "execution": exec_res,
+            "horizon": {
+                "train_obs": int(len(lp) * 0.7),
+                "test_obs": len(lp) - int(len(lp) * 0.7),
+                "train_start": str(lp.index.min().date()) if len(lp) else "",
+                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_end": str(lp.index.max().date()) if len(lp) else "",
+            },
+            "skipped_reason": "zscore_empty",
+        }
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
+    if not np.isfinite(ect_std) or ect_std < min_spread_std:
+        LOGGER.error(
+            "Spread variance too low (std=%.6g); skipping pair %s~%s",
+            ect_std,
+            selected_l,
+            selected_r,
+        )
+        empty_idx = lp.index
+        empty_signals = pd.DataFrame(
+            {"long": 0.0, "short": 0.0}, index=empty_idx, dtype=float
+        )
+        empty_series = pd.Series(0.0, index=empty_idx)
+        exec_res = ExecutionResult(
+            pos=empty_series.rename("pos"),
+            ret=empty_series.rename("ret"),
+            ret_core=empty_series.rename("ret_core"),
+            cost=empty_series.rename("cost"),
+            trades=pd.DataFrame(),
+        )
+        if cfg.oos_start:
+            oos_start_date = pd.to_datetime(cfg.oos_start).date()
+        else:
+            base_index = empty_idx
+            if not len(base_index):
+                oos_start_date = dt.datetime.utcnow().date()
+            else:
+                cutoff_idx = int(len(base_index) * 0.7)
+                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+                oos_start_date = base_index[cutoff_idx].date()
+        metrics = compute_metrics(exec_res, cfg, oos_start_date)
+        metrics["skip_reason"] = "spread_variance_low"
+        result = {
+            "run_id": run_id,
+            "params": cfg.to_dict(),
+            "config": cfg.to_dict(),
+            "metrics": metrics,
+            "model_checks": {
+                "pair": f"{selected_l}~{selected_r}",
+                "rank": 1,
+                "deterministic": "ci",
+                "threshold": float("nan"),
+                "skipped": True,
+            },
+            "signals": empty_signals,
+            "execution": exec_res,
+            "horizon": {
+                "train_obs": int(len(lp) * 0.7),
+                "test_obs": len(lp) - int(len(lp) * 0.7),
+                "train_start": str(lp.index.min().date()) if len(lp) else "",
+                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
+                "test_end": str(lp.index.max().date()) if len(lp) else "",
+            },
+            "skipped_reason": "spread_variance_low",
+        }
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
     zect = zect_valid
 
     delta_score: Optional[pd.Series] = None
@@ -1093,12 +1404,23 @@ def run_playbook(
             LOGGER.info("No z_mom12 panel found in short_term_signals attrs; skip delta_mom12")
 
     # Regime switching model on the spread to infer mean-reverting regime probability
-    try:
-        ms_model = fit_ms_spread(zect)
+    ms_status = "ok"
+    ms_error = ""
+    ms_model = fit_ms_spread(zect)
+    if not ms_model.get("success", False):
+        ms_error = str(ms_model.get("error") or "unknown")
+        if ms_model.get("skipped", False):
+            ms_status = "skipped"
+            LOGGER.warning(
+                "MS spread model skipped (%s); continuing with flat regime probability",
+                ms_error,
+            )
+            p_mr_series = pd.Series(0.7, index=zect.index)
+        else:
+            LOGGER.error("MS spread model failed: %s", ms_error)
+            raise RuntimeError(f"MS spread model failed: {ms_error}")
+    else:
         p_mr_series = compute_regime_prob(ms_model, zect)
-    except Exception as exc:
-        LOGGER.warning("MS spread modelling failed; falling back to flat regime prob: %s", exc)
-        p_mr_series = pd.Series(0.7, index=zect.index)
 
     # Estimasi parameter konvergensi spread pada full sample
     alpha_ec, half_life_full = _convergence_stats(zect)
@@ -1145,6 +1467,9 @@ def run_playbook(
     metrics["alpha_ec"] = alpha_ec
     metrics["half_life_full"] = half_life_full
     metrics["z_th"] = z_th
+    metrics["ms_regime_status"] = ms_status
+    if ms_error:
+        metrics["ms_regime_error"] = ms_error
     if cfg.z_entry is not None and np.isfinite(cfg.z_entry):
         metrics["z_entry"] = float(cfg.z_entry)
     result = {
@@ -1157,6 +1482,7 @@ def run_playbook(
             "rank": 1,
             "deterministic": "ci",
             "threshold": float(z_th),
+            "spec_ok": True,
         },
         "signals": signals,
         "execution": exec_res,
@@ -1218,6 +1544,9 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
     with open(artifacts_path, "w", encoding="utf-8") as fh:
         json.dump({"params": cfg.to_dict(), "run_id": run_id}, fh, indent=2, default=str)
 
+    status = result.get("status")
+    if not status:
+        status = "OK_HAS_TRADES" if exec_res.trades.shape[0] else "OK_NO_TRADES"
     manifest_row = {
         "run_id": run_id,
         "ts_utc": _now_utc().isoformat(),
@@ -1226,7 +1555,7 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
         "pair": result["model_checks"]["pair"],
         "z_source": cfg.z_auto_method,
         "z_th": result["metrics"].get("z_th"),
-        "status": "OK_HAS_TRADES" if exec_res.trades.shape[0] else "OK_NO_TRADES",
+        "status": status,
         "trades": int(exec_res.trades.shape[0]),
         "Sharpe": float(result["metrics"].get("sharpe_oos", 0.0)),
         "CAGR": float(result["metrics"].get("cagr", 0.0)),
@@ -1266,6 +1595,25 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
                 p_mr_mean=float(result["metrics"].get("p_mr_mean", math.nan)),
                 p_mr_inpos_mean=float(result["metrics"].get("p_mr_inpos_mean", math.nan)),
             )
+        storage.write_model_checks(
+            conn,
+            run_id,
+            pair=result["model_checks"]["pair"],
+            johansen_rank=1,
+            det_term="ci",
+            tvecm_thresholds={
+                "z_exit": cfg.z_exit,
+                "z_stop": cfg.z_stop,
+                "z_th": result["metrics"].get("z_th"),
+            },
+            spec_ok=bool(result["model_checks"].get("spec_ok", True)),
+        )
+        storage.write_regime_stats(
+            conn,
+            run_id,
+            p_mr_mean=float(result["metrics"].get("p_mr_mean", math.nan)),
+            p_mr_inpos_mean=float(result["metrics"].get("p_mr_inpos_mean", math.nan)),
+        )
 
 
 def _append_manifest(path: pathlib.Path, row: Mapping[str, object]) -> None:
