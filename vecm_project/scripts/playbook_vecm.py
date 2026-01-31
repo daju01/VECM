@@ -536,6 +536,40 @@ def preprocess_data(
     if drop_cols:
         LOGGER.warning("Dropping >20%% NA series: %s", ", ".join(drop_cols))
         df = df.drop(columns=drop_cols)
+    rolling_window = min(60, len(df))
+    critical_window = min(30, len(df))
+    rolling_threshold = 0.35
+    critical_threshold = 0.25
+    density_drop_cols: List[str] = []
+    if rolling_window >= 10 or critical_window >= 5:
+        for col in df.columns:
+            series = df[col]
+            rolling_ratio = np.nan
+            if rolling_window >= 10:
+                rolling_ratio = (
+                    series.isna()
+                    .rolling(window=rolling_window, min_periods=rolling_window)
+                    .mean()
+                    .max()
+                )
+            tail_ratio = np.nan
+            if critical_window >= 5:
+                tail_ratio = series.isna().tail(critical_window).mean()
+            if (
+                (np.isfinite(rolling_ratio) and rolling_ratio > rolling_threshold)
+                or (np.isfinite(tail_ratio) and tail_ratio > critical_threshold)
+            ):
+                density_drop_cols.append(col)
+                LOGGER.warning(
+                    "Dropping %s due to poor density (rolling_na=%.2f over %d, tail_na=%.2f over %d)",
+                    col,
+                    float(rolling_ratio) if np.isfinite(rolling_ratio) else float("nan"),
+                    rolling_window,
+                    float(tail_ratio) if np.isfinite(tail_ratio) else float("nan"),
+                    critical_window,
+                )
+    if density_drop_cols:
+        df = df.drop(columns=density_drop_cols)
     if cfg.roll_years > 0 and not df.empty:
         window = int(cfg.roll_years * 365.25)
         cutoff = df.index.max() - pd.Timedelta(days=window)
