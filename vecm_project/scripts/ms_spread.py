@@ -8,7 +8,7 @@ short, it falls back to a flat probability to avoid breaking the pipeline.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,26 @@ except Exception:  # pragma: no cover - defensive import guard
     MarkovRegression = None  # type: ignore
 
 LOGGER = logging.getLogger(__name__)
+_MS_SPREAD_CACHE: Dict[Tuple[object, ...], Dict[str, Any]] = {}
+
+
+def _build_cache_key(
+    z_series: pd.Series,
+    cache_key: Optional[object],
+    k_regimes: int,
+    min_len: int,
+    max_iter: int,
+) -> Tuple[object, ...]:
+    if cache_key is not None:
+        return (cache_key, k_regimes, min_len, max_iter)
+
+    if z_series.empty:
+        return ("empty", k_regimes, min_len, max_iter)
+
+    series_hash = int(pd.util.hash_pandas_object(z_series, index=True).sum())
+    start = z_series.index[0]
+    end = z_series.index[-1]
+    return (series_hash, len(z_series), start, end, k_regimes, min_len, max_iter)
 
 
 def fit_ms_spread(
@@ -27,6 +47,7 @@ def fit_ms_spread(
     k_regimes: int = 2,
     min_len: int = 80,
     max_iter: int = 200,
+    cache_key: Optional[object] = None,
 ) -> Dict[str, Any]:
     """Fit a Markov-switching model on the spread/z-score series.
 
@@ -51,6 +72,11 @@ def fit_ms_spread(
         - "result": statsmodels result (or None on failure).
     """
 
+    cache_key_tuple = _build_cache_key(z_series, cache_key, k_regimes, min_len, max_iter)
+    cached = _MS_SPREAD_CACHE.get(cache_key_tuple)
+    if cached is not None:
+        return cached
+
     z = z_series.dropna().astype(float)
     if len(z) < min_len or MarkovRegression is None:
         reason = "insufficient_data" if len(z) < min_len else "statsmodels_unavailable"
@@ -68,6 +94,9 @@ def fit_ms_spread(
             "error": reason,
             "skipped": True,
         }
+        model = {"p_mr": p, "regime_mr": None, "success": False, "result": None}
+        _MS_SPREAD_CACHE[cache_key_tuple] = model
+        return model
 
     try:
         mod = MarkovRegression(
@@ -89,6 +118,9 @@ def fit_ms_spread(
             "error": str(exc),
             "skipped": False,
         }
+        model = {"p_mr": p, "regime_mr": None, "success": False, "result": None}
+        _MS_SPREAD_CACHE[cache_key_tuple] = model
+        return model
 
     params = res.params
     sigma2_vals = []
@@ -120,7 +152,7 @@ def fit_ms_spread(
     if p_full.isna().any():
         p_full = p_full.ffill().bfill().fillna(0.7)
 
-    return {
+    model = {
         "p_mr": p_full.astype(float),
         "regime_mr": regime_mr,
         "success": True,
@@ -128,6 +160,8 @@ def fit_ms_spread(
         "error": "",
         "skipped": False,
     }
+    _MS_SPREAD_CACHE[cache_key_tuple] = model
+    return model
 
 
 def compute_regime_prob(
