@@ -205,45 +205,46 @@ def run_bo(
     LOGGER.info("Stage2 BO complete | best_trial=%s best_score=%.4f", best.number, best.value)
 
     with storage.managed_storage("stage2_bo") as conn:
-        storage.write_run(
-            conn,
-            study_run_id,
-            started_at=start_wall,
-            finished_at=finish_wall,
-            n_workers=n_jobs,
-            plan="optuna_tpe",
-            seed_method="tpe",
-            notes=json.dumps({"pair": pair, "method": method, "acq": acq}),
-        )
-        horizon_payload = {"horizon": horizon} if horizon else None
-        for trial in study.trials:
-            record = trial.user_attrs.get("record")
-            if not record:
-                continue
-            trial_id = f"{pair.replace(',', '-')}:{trial.number:03d}"
-            params_payload = {
-                **record["params"],
-                "trial_run_id": record["trial_run_id"],
-            }
-            diagnostics = record["diagnostics"]
-            storage.write_trial(
+        with storage.with_transaction(conn):
+            storage.write_run(
                 conn,
-                run_id=study_run_id,
-                trial_id=trial_id,
-                stage=2,
-                pair=pair,
-                method=method,
-                params=params_payload,
-                horizon=horizon_payload,
-                eval_time_s=diagnostics["eval_time_s"],
-                sharpe_oos=diagnostics["sharpe_oos"],
-                maxdd=diagnostics["maxdd"],
-                turnover=diagnostics["turnover"],
-                alpha_ec=diagnostics.get("alpha_ec"),
-                half_life_full=diagnostics.get("half_life_full"),
-                pruned=False,
+                study_run_id,
+                started_at=start_wall,
+                finished_at=finish_wall,
+                n_workers=n_jobs,
+                plan="optuna_tpe",
+                seed_method="tpe",
+                notes=json.dumps({"pair": pair, "method": method, "acq": acq}),
             )
-        storage.mark_run_finished(conn, study_run_id, finished_at=finish_wall)
+            horizon_payload = {"horizon": horizon} if horizon else None
+            for trial in study.trials:
+                record = trial.user_attrs.get("record")
+                if not record:
+                    continue
+                trial_id = f"{pair.replace(',', '-')}:{trial.number:03d}"
+                params_payload = {
+                    **record["params"],
+                    "trial_run_id": record["trial_run_id"],
+                }
+                diagnostics = record["diagnostics"]
+                storage.write_trial(
+                    conn,
+                    run_id=study_run_id,
+                    trial_id=trial_id,
+                    stage=2,
+                    pair=pair,
+                    method=method,
+                    params=params_payload,
+                    horizon=horizon_payload,
+                    eval_time_s=diagnostics["eval_time_s"],
+                    sharpe_oos=diagnostics["sharpe_oos"],
+                    maxdd=diagnostics["maxdd"],
+                    turnover=diagnostics["turnover"],
+                    alpha_ec=diagnostics.get("alpha_ec"),
+                    half_life_full=diagnostics.get("half_life_full"),
+                    pruned=False,
+                )
+            storage.mark_run_finished(conn, study_run_id, finished_at=finish_wall)
 
     return study
 
