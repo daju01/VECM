@@ -8,10 +8,12 @@ for stock market price analysis
    ```bash
    python -m venv .venv
    source .venv/bin/activate
-   pip install -r vecm_project/requirements.txt
+   pip install -r requirements.txt
    ```
    Langkah ini memastikan modul inti seperti `duckdb`, `pandas`, dan `statsmodels`
-   tersedia sebelum pipeline dijalankan.
+   tersedia sebelum pipeline dijalankan. File `requirements.txt` di root hanya
+   meng-include `vecm_project/requirements.txt`, jadi satu-satunya sumber
+   kebenaran tetap berada di subfolder tersebut.
 
 2. **Unduh dan validasi data harga pertama kali.**
    Jalankan demo end-to-end sesaat setelah instalasi:
@@ -64,9 +66,9 @@ the following approaches:
    commands above there. Once the virtual environment is populated you can run
    the demo directly from that machine.
 2. **Pre-download the wheels.** On a machine with internet access execute
-   `pip download -r vecm_project/requirements.txt -d wheels/`, copy the
+   `pip download -r requirements.txt -d wheels/`, copy the
    resulting `wheels/` directory to the restricted environment, and install via
-   `pip install --no-index --find-links wheels -r vecm_project/requirements.txt`.
+   `pip install --no-index --find-links wheels -r requirements.txt`.
 3. **Point pip at an internal mirror.** If your organisation provides a
    whitelisted PyPI mirror, export `PIP_INDEX_URL=<mirror-url>` before running
    `pip install`.
