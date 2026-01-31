@@ -63,6 +63,9 @@ RUN_ID_FMT = "%Y%m%d_%H%M%S"
 LOGGER = storage.configure_logging("playbook_vecm")
 
 
+_DATAFRAME_CACHE: Dict[str, Tuple[float, pd.DataFrame]] = {}
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses & configuration ------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -394,11 +397,17 @@ def _mfpt_threshold(z_series: pd.Series, z_grid: Iterable[float], z_exit: float,
 # Data loading & preprocessing ----------------------------------------------
 # ---------------------------------------------------------------------------
 def load_and_validate_data(path: str) -> pd.DataFrame:
+    cached = _DATAFRAME_CACHE.get(path)
     if not os.path.exists(path):
         LOGGER.info("Input file %s missing; invoking streaming loader", path)
         ensure_price_data(force_refresh=False)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Input file not found: {path}")
+    mtime = os.path.getmtime(path)
+    if cached is not None:
+        cached_mtime, cached_df = cached
+        if mtime == cached_mtime:
+            return cached_df.copy(deep=True)
     df = pd.read_csv(path)
     if df.empty:
         raise ValueError("Input CSV has no rows")
@@ -423,6 +432,7 @@ def load_and_validate_data(path: str) -> pd.DataFrame:
     if len(price_cols) < 2:
         raise ValueError("Need at least two price columns")
     df = df.reset_index(drop=True)
+    _DATAFRAME_CACHE[path] = (mtime, df.copy(deep=True))
     return df
 
 
