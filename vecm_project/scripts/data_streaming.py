@@ -49,6 +49,7 @@ YF_PROXY_AUTH_ENV = "VECM_PROXY_AUTH"
 
 
 _REQUESTS_SESSION: Any = None
+_REQUESTS_SESSION_PID: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +221,9 @@ def _ensure_data_dir() -> None:
 
 
 def _get_requests_session() -> Any:
-    global _REQUESTS_SESSION
-    if _REQUESTS_SESSION is not None:
+    global _REQUESTS_SESSION, _REQUESTS_SESSION_PID
+    current_pid = os.getpid()
+    if _REQUESTS_SESSION is not None and _REQUESTS_SESSION_PID == current_pid:
         return _REQUESTS_SESSION
 
     user_agent = os.getenv(YF_USER_AGENT_ENV, "").strip() or YF_DEFAULT_USER_AGENT
@@ -279,6 +281,7 @@ def _get_requests_session() -> Any:
         session.verify = verify_path
 
     _REQUESTS_SESSION = session
+    _REQUESTS_SESSION_PID = current_pid
     return session
 
 
