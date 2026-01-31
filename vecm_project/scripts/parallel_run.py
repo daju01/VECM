@@ -102,6 +102,7 @@ DEFAULT_SUBSETS = (
     "ANTM,MBMA",
     "ANTM,NCKL",
 )
+DEFAULT_FALLBACK_DEFAULTS = True
 
 SUBSET_LIBRARY_PATH = BASE_DIR / "data" / "subset_pairs.txt"
 
@@ -485,7 +486,12 @@ def _load_subset_library() -> List[str]:
     return _parse_subset_entries(lines, source="subset library")
 
 
-def _gather_subsets(input_csv: Path, override: Optional[Iterable[str]] = None) -> List[str]:
+def _gather_subsets(
+    input_csv: Path,
+    override: Optional[Iterable[str]] = None,
+    *,
+    fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
+) -> List[str]:
     if override:
         parsed = _parse_subset_entries(list(override), source="override")
         if parsed:
@@ -583,7 +589,11 @@ def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, L
     return result
 
 
-def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerConfig:
+def _build_config(
+    subsets_override: Optional[Iterable[str]] = None,
+    *,
+    fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
+) -> RunnerConfig:
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -592,7 +602,7 @@ def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerCon
     lock_file = out_dir / ".start_gate.lock"
     stamp_file = out_dir / ".last_start_time"
     max_workers = max(1, _env_int("VECM_MAX_WORKERS", _available_workers()))
-    subsets = _gather_subsets(input_csv, subsets_override)
+    subsets = _gather_subsets(input_csv, subsets_override, fallback_defaults=fallback_defaults)
     tickers = _download_tickers_for_subsets(subsets)
     ensure_price_data(tickers=tickers or None)
     stage = _choose_stage(manifest_path, subsets)
@@ -965,9 +975,13 @@ def _cli_subset_override(args: argparse.Namespace) -> Optional[List[str]]:
     return parsed or None
 
 
-def run_parallel(subsets: Optional[Iterable[str]] = None) -> None:
+def run_parallel(
+    subsets: Optional[Iterable[str]] = None,
+    *,
+    fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
+) -> None:
     global GLOBAL_CONFIG
-    config = _build_config(subsets_override=subsets)
+    config = _build_config(subsets_override=subsets, fallback_defaults=fallback_defaults)
     GLOBAL_CONFIG = config
     LOGGER.info("Parallel plan: stage=%s workers=%s oos_start=%s", config.stage, config.max_workers, config.oos_start)
     jobs = _build_jobs(config)
@@ -996,10 +1010,23 @@ if __name__ == "__main__":
         type=Path,
         help="Path to a file containing subset pairs (one pair per line)",
     )
+    parser.add_argument(
+        "--fallback-defaults",
+        dest="fallback_defaults",
+        action="store_true",
+        default=DEFAULT_FALLBACK_DEFAULTS,
+        help="Fallback to DEFAULT_SUBSETS when no subset sources are found",
+    )
+    parser.add_argument(
+        "--no-fallback-defaults",
+        dest="fallback_defaults",
+        action="store_false",
+        help="Disable fallback to DEFAULT_SUBSETS when no subset sources are found",
+    )
     cli_args = parser.parse_args()
     try:
         override = _cli_subset_override(cli_args)
-        run_parallel(override)
+        run_parallel(override, fallback_defaults=cli_args.fallback_defaults)
     except FileNotFoundError as exc:
         LOGGER.error("Parallel run failed: %s", exc)
         sys.exit(1)
