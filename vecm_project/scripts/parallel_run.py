@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import json
 import itertools
 import math
 import os
@@ -105,21 +106,51 @@ DEFAULT_SUBSETS = (
 
 SUBSET_LIBRARY_PATH = BASE_DIR / "data" / "subset_pairs.txt"
 
-Z_METHODS = ("quant",)
-Z_QUANTILES = (0.65,)
-P_THRESH = (0.55,)
-REGIME_CONFIRM = (0, 1)
-GATE_CORR_MIN = (0.50,)
-GATE_CORR_WIN = (40,)
-COOLDOWN = (1, 3)
-Z_EXIT = (0.60,)
-Z_STOP = (1.00,)
-DEFAULT_MAX_GRID = 48
 
-MOM_Z_SET = (0.70,)
-MOM_K_SET = (3,)
-MOM_GATE_K_SET = (3,)
-MOM_COOLD_SET = (4,)
+@dataclass
+class GridConfig:
+    z_methods: List[str] = None
+    z_quantiles: List[float] = None
+    p_thresh: List[float] = None
+    regime_confirm: List[int] = None
+    gate_corr_min: List[float] = None
+    gate_corr_win: List[int] = None
+    cooldown: List[int] = None
+    z_exit: List[float] = None
+    z_stop: List[float] = None
+    max_grid: int = 48
+    mom_z_set: List[float] = None
+    mom_k_set: List[int] = None
+    mom_gate_k_set: List[int] = None
+    mom_cool_set: List[int] = None
+
+    def __post_init__(self) -> None:
+        if self.z_methods is None:
+            self.z_methods = ["quant"]
+        if self.z_quantiles is None:
+            self.z_quantiles = [0.65]
+        if self.p_thresh is None:
+            self.p_thresh = [0.55]
+        if self.regime_confirm is None:
+            self.regime_confirm = [0, 1]
+        if self.gate_corr_min is None:
+            self.gate_corr_min = [0.50]
+        if self.gate_corr_win is None:
+            self.gate_corr_win = [40]
+        if self.cooldown is None:
+            self.cooldown = [1, 3]
+        if self.z_exit is None:
+            self.z_exit = [0.60]
+        if self.z_stop is None:
+            self.z_stop = [1.00]
+        if self.mom_z_set is None:
+            self.mom_z_set = [0.70]
+        if self.mom_k_set is None:
+            self.mom_k_set = [3]
+        if self.mom_gate_k_set is None:
+            self.mom_gate_k_set = [3]
+        if self.mom_cool_set is None:
+            self.mom_cool_set = [4]
 
 
 @dataclass
@@ -141,6 +172,7 @@ class RunnerConfig:
     min_obs: int
     use_momentum: bool
     subsets: List[str]
+    grid_config: GridConfig
 
 
 @dataclass
@@ -220,6 +252,99 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _parse_csv_values(raw: Optional[str], cast) -> Optional[List[Any]]:
+    if raw is None:
+        return None
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items:
+        return []
+    return [cast(item) for item in items]
+
+
+def _read_grid_config_file(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        LOGGER.error("Failed to read grid config %s: %s", path, exc)
+        raise SystemExit(1) from exc
+    except json.JSONDecodeError as exc:
+        LOGGER.error("Invalid JSON in grid config %s: %s", path, exc)
+        raise SystemExit(1) from exc
+    if not isinstance(payload, dict):
+        LOGGER.error("Grid config %s must contain a JSON object", path)
+        raise SystemExit(1)
+    return payload
+
+
+def _coerce_list(name: str, payload: Dict[str, Any], cast) -> Optional[List[Any]]:
+    if name not in payload:
+        return None
+    value = payload[name]
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [cast(item) for item in value]
+    return [cast(value)]
+
+
+def _build_grid_config(path: Optional[Path], overrides: Dict[str, Any]) -> GridConfig:
+    payload = _read_grid_config_file(path)
+    config = GridConfig()
+    key_map = {
+        "z_methods": "z_methods",
+        "z_meth": "z_methods",
+        "z_quantiles": "z_quantiles",
+        "z_q": "z_quantiles",
+        "p_thresh": "p_thresh",
+        "p_th": "p_thresh",
+        "regime_confirm": "regime_confirm",
+        "gate_corr_min": "gate_corr_min",
+        "gate_corr_win": "gate_corr_win",
+        "cooldown": "cooldown",
+        "z_exit": "z_exit",
+        "z_stop": "z_stop",
+        "max_grid": "max_grid",
+        "mom_z_set": "mom_z_set",
+        "mom_k_set": "mom_k_set",
+        "mom_gate_k_set": "mom_gate_k_set",
+        "mom_cool_set": "mom_cool_set",
+    }
+    merged: Dict[str, Any] = {}
+    for key, value in payload.items():
+        mapped = key_map.get(key)
+        if mapped:
+            merged[mapped] = value
+        else:
+            LOGGER.warning("Ignoring unknown grid config key: %s", key)
+    merged.update({k: v for k, v in overrides.items() if v is not None})
+
+    list_fields = {
+        "z_methods": str,
+        "z_quantiles": float,
+        "p_thresh": float,
+        "regime_confirm": int,
+        "gate_corr_min": float,
+        "gate_corr_win": int,
+        "cooldown": int,
+        "z_exit": float,
+        "z_stop": float,
+        "mom_z_set": float,
+        "mom_k_set": int,
+        "mom_gate_k_set": int,
+        "mom_cool_set": int,
+    }
+    for field_name, cast in list_fields.items():
+        value = _coerce_list(field_name, merged, cast)
+        if value is not None:
+            setattr(config, field_name, value)
+    if "max_grid" in merged and merged["max_grid"] is not None:
+        config.max_grid = int(merged["max_grid"])
+    config.max_grid = _env_int("VECM_MAX_GRID", config.max_grid)
+    return config
 
 
 def _load_manifest(path: Path) -> pd.DataFrame:
@@ -524,7 +649,11 @@ def _download_tickers_for_subsets(subsets: Iterable[str]) -> List[str]:
     return tickers
 
 
-def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, List[Any]]:
+def _prune_from_manifest(
+    manifest_path: Path,
+    subsets: List[str],
+    grid_config: GridConfig,
+) -> Dict[str, List[Any]]:
     manifest = _load_manifest(manifest_path)
     if manifest.empty:
         return {}
@@ -574,7 +703,9 @@ def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, L
         if key in pruned.columns:
             result[key] = top_values(pd.to_numeric(pruned[key], errors="coerce"), mapping)
     if "z_source" in pruned.columns:
-        result["z_meth"] = [val for val in pruned["z_source"].dropna().unique() if val in Z_METHODS]
+        result["z_meth"] = [
+            val for val in pruned["z_source"].dropna().unique() if val in grid_config.z_methods
+        ]
     if "tag" in pruned.columns:
         extracted = pruned["tag"].astype(str).str.extract(r"_q=([0-9.]+)")
         q_values = pd.to_numeric(extracted[0], errors="coerce").dropna().unique()
@@ -583,7 +714,10 @@ def _prune_from_manifest(manifest_path: Path, subsets: List[str]) -> Dict[str, L
     return result
 
 
-def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerConfig:
+def _build_config(
+    subsets_override: Optional[Iterable[str]] = None,
+    grid_config: Optional[GridConfig] = None,
+) -> RunnerConfig:
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +760,7 @@ def _build_config(subsets_override: Optional[Iterable[str]] = None) -> RunnerCon
         min_obs=min_obs,
         use_momentum=use_momentum,
         subsets=subsets,
+        grid_config=grid_config or GridConfig(),
     )
 
 
@@ -670,13 +805,13 @@ def _safe_launch(config: RunnerConfig, func):
     return func()
 
 
-def _momentum_for_tag(tag: str) -> Dict[str, Any]:
+def _momentum_for_tag(tag: str, grid_config: GridConfig) -> Dict[str, Any]:
     hash_bytes = hashlib.sha1(tag.encode("utf-8")).digest()
     value = int.from_bytes(hash_bytes[:4], "big")
-    mz = MOM_Z_SET[value % len(MOM_Z_SET)]
-    mk = MOM_K_SET[(value // 5) % len(MOM_K_SET)]
-    mg = MOM_GATE_K_SET[(value // 11) % len(MOM_GATE_K_SET)]
-    mc = MOM_COOLD_SET[(value // 17) % len(MOM_COOLD_SET)]
+    mz = grid_config.mom_z_set[value % len(grid_config.mom_z_set)]
+    mk = grid_config.mom_k_set[(value // 5) % len(grid_config.mom_k_set)]
+    mg = grid_config.mom_gate_k_set[(value // 11) % len(grid_config.mom_gate_k_set)]
+    mc = grid_config.mom_cool_set[(value // 17) % len(grid_config.mom_cool_set)]
     return {
         "mom_enable": 1,
         "mom_z": mz,
@@ -686,16 +821,20 @@ def _momentum_for_tag(tag: str) -> Dict[str, Any]:
     }
 
 
-def _build_grid(subsets: List[str], overrides: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
-    z_methods = overrides.get("z_meth", list(Z_METHODS))
-    z_quantiles = overrides.get("z_q", list(Z_QUANTILES))
-    p_values = overrides.get("p_th", list(P_THRESH))
-    rc_values = overrides.get("regime_confirm", list(REGIME_CONFIRM))
-    gcmin_values = overrides.get("gate_corr_min", list(GATE_CORR_MIN))
-    gcwin_values = overrides.get("gate_corr_win", list(GATE_CORR_WIN))
-    cool_values = overrides.get("cooldown", list(COOLDOWN))
-    zexit_values = overrides.get("z_exit", list(Z_EXIT))
-    zstop_values = overrides.get("z_stop", list(Z_STOP))
+def _build_grid(
+    subsets: List[str],
+    overrides: Dict[str, List[Any]],
+    grid_config: GridConfig,
+) -> List[Dict[str, Any]]:
+    z_methods = overrides.get("z_meth", list(grid_config.z_methods))
+    z_quantiles = overrides.get("z_q", list(grid_config.z_quantiles))
+    p_values = overrides.get("p_th", list(grid_config.p_thresh))
+    rc_values = overrides.get("regime_confirm", list(grid_config.regime_confirm))
+    gcmin_values = overrides.get("gate_corr_min", list(grid_config.gate_corr_min))
+    gcwin_values = overrides.get("gate_corr_win", list(grid_config.gate_corr_win))
+    cool_values = overrides.get("cooldown", list(grid_config.cooldown))
+    zexit_values = overrides.get("z_exit", list(grid_config.z_exit))
+    zstop_values = overrides.get("z_stop", list(grid_config.z_stop))
 
     grid: List[Dict[str, Any]] = []
     for subset, z_meth, p_val, rc, gmin, gwin, cool, zexit, zstop in itertools.product(
@@ -725,7 +864,7 @@ def _build_grid(subsets: List[str], overrides: Dict[str, List[Any]]) -> List[Dic
                 grid.append({**row, "z_q": float(q)})
         else:
             grid.append(row)
-    limit = _env_int("VECM_MAX_GRID", DEFAULT_MAX_GRID)
+    limit = grid_config.max_grid
     total = len(grid)
     if limit and total > limit:
         rng = np.random.default_rng(314159)
@@ -771,7 +910,7 @@ def _job_from_row(idx: int, row: Dict[str, Any], config: RunnerConfig, seed: int
     if qval is not None:
         params["z_quantile"] = float(qval)
     if config.use_momentum:
-        params.update(_momentum_for_tag(tag))
+        params.update(_momentum_for_tag(tag, config.grid_config))
     if aligned is not None:
         params["aligned_path"] = str(aligned)
     return JobSpec(idx=idx, subset=subset, tag=tag, params=params, aligned_path=aligned, seed=seed)
@@ -781,10 +920,10 @@ def _build_jobs(config: RunnerConfig) -> List[JobSpec]:
     subsets = config.subsets
     overrides = {}
     if config.stage.lower() == "stage2":
-        overrides = _prune_from_manifest(config.manifest_path, subsets)
+        overrides = _prune_from_manifest(config.manifest_path, subsets, config.grid_config)
         if overrides:
             LOGGER.info("Stage2 manifest prune applied: %s", {k: len(v) for k, v in overrides.items()})
-    grid = _build_grid(subsets, overrides)
+    grid = _build_grid(subsets, overrides, config.grid_config)
     cache: Dict[str, Optional[Path]] = {}
     if config.date_align:
         for subset in subsets:
@@ -965,9 +1104,31 @@ def _cli_subset_override(args: argparse.Namespace) -> Optional[List[str]]:
     return parsed or None
 
 
-def run_parallel(subsets: Optional[Iterable[str]] = None) -> None:
+def _cli_grid_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "z_methods": _parse_csv_values(args.grid_z_methods, str),
+        "z_quantiles": _parse_csv_values(args.grid_z_quantiles, float),
+        "p_thresh": _parse_csv_values(args.grid_p_thresh, float),
+        "regime_confirm": _parse_csv_values(args.grid_regime_confirm, int),
+        "gate_corr_min": _parse_csv_values(args.grid_gate_corr_min, float),
+        "gate_corr_win": _parse_csv_values(args.grid_gate_corr_win, int),
+        "cooldown": _parse_csv_values(args.grid_cooldown, int),
+        "z_exit": _parse_csv_values(args.grid_z_exit, float),
+        "z_stop": _parse_csv_values(args.grid_z_stop, float),
+        "max_grid": args.grid_max,
+        "mom_z_set": _parse_csv_values(args.mom_z_set, float),
+        "mom_k_set": _parse_csv_values(args.mom_k_set, int),
+        "mom_gate_k_set": _parse_csv_values(args.mom_gate_k_set, int),
+        "mom_cool_set": _parse_csv_values(args.mom_cool_set, int),
+    }
+
+
+def run_parallel(
+    subsets: Optional[Iterable[str]] = None,
+    grid_config: Optional[GridConfig] = None,
+) -> None:
     global GLOBAL_CONFIG
-    config = _build_config(subsets_override=subsets)
+    config = _build_config(subsets_override=subsets, grid_config=grid_config)
     GLOBAL_CONFIG = config
     LOGGER.info("Parallel plan: stage=%s workers=%s oos_start=%s", config.stage, config.max_workers, config.oos_start)
     jobs = _build_jobs(config)
@@ -996,10 +1157,74 @@ if __name__ == "__main__":
         type=Path,
         help="Path to a file containing subset pairs (one pair per line)",
     )
+    parser.add_argument(
+        "--grid-config",
+        type=Path,
+        help="Path to a JSON file with grid parameter overrides",
+    )
+    parser.add_argument(
+        "--grid-z-methods",
+        help="Comma-separated z methods (e.g., quant)",
+    )
+    parser.add_argument(
+        "--grid-z-quantiles",
+        help="Comma-separated z quantiles (e.g., 0.65,0.7)",
+    )
+    parser.add_argument(
+        "--grid-p-thresh",
+        help="Comma-separated p thresholds (e.g., 0.55,0.6)",
+    )
+    parser.add_argument(
+        "--grid-regime-confirm",
+        help="Comma-separated regime confirm values (e.g., 0,1)",
+    )
+    parser.add_argument(
+        "--grid-gate-corr-min",
+        help="Comma-separated gate corr min values (e.g., 0.5,0.6)",
+    )
+    parser.add_argument(
+        "--grid-gate-corr-win",
+        help="Comma-separated gate corr window values (e.g., 40,60)",
+    )
+    parser.add_argument(
+        "--grid-cooldown",
+        help="Comma-separated cooldown values (e.g., 1,3)",
+    )
+    parser.add_argument(
+        "--grid-z-exit",
+        help="Comma-separated z-exit values (e.g., 0.6,0.7)",
+    )
+    parser.add_argument(
+        "--grid-z-stop",
+        help="Comma-separated z-stop values (e.g., 1.0,1.2)",
+    )
+    parser.add_argument(
+        "--grid-max",
+        type=int,
+        help="Maximum grid size before subsampling",
+    )
+    parser.add_argument(
+        "--mom-z-set",
+        help="Comma-separated momentum z values (e.g., 0.7,0.8)",
+    )
+    parser.add_argument(
+        "--mom-k-set",
+        help="Comma-separated momentum k values (e.g., 3,4)",
+    )
+    parser.add_argument(
+        "--mom-gate-k-set",
+        help="Comma-separated momentum gate k values (e.g., 3,4)",
+    )
+    parser.add_argument(
+        "--mom-cool-set",
+        help="Comma-separated momentum cooldown values (e.g., 4,5)",
+    )
     cli_args = parser.parse_args()
     try:
         override = _cli_subset_override(cli_args)
-        run_parallel(override)
+        grid_overrides = _cli_grid_overrides(cli_args)
+        grid_config = _build_grid_config(cli_args.grid_config, grid_overrides)
+        run_parallel(override, grid_config)
     except FileNotFoundError as exc:
         LOGGER.error("Parallel run failed: %s", exc)
         sys.exit(1)
