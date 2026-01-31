@@ -7,7 +7,7 @@ import json
 import logging
 import pathlib
 import tempfile
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import duckdb
 import pandas as pd
@@ -18,6 +18,8 @@ try:  # Optional dependency for Parquet export helpers.
 except Exception:  # pragma: no cover - optional dependency
     pa = None
     pq = None
+
+DuckDBConnection = duckdb.DuckDBPyConnection
 
 # Project level constants ----------------------------------------------------
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -69,7 +71,7 @@ def configure_logging(name: str = __name__) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def storage_open(read_only: bool = False) -> duckdb.DuckDBPyConnection:
+def storage_open(read_only: bool = False) -> DuckDBConnection:
     """Open a DuckDB connection, ensuring directories exist first."""
 
     _ensure_dirs()
@@ -85,7 +87,7 @@ def storage_open(read_only: bool = False) -> duckdb.DuckDBPyConnection:
     return conn
 
 
-def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
+def storage_init(conn: DuckDBConnection) -> None:
     """Create tables mirroring the reference R implementation."""
 
     statements = [
@@ -234,7 +236,7 @@ def storage_init(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def storage_create_index(
-    conn: duckdb.DuckDBPyConnection, table: str, columns: Sequence[str]
+    conn: DuckDBConnection, table: str, columns: Sequence[str]
 ) -> None:
     for column in columns:
         index_name = f"idx_{table}_{column}"
@@ -247,7 +249,7 @@ def storage_create_index(
         )
 
 
-def _bootstrap_dirty_meta(conn: duckdb.DuckDBPyConnection) -> None:
+def _bootstrap_dirty_meta(conn: DuckDBConnection) -> None:
     now = dt.datetime.utcnow()
     for table in TRACKED_TABLES:
         conn.execute(
@@ -260,7 +262,7 @@ def _bootstrap_dirty_meta(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
-def _mark_table_dirty(conn: duckdb.DuckDBPyConnection, table: str) -> None:
+def _mark_table_dirty(conn: DuckDBConnection, table: str) -> None:
     conn.execute(
         f"""
         INSERT INTO {DIRTY_META_TABLE} (table_name, dirty, last_marked)
@@ -273,7 +275,7 @@ def _mark_table_dirty(conn: duckdb.DuckDBPyConnection, table: str) -> None:
     )
 
 
-def storage_schedule_analyze(conn: duckdb.DuckDBPyConnection, table: str) -> None:
+def storage_schedule_analyze(conn: DuckDBConnection, table: str) -> None:
     """Mark a table as needing statistics refresh."""
 
     try:
@@ -282,7 +284,7 @@ def storage_schedule_analyze(conn: duckdb.DuckDBPyConnection, table: str) -> Non
         LOGGER.warning("Failed to mark table %%s dirty: %%s", table, exc)
 
 
-def _eligible_dirty_tables(conn: duckdb.DuckDBPyConnection, *, force: bool) -> Iterable[str]:
+def _eligible_dirty_tables(conn: DuckDBConnection, *, force: bool) -> Iterable[str]:
     threshold = dt.datetime.utcnow() - ANALYZE_MIN_INTERVAL
     if force:
         query = f"SELECT table_name FROM {DIRTY_META_TABLE} WHERE dirty"
@@ -298,7 +300,7 @@ def _eligible_dirty_tables(conn: duckdb.DuckDBPyConnection, *, force: bool) -> I
 
 
 def storage_run_maintenance(
-    conn: duckdb.DuckDBPyConnection, *, force: bool = False
+    conn: DuckDBConnection, *, force: bool = False
 ) -> None:
     """Run pending ANALYZE statements in batch if tables are marked dirty."""
 
@@ -323,14 +325,14 @@ def storage_run_maintenance(
             LOGGER.warning("ANALYZE failed for %%s: %%s", table, exc)
 
 
-def storage_analyze(conn: duckdb.DuckDBPyConnection) -> None:
+def storage_analyze(conn: DuckDBConnection) -> None:
     """Force an ANALYZE run for all dirty tables regardless of interval."""
 
     storage_run_maintenance(conn, force=True)
 
 
 def write_run(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     *,
     started_at: dt.datetime | None = None,
@@ -358,7 +360,7 @@ def write_run(
 
 
 def mark_run_finished(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     finished_at: dt.datetime | None = None,
 ) -> None:
@@ -370,7 +372,7 @@ def mark_run_finished(
 
 
 def write_trial(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     *,
     run_id: str,
     trial_id: str,
@@ -412,7 +414,7 @@ def write_trial(
 
 
 def write_exec_metrics(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     *,
     metric_ts: dt.datetime | None = None,
@@ -440,7 +442,7 @@ def write_exec_metrics(
 
 
 def write_storage_metrics(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     *,
     manifest_writes: int | None = None,
@@ -464,7 +466,7 @@ def write_storage_metrics(
 
 
 def write_trade_stats(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     *,
     n_trades: int,
@@ -492,7 +494,7 @@ def write_trade_stats(
 
 
 def write_regime_stats(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     *,
     p_mr_mean: float,
@@ -514,7 +516,7 @@ def write_regime_stats(
 
 
 def write_model_checks(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     run_id: str,
     *,
     pair: str,
@@ -540,7 +542,7 @@ def write_model_checks(
 
 
 def write_pareto_front(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     rows: Iterable[Mapping[str, Any]],
 ) -> None:
     if not rows:
@@ -554,7 +556,7 @@ def write_pareto_front(
 
 
 def write_sd_loop(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     rows: Iterable[Mapping[str, Any]],
 ) -> None:
     if not rows:
@@ -580,7 +582,7 @@ def write_sd_loop(
 
 
 def write_dashboard_daily(
-    conn: duckdb.DuckDBPyConnection,
+    conn: DuckDBConnection,
     rows: Iterable[Mapping[str, Any]],
 ) -> None:
     if not rows:
@@ -619,7 +621,7 @@ def write_dashboard_daily(
     storage_schedule_analyze(conn, "dashboard_daily")
 
 
-def storage_write_df(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> None:
+def storage_write_df(conn: DuckDBConnection, table: str, df: pd.DataFrame) -> None:
     if df.empty:
         raise ValueError("DataFrame must contain at least one row")
     tmp_name = f"tmp_{table}_df"
@@ -665,7 +667,7 @@ def duckdb_copy_to(src_path: pathlib.Path, dst_path: pathlib.Path) -> None:
 
 
 @contextlib.contextmanager
-def with_transaction(conn: duckdb.DuckDBPyConnection):
+def with_transaction(conn: DuckDBConnection) -> Iterator[DuckDBConnection]:
     conn.execute("BEGIN TRANSACTION")
     try:
         yield conn
@@ -677,7 +679,7 @@ def with_transaction(conn: duckdb.DuckDBPyConnection):
 
 
 @contextlib.contextmanager
-def managed_storage(_note: str = ""):
+def managed_storage(_note: str = "") -> Iterator[DuckDBConnection]:
     conn = storage_open()
     try:
         storage_init(conn)
