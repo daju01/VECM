@@ -29,6 +29,9 @@ BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
 CACHE_META_PATH = DATA_DIR / "adj_close_data.meta.json"
+OFFLINE_FALLBACK_PATH = pathlib.Path(
+    os.getenv("OFFLINE_FALLBACK_PATH", str(DATA_DIR / "offline_prices.csv"))
+)
 DEFAULT_START_DATE = dt.date(2013, 1, 1)
 MAX_WORKERS = 4
 MAX_RETRIES = 3
@@ -49,6 +52,7 @@ YF_PROXY_AUTH_ENV = "VECM_PROXY_AUTH"
 
 
 _REQUESTS_SESSION: Any = None
+_REQUESTS_SESSION_PID: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +224,9 @@ def _ensure_data_dir() -> None:
 
 
 def _get_requests_session() -> Any:
-    global _REQUESTS_SESSION
-    if _REQUESTS_SESSION is not None:
+    global _REQUESTS_SESSION, _REQUESTS_SESSION_PID
+    current_pid = os.getpid()
+    if _REQUESTS_SESSION is not None and _REQUESTS_SESSION_PID == current_pid:
         return _REQUESTS_SESSION
 
     user_agent = os.getenv(YF_USER_AGENT_ENV, "").strip() or YF_DEFAULT_USER_AGENT
@@ -279,6 +284,7 @@ def _get_requests_session() -> Any:
         session.verify = verify_path
 
     _REQUESTS_SESSION = session
+    _REQUESTS_SESSION_PID = current_pid
     return session
 
 
@@ -305,6 +311,8 @@ def _read_existing_prices() -> Optional[pd.DataFrame]:
 
 @lru_cache(maxsize=1)
 def _load_offline_table() -> pd.DataFrame:
+    if os.getenv("OFFLINE_FALLBACK_PATH") is None:
+        LOGGER.info("Using default offline fallback path at %s", OFFLINE_FALLBACK_PATH)
     if not OFFLINE_FALLBACK_PATH.exists():
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     try:
@@ -587,6 +595,7 @@ def ensure_price_data(
 
     new_frames: List[pd.DataFrame] = []
     refreshed_tickers: List[str] = []
+    failed_tickers: List[str] = []
     meta_changed = False
     if download_plan:
         max_workers = max(1, min(MAX_WORKERS, len(download_plan)))
@@ -608,6 +617,7 @@ def ensure_price_data(
                 except Exception as exc:  # pragma: no cover - network/runtime errors
                     LOGGER.warning("Download task failed for %s: %s", ticker, exc)
                     _update_meta_record(meta, ticker, refreshed=False)
+                    failed_tickers.append(ticker)
                     meta_changed = True
                     continue
                 if not frame.empty:
@@ -616,6 +626,7 @@ def ensure_price_data(
                     _update_meta_record(meta, ticker, refreshed=True)
                 else:
                     _update_meta_record(meta, ticker, refreshed=False)
+                    failed_tickers.append(ticker)
                 meta_changed = True
     else:
         LOGGER.info("No tickers required download; cache is up to date")
@@ -635,6 +646,14 @@ def ensure_price_data(
         LOGGER.info("Refreshed %d tickers: %s", len(refreshed_tickers), ", ".join(sorted(refreshed_tickers)[:10]))
         if len(refreshed_tickers) > 10:
             LOGGER.info("...and %d more", len(refreshed_tickers) - 10)
+    if failed_tickers:
+        LOGGER.warning(
+            "Failed to refresh %d tickers: %s",
+            len(failed_tickers),
+            ", ".join(sorted(failed_tickers)[:10]),
+        )
+        if len(failed_tickers) > 10:
+            LOGGER.warning("...and %d more", len(failed_tickers) - 10)
     return wide
 
 

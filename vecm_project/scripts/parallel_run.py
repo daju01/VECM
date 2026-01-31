@@ -39,6 +39,7 @@ GLOBAL_CONFIG: Optional["RunnerConfig"] = None
 BASE_DIR = Path(__file__).resolve().parents[1]
 _DEFAULT_CFG_DICT: Optional[Dict[str, Any]] = None
 _DATA_CACHE: Dict[str, pd.DataFrame] = {}
+_RAW_DATA_CACHE: Dict[str, pd.DataFrame] = {}
 _PLAYBOOK_FIELDS = {field.name for field in fields(PlaybookConfig)}
 _GRID_PARAM_MAPPING = {
     "p": "p_th",
@@ -103,6 +104,7 @@ DEFAULT_SUBSETS = (
     "ANTM,MBMA",
     "ANTM,NCKL",
 )
+DEFAULT_FALLBACK_DEFAULTS = True
 
 SUBSET_LIBRARY_PATH = BASE_DIR / "data" / "subset_pairs.txt"
 
@@ -198,6 +200,15 @@ def _cached_frame(path: Path) -> pd.DataFrame:
     if frame is None:
         frame = load_and_validate_data(key)
         _DATA_CACHE[key] = frame
+    return frame
+
+
+def _cached_csv_frame(path: Path) -> pd.DataFrame:
+    key = str(path)
+    frame = _RAW_DATA_CACHE.get(key)
+    if frame is None:
+        frame = pd.read_csv(path)
+        _RAW_DATA_CACHE[key] = frame
     return frame
 
 
@@ -387,7 +398,7 @@ def _prefilter_pairs(
     top_k: int = 80,
 ) -> List[str]:
     try:
-        df = pd.read_csv(csv_path)
+        df = _cached_csv_frame(csv_path).copy()
     except FileNotFoundError:
         return []
     if df.shape[1] < 3:
@@ -525,7 +536,7 @@ def _align_pair(
     min_obs: int,
 ) -> Optional[Path]:
     try:
-        df = pd.read_csv(csv_path)
+        df = _cached_csv_frame(csv_path).copy()
     except FileNotFoundError:
         LOGGER.warning("Cannot align %s: input CSV %s missing", subset, csv_path)
         return None
@@ -610,7 +621,12 @@ def _load_subset_library() -> List[str]:
     return _parse_subset_entries(lines, source="subset library")
 
 
-def _gather_subsets(input_csv: Path, override: Optional[Iterable[str]] = None) -> List[str]:
+def _gather_subsets(
+    input_csv: Path,
+    override: Optional[Iterable[str]] = None,
+    *,
+    fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
+) -> List[str]:
     if override:
         parsed = _parse_subset_entries(list(override), source="override")
         if parsed:
@@ -717,6 +733,8 @@ def _prune_from_manifest(
 def _build_config(
     subsets_override: Optional[Iterable[str]] = None,
     grid_config: Optional[GridConfig] = None,
+    *,
+    fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
 ) -> RunnerConfig:
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
@@ -726,7 +744,7 @@ def _build_config(
     lock_file = out_dir / ".start_gate.lock"
     stamp_file = out_dir / ".last_start_time"
     max_workers = max(1, _env_int("VECM_MAX_WORKERS", _available_workers()))
-    subsets = _gather_subsets(input_csv, subsets_override)
+    subsets = _gather_subsets(input_csv, subsets_override, fallback_defaults=fallback_defaults)
     tickers = _download_tickers_for_subsets(subsets)
     ensure_price_data(tickers=tickers or None)
     stage = _choose_stage(manifest_path, subsets)
@@ -1087,6 +1105,29 @@ def _write_stage_summary(statuses: List[Dict[str, Any]], config: RunnerConfig) -
     LOGGER.info("Stage summary written to %s", path)
 
 
+def _report_failed_pairs(statuses: List[Dict[str, Any]], config: RunnerConfig) -> None:
+    df = pd.DataFrame(statuses)
+    if df.empty:
+        return
+    def _status(row: pd.Series) -> str:
+        rc = row.get("rc")
+        if pd.isna(rc):
+            return "skipped"
+        return "ok" if rc == 0 else "failed"
+    df = df.assign(status=df.apply(_status, axis=1))
+    failed = df[df["status"] != "ok"].copy()
+    if failed.empty:
+        LOGGER.info("No failed/skipped pairs detected")
+        return
+    cols = [col for col in ["subset", "tag", "run_id", "status", "error"] if col in failed.columns]
+    report_path = config.out_dir / f"failed_pairs_{config.stage}.csv"
+    failed[cols].to_csv(report_path, index=False)
+    LOGGER.warning("Recorded %d failed/skipped pairs to %s", len(failed), report_path)
+    preview = failed[cols].head(5)
+    for _, row in preview.iterrows():
+        LOGGER.warning("Pair status: %s | %s | %s", row.get("status"), row.get("subset"), row.get("error"))
+
+
 def _cli_subset_override(args: argparse.Namespace) -> Optional[List[str]]:
     entries: List[str] = []
     if args.subs:
@@ -1129,6 +1170,13 @@ def run_parallel(
 ) -> None:
     global GLOBAL_CONFIG
     config = _build_config(subsets_override=subsets, grid_config=grid_config)
+def run_parallel(
+    subsets: Optional[Iterable[str]] = None,
+    *,
+    fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
+) -> None:
+    global GLOBAL_CONFIG
+    config = _build_config(subsets_override=subsets, fallback_defaults=fallback_defaults)
     GLOBAL_CONFIG = config
     LOGGER.info("Parallel plan: stage=%s workers=%s oos_start=%s", config.stage, config.max_workers, config.oos_start)
     jobs = _build_jobs(config)
@@ -1138,6 +1186,7 @@ def run_parallel(
     statuses = _execute_jobs(jobs, config)
     _aggregate_exec_metrics(statuses, config)
     _write_stage_summary(statuses, config)
+    _report_failed_pairs(statuses, config)
     completed = [s for s in statuses if s.get("rc") == 0]
     LOGGER.info("Completed %s/%s jobs", len(completed), len(jobs))
 
@@ -1218,6 +1267,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mom-cool-set",
         help="Comma-separated momentum cooldown values (e.g., 4,5)",
+        "--fallback-defaults",
+        dest="fallback_defaults",
+        action="store_true",
+        default=DEFAULT_FALLBACK_DEFAULTS,
+        help="Fallback to DEFAULT_SUBSETS when no subset sources are found",
+    )
+    parser.add_argument(
+        "--no-fallback-defaults",
+        dest="fallback_defaults",
+        action="store_false",
+        help="Disable fallback to DEFAULT_SUBSETS when no subset sources are found",
     )
     cli_args = parser.parse_args()
     try:
@@ -1225,6 +1285,7 @@ if __name__ == "__main__":
         grid_overrides = _cli_grid_overrides(cli_args)
         grid_config = _build_grid_config(cli_args.grid_config, grid_overrides)
         run_parallel(override, grid_config)
+        run_parallel(override, fallback_defaults=cli_args.fallback_defaults)
     except FileNotFoundError as exc:
         LOGGER.error("Parallel run failed: %s", exc)
         sys.exit(1)
