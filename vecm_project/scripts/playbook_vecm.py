@@ -121,6 +121,53 @@ class PlaybookConfig:
         return dataclasses.asdict(self)
 
 
+@dataclass(frozen=True)
+class FeatureConfig:
+    base_config: PlaybookConfig
+    pair: str
+    method: str = "TVECM"
+    horizon: str = ""
+    data_frame: Optional[pd.DataFrame] = None
+    run_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DecisionParams:
+    z_entry: Optional[float]
+    z_exit: float
+    max_hold: int
+    cooldown: int
+    run_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FeatureBundle:
+    run_id: str
+    cfg: PlaybookConfig
+    pair: str
+    selected_l: str
+    selected_r: str
+    lp: pd.DataFrame
+    beta_series: pd.Series
+    zect: pd.Series
+    combined_gate: pd.Series
+    p_mr_series: pd.Series
+    delta_score: Optional[pd.Series]
+    delta_mom12: Optional[pd.Series]
+    alpha_ec: float
+    half_life_full: float
+    ms_status: str
+    ms_error: str
+    oos_start_date: dt.date
+    horizon: Dict[str, object]
+
+
+@dataclass(frozen=True)
+class FeatureBuildResult:
+    features: Optional[FeatureBundle]
+    skip_result: Optional[Dict[str, object]] = None
+
+
 def _default_input_path() -> str:
     """Return the default price cache path without forcing it to exist."""
 
@@ -295,6 +342,18 @@ def _write_text(path: pathlib.Path, text: str) -> None:
     path.write_text(text)
 
 
+def _resolve_universe(
+    universe: Optional[Iterable[str] | str],
+    fallback: str,
+) -> str:
+    if universe is None:
+        return fallback
+    if isinstance(universe, str):
+        return universe
+    tokens = [str(token).strip() for token in universe if str(token).strip()]
+    return ",".join(tokens) if tokens else fallback
+
+
 def _df_to_csv(df: pd.DataFrame, path: pathlib.Path) -> None:
     df_out = df.copy()
     if "date" not in df_out.columns:
@@ -366,6 +425,45 @@ def _confirm_streak(mask: pd.Series, streak: int) -> pd.Series:
         counter = counter + 1 if flag else 0
         out[idx] = counter >= streak
     return pd.Series(out, index=mask.index)
+
+
+def _resolve_oos_start_date(
+    cfg: PlaybookConfig,
+    base_index: pd.Index,
+    *,
+    allow_empty: bool = False,
+) -> dt.date:
+    if cfg.oos_start:
+        return pd.to_datetime(cfg.oos_start).date()
+    if not len(base_index):
+        if allow_empty:
+            return dt.datetime.utcnow().date()
+        raise ValueError("Cannot determine OOS start date; no observations available")
+    cutoff_idx = int(len(base_index) * 0.7)
+    cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
+    return base_index[cutoff_idx].date()
+
+
+def _build_horizon(index: pd.Index) -> Dict[str, object]:
+    if not len(index):
+        return {
+            "train_obs": 0,
+            "test_obs": 0,
+            "train_start": "",
+            "train_end": "",
+            "test_start": "",
+            "test_end": "",
+        }
+    cutoff_idx = int(len(index) * 0.7)
+    cutoff_idx = min(max(cutoff_idx, 0), len(index) - 1)
+    return {
+        "train_obs": int(cutoff_idx),
+        "test_obs": len(index) - int(cutoff_idx),
+        "train_start": str(index.min().date()),
+        "train_end": str(index[cutoff_idx].date()),
+        "test_start": str(index[cutoff_idx].date()),
+        "test_end": str(index.max().date()),
+    }
 
 
 def _cooldown(mask: pd.Series, cooldown: int) -> pd.Series:
@@ -1175,39 +1273,58 @@ def _build_invalid_result(
     }
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline -------------------------------------------------------------
-# ---------------------------------------------------------------------------
-def run_playbook(
-    config: Mapping[str, object],
-    *,
-    persist: bool = True,
-    data_frame: Optional[pd.DataFrame] = None,
-) -> Dict[str, object]:
-    if isinstance(config, PlaybookConfig):
-        cfg = config
-    else:
-        default_cfg = parse_args([])
-        cfg_dict = default_cfg.to_dict()
-        cfg_dict.update({k: v for k, v in dict(config).items() if v is not None})
-        cfg = PlaybookConfig(**cfg_dict)
-    if cfg.z_entry is not None:
-        if not np.isfinite(cfg.z_entry) or cfg.z_entry <= 0:
-            LOGGER.warning("Invalid z_entry %.3f supplied; disabling manual override", cfg.z_entry)
-            cfg.z_entry = None
-        elif cfg.z_stop < cfg.z_entry:
+def _apply_decision_params(
+    cfg: PlaybookConfig,
+    decision_params: DecisionParams,
+) -> PlaybookConfig:
+    updated_cfg = dataclasses.replace(
+        cfg,
+        z_entry=decision_params.z_entry,
+        z_exit=float(decision_params.z_exit),
+        max_hold=int(decision_params.max_hold),
+        cooldown=int(decision_params.cooldown),
+        z_stop=float(max(decision_params.z_entry or 0.0, decision_params.z_exit)),
+    )
+    if updated_cfg.z_entry is not None:
+        if not np.isfinite(updated_cfg.z_entry) or updated_cfg.z_entry <= 0:
+            LOGGER.warning(
+                "Invalid z_entry %.3f supplied; disabling manual override",
+                updated_cfg.z_entry,
+            )
+            updated_cfg = dataclasses.replace(updated_cfg, z_entry=None)
+        elif updated_cfg.z_stop < updated_cfg.z_entry:
             LOGGER.info(
                 "Adjusting z_stop from %.3f to %.3f to respect z_entry threshold",
-                cfg.z_stop,
-                cfg.z_entry,
+                updated_cfg.z_stop,
+                updated_cfg.z_entry,
             )
-            cfg.z_stop = float(cfg.z_entry)
+            updated_cfg = dataclasses.replace(updated_cfg, z_stop=float(updated_cfg.z_entry))
+    return updated_cfg
+
+
+def build_features(
+    universe: Optional[Iterable[str] | str],
+    feature_config: FeatureConfig,
+) -> FeatureBuildResult:
+    run_id = feature_config.run_id or dt.datetime.utcnow().strftime(RUN_ID_FMT)
+    subset = _resolve_universe(universe, feature_config.base_config.subset)
+    cfg = dataclasses.replace(
+        feature_config.base_config,
+        subset=subset,
+        method=feature_config.method,
+        horizon=feature_config.horizon,
+    )
     if cfg.seed is not None:
         np.random.seed(cfg.seed)
-    run_id = dt.datetime.utcnow().strftime(RUN_ID_FMT)
-    LOGGER.info("=== VECM Playbook start | run_id=%s ===", run_id)
-    if data_frame is not None:
-        df = data_frame.copy(deep=True)
+    LOGGER.info(
+        "Feature build start | run_id=%s pair=%s method=%s",
+        run_id,
+        subset,
+        cfg.method,
+    )
+
+    if feature_config.data_frame is not None:
+        df = feature_config.data_frame.copy(deep=True)
     else:
         df = load_and_validate_data(cfg.input_file)
 
@@ -1218,7 +1335,7 @@ def run_playbook(
     except Exception as exc:
         LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
 
-    df_clean, tickers, outlier_ratios = preprocess_data(df, cfg)
+    df_clean, _, outlier_ratios = preprocess_data(df, cfg)
     try:
         selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
     except PairSelectionError as exc:
@@ -1230,9 +1347,7 @@ def run_playbook(
             pair=exc.pair,
             observations=exc.observations,
         )
-        if persist:
-            persist_artifacts(run_id, cfg, result)
-        return result
+        return FeatureBuildResult(features=None, skip_result=result)
     LOGGER.info("Selected pair: %s ~ %s | beta0=%.4f", selected_l, selected_r, beta0)
     pair_prices = df_clean[[selected_l, selected_r]].dropna()
     lp = np.log(pair_prices)
@@ -1271,16 +1386,7 @@ def run_playbook(
             cost=empty_series.rename("cost"),
             trades=pd.DataFrame(),
         )
-        if cfg.oos_start:
-            oos_start_date = pd.to_datetime(cfg.oos_start).date()
-        else:
-            base_index = empty_idx
-            if not len(base_index):
-                oos_start_date = dt.datetime.utcnow().date()
-            else:
-                cutoff_idx = int(len(base_index) * 0.7)
-                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
-                oos_start_date = base_index[cutoff_idx].date()
+        oos_start_date = _resolve_oos_start_date(cfg, empty_idx, allow_empty=True)
         metrics = compute_metrics(exec_res, cfg, oos_start_date)
         metrics["skip_reason"] = "zscore_empty"
         result = {
@@ -1297,20 +1403,10 @@ def run_playbook(
             },
             "signals": empty_signals,
             "execution": exec_res,
-            "horizon": {
-                "train_obs": int(len(lp) * 0.7),
-                "test_obs": len(lp) - int(len(lp) * 0.7),
-                "train_start": str(lp.index.min().date()) if len(lp) else "",
-                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
-                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
-                "test_end": str(lp.index.max().date()) if len(lp) else "",
-            },
+            "horizon": _build_horizon(lp.index),
             "skipped_reason": "zscore_empty",
         }
-        if persist:
-            persist_artifacts(run_id, cfg, result)
-        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
-        return result
+        return FeatureBuildResult(features=None, skip_result=result)
     if not np.isfinite(ect_std) or ect_std < min_spread_std:
         LOGGER.error(
             "Spread variance too low (std=%.6g); skipping pair %s~%s",
@@ -1330,16 +1426,7 @@ def run_playbook(
             cost=empty_series.rename("cost"),
             trades=pd.DataFrame(),
         )
-        if cfg.oos_start:
-            oos_start_date = pd.to_datetime(cfg.oos_start).date()
-        else:
-            base_index = empty_idx
-            if not len(base_index):
-                oos_start_date = dt.datetime.utcnow().date()
-            else:
-                cutoff_idx = int(len(base_index) * 0.7)
-                cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
-                oos_start_date = base_index[cutoff_idx].date()
+        oos_start_date = _resolve_oos_start_date(cfg, empty_idx, allow_empty=True)
         metrics = compute_metrics(exec_res, cfg, oos_start_date)
         metrics["skip_reason"] = "spread_variance_low"
         result = {
@@ -1356,20 +1443,10 @@ def run_playbook(
             },
             "signals": empty_signals,
             "execution": exec_res,
-            "horizon": {
-                "train_obs": int(len(lp) * 0.7),
-                "test_obs": len(lp) - int(len(lp) * 0.7),
-                "train_start": str(lp.index.min().date()) if len(lp) else "",
-                "train_end": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
-                "test_start": str(lp.index[int(len(lp) * 0.7)].date()) if len(lp) else "",
-                "test_end": str(lp.index.max().date()) if len(lp) else "",
-            },
+            "horizon": _build_horizon(lp.index),
             "skipped_reason": "spread_variance_low",
         }
-        if persist:
-            persist_artifacts(run_id, cfg, result)
-        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
-        return result
+        return FeatureBuildResult(features=None, skip_result=result)
     zect = zect_valid
 
     delta_score: Optional[pd.Series] = None
@@ -1436,49 +1513,84 @@ def run_playbook(
         combined_gate = (corr_gate & hl_gate).reindex(zect.index).fillna(False)
     else:
         combined_gate = pd.Series(True, index=zect.index)
-    signals, z_th = build_signals(
-        zect,
-        cfg,
-        combined_gate,
+
+    oos_start_date = _resolve_oos_start_date(cfg, zect.index, allow_empty=False)
+    horizon = _build_horizon(lp.index)
+    features = FeatureBundle(
+        run_id=run_id,
+        cfg=cfg,
+        pair=f"{selected_l},{selected_r}",
+        selected_l=selected_l,
+        selected_r=selected_r,
+        lp=lp,
+        beta_series=beta_series,
+        zect=zect,
+        combined_gate=combined_gate,
+        p_mr_series=p_mr_series,
         delta_score=delta_score,
-        p_regime=p_mr_series,
         delta_mom12=delta_mom12,
+        alpha_ec=alpha_ec,
+        half_life_full=half_life_full,
+        ms_status=ms_status,
+        ms_error=ms_error,
+        oos_start_date=oos_start_date,
+        horizon=horizon,
+    )
+    LOGGER.info(
+        "Feature build complete | run_id=%s pair=%s rows=%d",
+        run_id,
+        features.pair,
+        len(zect),
+    )
+    return FeatureBuildResult(features=features)
+
+
+def evaluate_rules(
+    feature_result: FeatureBuildResult,
+    decision_params: DecisionParams,
+) -> Dict[str, object]:
+    if feature_result.skip_result is not None:
+        return feature_result.skip_result
+    if feature_result.features is None:
+        raise ValueError("Feature bundle missing; cannot evaluate rules")
+    features = feature_result.features
+    cfg = _apply_decision_params(features.cfg, decision_params)
+
+    signals, z_th = build_signals(
+        features.zect,
+        cfg,
+        features.combined_gate,
+        delta_score=features.delta_score,
+        p_regime=features.p_mr_series,
+        delta_mom12=features.delta_mom12,
     )
     exec_res = execute_trades(
-        zect,
+        features.zect,
         signals,
-        lp,
-        beta_series,
+        features.lp,
+        features.beta_series,
         cfg,
-        p_regime=p_mr_series,
-        delta_score=delta_score,
-        delta_mom12=delta_mom12,
+        p_regime=features.p_mr_series,
+        delta_score=features.delta_score,
+        delta_mom12=features.delta_mom12,
     )
-    if cfg.oos_start:
-        oos_start_date = pd.to_datetime(cfg.oos_start).date()
-    else:
-        base_index = zect.index if len(zect) else lp.index
-        if not len(base_index):
-            raise ValueError("Cannot determine OOS start date; no observations available")
-        cutoff_idx = int(len(base_index) * 0.7)
-        cutoff_idx = min(max(cutoff_idx, 0), len(base_index) - 1)
-        oos_start_date = base_index[cutoff_idx].date()
-    metrics = compute_metrics(exec_res, cfg, oos_start_date)
-    metrics["alpha_ec"] = alpha_ec
-    metrics["half_life_full"] = half_life_full
+    metrics = compute_metrics(exec_res, cfg, features.oos_start_date)
+    metrics["alpha_ec"] = features.alpha_ec
+    metrics["half_life_full"] = features.half_life_full
     metrics["z_th"] = z_th
-    metrics["ms_regime_status"] = ms_status
-    if ms_error:
-        metrics["ms_regime_error"] = ms_error
+    metrics["ms_regime_status"] = features.ms_status
+    if features.ms_error:
+        metrics["ms_regime_error"] = features.ms_error
     if cfg.z_entry is not None and np.isfinite(cfg.z_entry):
         metrics["z_entry"] = float(cfg.z_entry)
-    result = {
+    run_id = decision_params.run_id or features.run_id
+    return {
         "run_id": run_id,
         "params": cfg.to_dict(),
         "config": cfg.to_dict(),
         "metrics": metrics,
         "model_checks": {
-            "pair": f"{selected_l}~{selected_r}",
+            "pair": f"{features.selected_l}~{features.selected_r}",
             "rank": 1,
             "deterministic": "ci",
             "threshold": float(z_th),
@@ -1486,15 +1598,54 @@ def run_playbook(
         },
         "signals": signals,
         "execution": exec_res,
-        "horizon": {
-            "train_obs": int(len(lp) * 0.7),
-            "test_obs": len(lp) - int(len(lp) * 0.7),
-            "train_start": str(lp.index.min().date()),
-            "train_end": str(lp.index[int(len(lp) * 0.7)].date()),
-            "test_start": str(lp.index[int(len(lp) * 0.7)].date()),
-            "test_end": str(lp.index.max().date()),
-        },
+        "horizon": features.horizon,
     }
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+def run_playbook(
+    config: Mapping[str, object],
+    *,
+    persist: bool = True,
+    data_frame: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
+    if isinstance(config, PlaybookConfig):
+        cfg = config
+    else:
+        default_cfg = parse_args([])
+        cfg_dict = default_cfg.to_dict()
+        cfg_dict.update({k: v for k, v in dict(config).items() if v is not None})
+        cfg = PlaybookConfig(**cfg_dict)
+    run_id = dt.datetime.utcnow().strftime(RUN_ID_FMT)
+    LOGGER.info("=== VECM Playbook start | run_id=%s ===", run_id)
+    feature_result = build_features(
+        cfg.subset,
+        FeatureConfig(
+            base_config=cfg,
+            pair=cfg.subset,
+            method=cfg.method,
+            horizon=cfg.horizon,
+            data_frame=data_frame,
+            run_id=run_id,
+        ),
+    )
+    if feature_result.skip_result is not None:
+        result = feature_result.skip_result
+        if persist:
+            persist_artifacts(run_id, cfg, result)
+        LOGGER.info("=== VECM Playbook complete (skipped) | run_id=%s ===", run_id)
+        return result
+
+    decision_params = DecisionParams(
+        z_entry=cfg.z_entry,
+        z_exit=cfg.z_exit,
+        max_hold=cfg.max_hold,
+        cooldown=cfg.cooldown,
+        run_id=run_id,
+    )
+    result = evaluate_rules(feature_result, decision_params)
     if persist:
         persist_artifacts(run_id, cfg, result)
     LOGGER.info("=== VECM Playbook complete | run_id=%s ===", run_id)
