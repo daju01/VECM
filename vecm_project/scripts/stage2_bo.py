@@ -14,10 +14,13 @@ import pandas as pd
 
 from . import storage
 from .playbook_vecm import (
+    DecisionParams,
+    FeatureConfig,
     PlaybookConfig,
+    build_features,
+    evaluate_rules,
     load_and_validate_data,
     parse_args,
-    run_playbook,
 )
 
 LOGGER = storage.configure_logging("stage2_bo")
@@ -68,40 +71,15 @@ def _resolve_input_file(base_cfg: Mapping[str, Any]) -> str:
     return default_cfg.input_file
 
 
-def score_playbook(
+def score_rules(
     *,
-    pair: str,
-    method: str,
-    horizon: str,
-    base_cfg: Mapping[str, Any],
-    data_frame: pd.DataFrame,
-    z_entry: float,
-    z_exit: float,
-    max_hold: float,
-    cooldown: float,
+    feature_result: Any,
+    decision_params: DecisionParams,
 ) -> Dict[str, float]:
-    """Execute the playbook once and expose scalar diagnostics."""
+    """Evaluate the cached features once and expose scalar diagnostics."""
 
-    cfg_payload: Dict[str, Any] = dict(base_cfg)
-    cfg_payload.update(
-        {
-            "subset": pair,
-            "method": method,
-            "stage": 2,
-            "notes": f"stage2_bo|pair={pair}|method={method}",
-            "z_entry": float(z_entry),
-            "max_hold": int(max_hold),
-            "cooldown": int(cooldown),
-            "z_exit": float(z_exit),
-            "z_stop": float(max(z_entry, z_exit)),
-        }
-    )
-    if horizon:
-        cfg_payload.setdefault("horizon", horizon)
-
-    cfg = PlaybookConfig(**cfg_payload)
     start = time.perf_counter()
-    result = run_playbook(cfg, persist=False, data_frame=data_frame)
+    result = evaluate_rules(feature_result, decision_params)
     elapsed = time.perf_counter() - start
     metrics = result.get("metrics", {})
     sharpe = float(metrics.get("sharpe_oos", 0.0))
@@ -166,19 +144,51 @@ def run_bo(
     base_cfg = _base_config_dict(cfg)
     input_path = _resolve_input_file(base_cfg)
     data_frame = load_and_validate_data(input_path)
+    cfg_payload: Dict[str, Any] = dict(base_cfg)
+    cfg_payload.update(
+        {
+            "subset": pair,
+            "method": method,
+            "stage": 2,
+            "notes": f"stage2_bo|pair={pair}|method={method}",
+        }
+    )
+    if horizon:
+        cfg_payload.setdefault("horizon", horizon)
+    base_playbook_cfg = PlaybookConfig(**cfg_payload)
+    feature_result = build_features(
+        pair,
+        FeatureConfig(
+            base_config=base_playbook_cfg,
+            pair=pair,
+            method=method,
+            horizon=horizon,
+            data_frame=data_frame,
+            run_id=study_run_id,
+        ),
+    )
+    if feature_result.skip_result is not None:
+        LOGGER.warning(
+            "Feature build returned a skipped result; BO trials will only evaluate cached output."
+        )
+    else:
+        LOGGER.info("Feature cache ready; BO trials will only evaluate rules.")
     sampler_seed = base_cfg.get("seed") if isinstance(base_cfg, Mapping) else None
     sampler = optuna.samplers.TPESampler(seed=sampler_seed, n_startup_trials=n_init)
 
     def objective(trial: optuna.Trial) -> float:
         params = _suggest_params(trial)
         trial_run_id = f"{study_run_id}_trial{trial.number:03d}"
-        diagnostics = score_playbook(
-            pair=pair,
-            method=method,
-            horizon=horizon,
-            base_cfg=base_cfg,
-            data_frame=data_frame,
-            **params,
+        decision_params = DecisionParams(
+            z_entry=float(params["z_entry"]),
+            z_exit=float(params["z_exit"]),
+            max_hold=int(params["max_hold"]),
+            cooldown=int(params["cooldown"]),
+            run_id=trial_run_id,
+        )
+        diagnostics = score_rules(
+            feature_result=feature_result,
+            decision_params=decision_params,
         )
         record = {
             "params": params,
