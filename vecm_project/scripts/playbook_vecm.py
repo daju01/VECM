@@ -47,6 +47,7 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import VECM
 
 from . import storage
+from .cache_keys import hash_config, hash_dataframe
 from .data_streaming import ensure_price_data, load_cached_prices
 from .ms_spread import compute_regime_prob, fit_ms_spread
 from .short_term_signals import build_short_term_signals
@@ -57,6 +58,9 @@ from .short_term_signals import build_short_term_signals
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 OUT_DIR = BASE_DIR / "out_ms"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = BASE_DIR / "cache"
+PANEL_CACHE_DIR = CACHE_DIR / "panels"
+FEATURE_CACHE_DIR = CACHE_DIR / "features"
 
 RUN_ID_FMT = "%Y%m%d_%H%M%S"
 
@@ -363,6 +367,50 @@ def _df_to_csv(df: pd.DataFrame, path: pathlib.Path) -> None:
             df_out.insert(0, "date", df_out.index)
     path.parent.mkdir(parents=True, exist_ok=True)
     df_out.to_csv(path, index=False)
+
+
+def _safe_cache_slug(value: str) -> str:
+    return "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in value)
+
+
+def _panel_universe_id(tickers: List[str], cfg: PlaybookConfig) -> str:
+    payload = {
+        "subset": cfg.subset or "all",
+        "tickers": sorted(tickers),
+        "roll_years": cfg.roll_years,
+        "outlier_iqr_mult": cfg.outlier_iqr_mult,
+        "outlier_max_ratio": cfg.outlier_max_ratio,
+    }
+    return hash_config(payload)
+
+
+def _panel_cache_paths(universe_id: str, data_hash: str) -> tuple[pathlib.Path, pathlib.Path]:
+    cache_dir = PANEL_CACHE_DIR / universe_id
+    return cache_dir / f"{data_hash}.parquet", cache_dir / f"{data_hash}.json"
+
+
+def _read_panel_cache(path: pathlib.Path) -> pd.DataFrame:
+    panel = pd.read_parquet(path)
+    if not isinstance(panel.index, pd.DatetimeIndex):
+        if "date" in panel.columns:
+            panel = panel.set_index("date")
+        panel.index = pd.to_datetime(panel.index)
+    return panel.sort_index()
+
+
+def _write_panel_cache(path: pathlib.Path, panel: pd.DataFrame, meta_path: pathlib.Path, meta: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    panel.to_parquet(path)
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
+
+
+def _feature_cache_key(cfg: PlaybookConfig, data_hash: str, pair: str) -> str:
+    payload = {"data_hash": data_hash, "pair": pair, "cfg": cfg.to_dict()}
+    return hash_config(payload)
+
+
+def _feature_cache_path(pair_id: str, feature_key: str) -> pathlib.Path:
+    return FEATURE_CACHE_DIR / pair_id / f"{feature_key}.parquet"
 
 
 def _half_life(series: pd.Series) -> float:
@@ -1328,6 +1376,17 @@ def build_features(
     else:
         df = load_and_validate_data(cfg.input_file)
 
+    available_cols = [c for c in df.columns if c != "date"]
+    subset_cols = available_cols
+    if cfg.subset:
+        raw_tokens = [token.strip() for token in cfg.subset.split(",") if token.strip()]
+        enriched = [tok if tok.endswith(".JK") else f"{tok}.JK" for tok in raw_tokens]
+        subset_cols = [c for c in available_cols if c in enriched] or available_cols
+    panel_df = df[["date", *subset_cols]].copy()
+    universe_id = _panel_universe_id(subset_cols, cfg)
+    panel_hash = hash_dataframe(panel_df)
+    panel_path, panel_meta_path = _panel_cache_paths(universe_id, panel_hash)
+
     short_panel: Optional[pd.DataFrame] = None
     try:
         short_panel = build_short_term_signals(df, market_col="^JKSE")
@@ -1335,7 +1394,23 @@ def build_features(
     except Exception as exc:
         LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
 
-    df_clean, _, outlier_ratios = preprocess_data(df, cfg)
+    outlier_ratios: Dict[str, float] = {}
+    df_clean: pd.DataFrame
+    if panel_path.exists():
+        df_clean = _read_panel_cache(panel_path)
+        if panel_meta_path.exists():
+            try:
+                meta_payload = json.loads(panel_meta_path.read_text())
+                outlier_ratios = {
+                    str(key): float(value)
+                    for key, value in meta_payload.get("outlier_ratios", {}).items()
+                }
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                LOGGER.warning("Failed to read panel cache metadata at %s", panel_meta_path)
+        LOGGER.info("Loaded cached panel %s with shape %s", panel_path, df_clean.shape)
+    else:
+        df_clean, _, outlier_ratios = preprocess_data(df, cfg)
+        _write_panel_cache(panel_path, df_clean, panel_meta_path, {"outlier_ratios": outlier_ratios})
     try:
         selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
     except PairSelectionError as exc:
@@ -1449,6 +1524,23 @@ def build_features(
         return FeatureBuildResult(features=None, skip_result=result)
     zect = zect_valid
 
+    pair_label = f"{selected_l}~{selected_r}"
+    pair_id = _safe_cache_slug(f"{selected_l}__{selected_r}")
+    feature_key = _feature_cache_key(cfg, panel_hash, pair_label)
+    feature_cache_path = _feature_cache_path(pair_id, feature_key)
+    cached_feature_panel: Optional[pd.DataFrame] = None
+    if feature_cache_path.exists():
+        try:
+            cached_feature_panel = pd.read_parquet(feature_cache_path)
+            if "date" in cached_feature_panel.columns:
+                cached_feature_panel = cached_feature_panel.set_index("date")
+            cached_feature_panel.index = pd.to_datetime(cached_feature_panel.index)
+            cached_feature_panel = cached_feature_panel.sort_index()
+            LOGGER.info("Loaded cached pair features from %s", feature_cache_path)
+        except Exception as exc:
+            LOGGER.warning("Failed to read feature cache at %s: %s", feature_cache_path, exc)
+            cached_feature_panel = None
+
     delta_score: Optional[pd.Series] = None
     if short_panel is not None:
         try:
@@ -1461,6 +1553,8 @@ def build_features(
                 selected_l,
                 selected_r,
             )
+    if delta_score is None and cached_feature_panel is not None and "short_term_delta" in cached_feature_panel.columns:
+        delta_score = cached_feature_panel["short_term_delta"].reindex(zect.index)
 
     # --- Long-horizon factor: 12M momentum spread (delta_mom12) ---
     delta_mom12: Optional[pd.Series] = None
@@ -1483,36 +1577,64 @@ def build_features(
     # Regime switching model on the spread to infer mean-reverting regime probability
     ms_status = "ok"
     ms_error = ""
-    ms_model = fit_ms_spread(zect)
-    if not ms_model.get("success", False):
-        ms_error = str(ms_model.get("error") or "unknown")
-        if ms_model.get("skipped", False):
-            ms_status = "skipped"
-            LOGGER.warning(
-                "MS spread model skipped (%s); continuing with flat regime probability",
-                ms_error,
-            )
-            p_mr_series = pd.Series(0.7, index=zect.index)
-        else:
-            LOGGER.error("MS spread model failed: %s", ms_error)
-            raise RuntimeError(f"MS spread model failed: {ms_error}")
+    if cached_feature_panel is not None and "p_regime" in cached_feature_panel.columns:
+        p_mr_series = cached_feature_panel["p_regime"].reindex(zect.index)
     else:
-        p_mr_series = compute_regime_prob(ms_model, zect)
+        ms_model = fit_ms_spread(zect)
+        if not ms_model.get("success", False):
+            ms_error = str(ms_model.get("error") or "unknown")
+            if ms_model.get("skipped", False):
+                ms_status = "skipped"
+                LOGGER.warning(
+                    "MS spread model skipped (%s); continuing with flat regime probability",
+                    ms_error,
+                )
+                p_mr_series = pd.Series(0.7, index=zect.index)
+            else:
+                LOGGER.error("MS spread model failed: %s", ms_error)
+                raise RuntimeError(f"MS spread model failed: {ms_error}")
+        else:
+            p_mr_series = compute_regime_prob(ms_model, zect)
 
     # Estimasi parameter konvergensi spread pada full sample
     alpha_ec, half_life_full = _convergence_stats(zect)
 
-    corr_vals = _run_cor(lp.iloc[:, 0].diff(), lp.iloc[:, 1].diff(), max(cfg.gate_corr_win, 10))
-    if cfg.gate_require_corr:
-        corr_gate = (corr_vals >= cfg.gate_corr_min).reindex(zect.index).fillna(False)
+    if cached_feature_panel is not None and "corr_gate" in cached_feature_panel.columns:
+        corr_gate = cached_feature_panel["corr_gate"].reindex(zect.index).fillna(False)
     else:
-        corr_gate = pd.Series(True, index=zect.index)
-    hl_series = zect.rolling(252, min_periods=60).apply(_half_life, raw=False)
+        corr_vals = _run_cor(lp.iloc[:, 0].diff(), lp.iloc[:, 1].diff(), max(cfg.gate_corr_win, 10))
+        if cfg.gate_require_corr:
+            corr_gate = (corr_vals >= cfg.gate_corr_min).reindex(zect.index).fillna(False)
+        else:
+            corr_gate = pd.Series(True, index=zect.index)
+    if cached_feature_panel is not None and "half_life" in cached_feature_panel.columns:
+        hl_series = cached_feature_panel["half_life"].reindex(zect.index)
+    else:
+        hl_series = zect.rolling(252, min_periods=60).apply(_half_life, raw=False)
     hl_gate = (hl_series <= cfg.half_life_max).reindex(zect.index).fillna(False)
     if cfg.gate_enforce:
         combined_gate = (corr_gate & hl_gate).reindex(zect.index).fillna(False)
     else:
         combined_gate = pd.Series(True, index=zect.index)
+
+    expected_feature_cols = ["spread", "zscore", "p_regime", "corr_gate", "half_life", "short_term_delta"]
+    write_feature_cache = cached_feature_panel is None or any(
+        col not in cached_feature_panel.columns for col in expected_feature_cols
+    )
+    if write_feature_cache:
+        feature_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        feature_payload = pd.DataFrame(
+            {
+                "spread": ect.reindex(zect.index),
+                "zscore": zect,
+                "p_regime": p_mr_series,
+                "corr_gate": corr_gate,
+                "half_life": hl_series,
+                "short_term_delta": delta_score,
+            }
+        )
+        feature_payload.to_parquet(feature_cache_path)
+        LOGGER.info("Wrote pair feature cache to %s", feature_cache_path)
 
     oos_start_date = _resolve_oos_start_date(cfg, zect.index, allow_empty=False)
     horizon = _build_horizon(lp.index)
