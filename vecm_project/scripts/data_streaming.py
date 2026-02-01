@@ -24,12 +24,15 @@ except Exception:  # pragma: no cover - curl_cffi not available
     curl_requests = None
 
 from . import storage
+from .cache_keys import hash_dataframe
 
 LOGGER = storage.configure_logging("data_streaming")
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
 CACHE_META_PATH = DATA_DIR / "adj_close_data.meta.json"
+CACHE_ROOT = BASE_DIR / "cache"
+TICKER_CACHE_DIR = CACHE_ROOT / "tickers"
 TICKER_CONFIG_PATH = BASE_DIR / "config" / "ticker_groups.json"
 TICKER_CONFIG_ENV = "VECM_TICKER_CONFIG"
 OFFLINE_FALLBACK_PATH = pathlib.Path(
@@ -212,6 +215,71 @@ ALL_TICKERS = sorted(set(chain.from_iterable(TICKER_CONFIG.values())))
 
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TICKER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_cache_slug(value: str) -> str:
+    return "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in value)
+
+
+def _ticker_cache_dir(ticker: str) -> pathlib.Path:
+    return TICKER_CACHE_DIR / _safe_cache_slug(ticker)
+
+
+def _ticker_cache_path(ticker: str, data_hash: str, suffix: str) -> pathlib.Path:
+    return _ticker_cache_dir(ticker) / f"{data_hash}{suffix}"
+
+
+def _find_existing_ticker_cache(ticker: str, data_hash: Optional[str] = None) -> Optional[pathlib.Path]:
+    cache_dir = _ticker_cache_dir(ticker)
+    if data_hash:
+        for suffix in (".parquet", ".feather"):
+            candidate = _ticker_cache_path(ticker, data_hash, suffix)
+            if candidate.exists():
+                return candidate
+        return None
+    if not cache_dir.exists():
+        return None
+    candidates = sorted(cache_dir.glob("*.parquet"))
+    if not candidates:
+        candidates = sorted(cache_dir.glob("*.feather"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _read_ticker_cache(path: pathlib.Path, ticker: str) -> pd.DataFrame:
+    if path.suffix == ".parquet":
+        frame = pd.read_parquet(path)
+    else:
+        frame = pd.read_feather(path)
+    if "Date" not in frame.columns:
+        raise ValueError(f"Ticker cache at {path} missing Date column")
+    if "AdjClose" not in frame.columns:
+        raise ValueError(f"Ticker cache at {path} missing AdjClose column")
+    frame = frame[["Date", "AdjClose"]].copy()
+    frame["Date"] = pd.to_datetime(frame["Date"])
+    frame["Ticker"] = ticker
+    frame["AdjClose"] = pd.to_numeric(frame["AdjClose"], errors="coerce")
+    return frame.dropna(subset=["AdjClose"])
+
+
+def _write_ticker_cache(ticker: str, frame: pd.DataFrame) -> str:
+    cache_dir = _ticker_cache_dir(ticker)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tidy = frame[["Date", "AdjClose"]].copy()
+    tidy["Date"] = pd.to_datetime(tidy["Date"])
+    tidy["AdjClose"] = pd.to_numeric(tidy["AdjClose"], errors="coerce")
+    tidy = tidy.dropna(subset=["AdjClose"]).sort_values("Date")
+    data_hash = hash_dataframe(tidy)
+    path = _ticker_cache_path(ticker, data_hash, ".parquet")
+    try:
+        tidy.to_parquet(path, index=False)
+        return data_hash
+    except Exception:  # pragma: no cover - fallback to feather
+        path = _ticker_cache_path(ticker, data_hash, ".feather")
+        tidy.to_feather(path)
+    return data_hash
 
 
 def _get_requests_session() -> Any:
@@ -298,6 +366,40 @@ def _read_existing_prices() -> Optional[pd.DataFrame]:
     tidy["Date"] = pd.to_datetime(tidy["Date"])
     tidy = tidy.dropna(subset=["AdjClose"])
     return tidy[["Date", "Ticker", "AdjClose"]]
+
+
+def _read_ticker_caches(
+    tickers: Sequence[str], meta: Dict[str, Any]
+) -> tuple[pd.DataFrame, Dict[str, str], bool]:
+    frames: List[pd.DataFrame] = []
+    hashes: Dict[str, str] = {}
+    bucket = meta.get("tickers", {}) if isinstance(meta, dict) else {}
+    changed = False
+    for ticker in tickers:
+        record = bucket.get(ticker) if isinstance(bucket, dict) else None
+        cache_hash = record.get("data_hash") if isinstance(record, dict) else None
+        cache_path = _find_existing_ticker_cache(ticker, cache_hash)
+        if cache_path is None:
+            continue
+        try:
+            frame = _read_ticker_cache(cache_path, ticker)
+        except Exception as exc:  # pragma: no cover - best effort cache
+            LOGGER.warning("Failed to read ticker cache for %s: %s", ticker, exc)
+            continue
+        if frame.empty:
+            continue
+        frames.append(frame)
+        if cache_hash is None:
+            cache_hash = hash_dataframe(frame[["Date", "AdjClose"]])
+            record = record or {}
+            record["data_hash"] = cache_hash
+            bucket[ticker] = record
+            changed = True
+        hashes[ticker] = cache_hash
+    if frames:
+        meta["tickers"] = bucket
+        return _merge_frames(frames), hashes, changed
+    return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"]), hashes, changed
 
 
 @lru_cache(maxsize=1)
@@ -402,17 +504,30 @@ def _write_cache_meta(meta: Dict[str, Any]) -> None:
 
 
 def _update_meta_record(
-    meta: Dict[str, Any], ticker: str, *, refreshed: bool, timestamp: Optional[dt.datetime] = None
+    meta: Dict[str, Any],
+    ticker: str,
+    *,
+    data_hash: Optional[str] = None,
+    rows: Optional[int] = None,
+    last_date: Optional[dt.date] = None,
+    refreshed: bool,
+    timestamp: Optional[dt.datetime] = None,
 ) -> None:
     bucket = _ensure_meta_bucket(meta)
     record = bucket.get(ticker, {})
     stamp = timestamp or dt.datetime.utcnow()
     record["last_attempt"] = stamp.isoformat()
     if refreshed:
-        record["last_refresh"] = stamp.date().isoformat()
+        record["last_refresh"] = stamp.isoformat()
         record.pop("failures", None)
     else:
         record["failures"] = int(record.get("failures", 0)) + 1
+    if data_hash is not None:
+        record["data_hash"] = data_hash
+    if rows is not None:
+        record["rows"] = int(rows)
+    if last_date is not None:
+        record["last_date"] = last_date.isoformat()
     bucket[ticker] = record
 
 
@@ -422,23 +537,19 @@ def _should_skip_download(
     today: dt.date,
     meta: Dict[str, Any],
     force_refresh: bool,
+    cache_hash: Optional[str],
 ) -> bool:
     if force_refresh:
         return False
     if start >= pd.Timestamp(today):
         return True
+    if not cache_hash:
+        return False
     bucket = meta.get("tickers", {})
     record = bucket.get(ticker) if isinstance(bucket, dict) else None
     if not record:
         return False
-    last_refresh = record.get("last_refresh")
-    if not last_refresh:
-        return False
-    try:
-        last_refresh_date = dt.date.fromisoformat(last_refresh)
-    except ValueError:
-        return False
-    return last_refresh_date >= today
+    return record.get("data_hash") == cache_hash
 
 
 def _resume_dates(
@@ -533,24 +644,33 @@ def ensure_price_data(
         force_refresh = True
     offline_requested = download_mode in _DOWNLOAD_DISABLE and not force_refresh
 
-    existing = None if force_refresh else _read_existing_prices()
     meta = _read_cache_meta() if not force_refresh else {"tickers": {}}
     today = dt.date.today()
+    existing_hashes: Dict[str, str] = {}
+    existing = None
+    meta_changed = False
+    if not force_refresh:
+        ticker_cache, existing_hashes, cache_meta_changed = _read_ticker_caches(ticker_list, meta)
+        if cache_meta_changed:
+            meta_changed = True
+        csv_cache = _read_existing_prices()
+        if not ticker_cache.empty and csv_cache is not None:
+            existing = _merge_frames([csv_cache, ticker_cache])
+        elif not ticker_cache.empty:
+            existing = ticker_cache
+        else:
+            existing = csv_cache
     if existing is not None and not force_refresh:
         resume_dates = _resume_dates(ticker_list, existing, default_start)
         missing_tickers = sorted(set(ticker_list) - set(existing["Ticker"].unique()))
-        last_available = existing["Date"].max().date() if not existing.empty else DEFAULT_START_DATE
-        within_one_day = last_available >= today - dt.timedelta(days=1)
-        needs_refresh = any(start.date() <= today for start in resume_dates.values())
-        updated_today = False
-        try:
-            updated_today = dt.date.fromtimestamp(DATA_PATH.stat().st_mtime) == today
-        except OSError:
-            updated_today = False
-        if (updated_today or (within_one_day and not needs_refresh)) and not missing_tickers:
-            LOGGER.info("Price cache already up to date at %s; skipping download", DATA_PATH)
-            wide = _tidy_to_wide(existing)
+        wide = _tidy_to_wide(existing)
+        current_hash = hash_dataframe(wide)
+        cached_hash = meta.get("data_hash")
+        if cached_hash == current_hash and not missing_tickers:
+            LOGGER.info("Price cache unchanged (hash=%s); skipping download", current_hash[:12])
             _write_wide(wide)
+            if meta_changed:
+                _write_cache_meta(meta)
             return wide
     else:
         resume_dates = _resume_dates(ticker_list, existing, default_start)
@@ -576,18 +696,18 @@ def ensure_price_data(
     else:
         for ticker in ticker_list:
             start = resume_dates[ticker]
-            if _should_skip_download(ticker, start, today, meta, force_refresh):
+            cache_hash = existing_hashes.get(ticker)
+            if _should_skip_download(ticker, start, today, meta, force_refresh, cache_hash):
                 throttled.append(ticker)
                 continue
             download_plan.append((ticker, start))
 
     if throttled:
-        LOGGER.info("Skipping %d tickers already refreshed today", len(throttled))
+        LOGGER.info("Skipping %d tickers with unchanged cache hashes", len(throttled))
 
     new_frames: List[pd.DataFrame] = []
     refreshed_tickers: List[str] = []
     failed_tickers: List[str] = []
-    meta_changed = False
     if download_plan:
         max_workers = max(1, min(MAX_WORKERS, len(download_plan)))
         LOGGER.info(
@@ -622,16 +742,48 @@ def ensure_price_data(
     else:
         LOGGER.info("No tickers required download; cache is up to date")
 
-    if meta_changed:
-        _write_cache_meta(meta)
-
     combined = _merge_frames([existing, _merge_frames(new_frames)])
     if combined.empty:
         raise FileNotFoundError(
             "Streaming download did not yield any adjusted close data. Check ticker list or network connectivity."
         )
 
+    meta_bucket = _ensure_meta_bucket(meta)
+    for ticker in ticker_list:
+        ticker_frame = combined.loc[combined["Ticker"] == ticker, ["Date", "AdjClose"]].copy()
+        if ticker_frame.empty:
+            continue
+        ticker_frame = ticker_frame.sort_values("Date")
+        data_hash = hash_dataframe(ticker_frame)
+        record = meta_bucket.get(ticker, {}) if isinstance(meta_bucket, dict) else {}
+        cached_hash = record.get("data_hash")
+        cache_path = _find_existing_ticker_cache(ticker, cached_hash)
+        if cached_hash == data_hash and cache_path is not None and cache_path.exists():
+            _update_meta_record(
+                meta,
+                ticker,
+                data_hash=data_hash,
+                rows=len(ticker_frame),
+                last_date=ticker_frame["Date"].max().date(),
+                refreshed=True,
+            )
+            continue
+        data_hash = _write_ticker_cache(ticker, ticker_frame.assign(Ticker=ticker))
+        _update_meta_record(
+            meta,
+            ticker,
+            data_hash=data_hash,
+            rows=len(ticker_frame),
+            last_date=ticker_frame["Date"].max().date(),
+            refreshed=True,
+        )
+        meta_changed = True
+
     wide = _tidy_to_wide(combined)
+    new_hash = hash_dataframe(wide)
+    if meta.get("data_hash") != new_hash:
+        meta_changed = True
+    meta["data_hash"] = new_hash
     _write_wide(wide)
     if refreshed_tickers:
         LOGGER.info("Refreshed %d tickers: %s", len(refreshed_tickers), ", ".join(sorted(refreshed_tickers)[:10]))
@@ -645,6 +797,8 @@ def ensure_price_data(
         )
         if len(failed_tickers) > 10:
             LOGGER.warning("...and %d more", len(failed_tickers) - 10)
+    if meta_changed:
+        _write_cache_meta(meta)
     return wide
 
 
