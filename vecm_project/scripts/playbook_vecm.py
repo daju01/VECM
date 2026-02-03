@@ -1580,9 +1580,10 @@ def build_features(
     if cached_feature_panel is not None and "p_regime" in cached_feature_panel.columns:
         p_mr_series = cached_feature_panel["p_regime"].reindex(zect.index)
     else:
-        ms_model = fit_ms_spread(zect)
+        ms_model = fit_ms_spread(zect, pair_id=pair_label, data_hash=panel_hash)
         if not ms_model.get("success", False):
             ms_error = str(ms_model.get("error") or "unknown")
+            fallback = ms_model.get("fallback") or ""
             if ms_model.get("skipped", False):
                 ms_status = "skipped"
                 LOGGER.warning(
@@ -1590,6 +1591,14 @@ def build_features(
                     ms_error,
                 )
                 p_mr_series = pd.Series(0.7, index=zect.index)
+            elif fallback:
+                ms_status = "fallback"
+                LOGGER.warning(
+                    "MS spread model fallback=%s (%s); using proxy regime probability",
+                    fallback,
+                    ms_error,
+                )
+                p_mr_series = compute_regime_prob(ms_model, zect)
             else:
                 LOGGER.error("MS spread model failed: %s", ms_error)
                 raise RuntimeError(f"MS spread model failed: {ms_error}")
