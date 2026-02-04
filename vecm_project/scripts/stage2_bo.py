@@ -121,6 +121,12 @@ def run_bo(
 ) -> optuna.Study:
     """Launch Bayesian optimisation with Optuna using the shared parameter grid."""
 
+    quick_mode = os.getenv("VECM_BO_QUICK_MODE", "").lower() in {"1", "true", "yes", "on"}
+    if quick_mode:
+        n_init = 2
+        iters = 4
+        LOGGER.info("Quick BO mode active: VECM_BO_QUICK_MODE=1 (n_init=%d iters=%d)", n_init, iters)
+
     if n_init < 1:
         raise ValueError("n_init must be >= 1")
     if iters < 1:
