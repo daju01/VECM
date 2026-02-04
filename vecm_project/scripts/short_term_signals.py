@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import datetime as dt
+import json
 import logging
-from typing import Optional
+import pathlib
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
+BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
+L2_L3_CACHE_DIR = BASE_DIR / "cache" / "l2_l3"
+SHORT_TERM_CACHE_DIR = L2_L3_CACHE_DIR / "short_term_overlays"
 
 
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -50,6 +56,62 @@ def _robust_zscore_cross_section(df: pd.DataFrame, cap: float = 3.0) -> pd.DataF
         return pd.Series(out, index=row.index)
 
     return df.apply(_z, axis=1)
+
+
+def _short_term_cache_paths(cache_dir: pathlib.Path, data_hash: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    base = cache_dir / f"short_term_{data_hash}"
+    return base.with_suffix(".parquet"), base.with_suffix(".mom12.parquet"), base.with_suffix(".json")
+
+
+def _load_short_term_cache(
+    cache_dir: pathlib.Path,
+    data_hash: str,
+) -> Optional[pd.DataFrame]:
+    cache_path, mom12_path, meta_path = _short_term_cache_paths(cache_dir, data_hash)
+    if not cache_path.exists():
+        return None
+    try:
+        cached = pd.read_parquet(cache_path)
+        if "date" in cached.columns:
+            cached = cached.set_index("date")
+        cached.index = pd.to_datetime(cached.index)
+        cached = cached.sort_index()
+        if cached.empty:
+            raise ValueError("cached short-term panel is empty")
+        if mom12_path.exists():
+            mom12 = pd.read_parquet(mom12_path)
+            if "date" in mom12.columns:
+                mom12 = mom12.set_index("date")
+            mom12.index = pd.to_datetime(mom12.index)
+            cached.attrs["z_mom12"] = mom12.sort_index()
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            if meta.get("data_hash") != data_hash:
+                raise ValueError("cached short-term metadata hash mismatch")
+        return cached
+    except Exception as exc:
+        LOGGER.warning("Failed to load short-term overlay cache at %s: %s", cache_path, exc)
+        return None
+
+
+def _save_short_term_cache(
+    cache_dir: pathlib.Path,
+    data_hash: str,
+    panel: pd.DataFrame,
+) -> None:
+    cache_path, mom12_path, meta_path = _short_term_cache_paths(cache_dir, data_hash)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    panel.to_parquet(cache_path)
+    z_mom12 = panel.attrs.get("z_mom12")
+    if isinstance(z_mom12, pd.DataFrame):
+        z_mom12.to_parquet(mom12_path)
+    meta = {
+        "data_hash": data_hash,
+        "rows": int(panel.shape[0]),
+        "cols": int(panel.shape[1]),
+        "created_at": dt.datetime.utcnow().isoformat(),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
 
 
 def build_short_term_signals(
@@ -169,3 +231,35 @@ def build_short_term_signals(
     out.attrs["z_mom12"] = z_mom12.astype(float)
 
     return out
+
+
+def build_short_term_overlay(
+    price_panel: pd.DataFrame,
+    market_col: str,
+    *,
+    data_hash: str,
+    cache_dir: Optional[pathlib.Path] = None,
+    lookback_mom_1m: int = 21,
+    lookback_rev_5d: int = 5,
+    lookback_vol_1m: int = 21,
+    lookback_mom_12m: int = 252,
+    skip_1m: int = 21,
+) -> pd.DataFrame:
+    """Build or reuse cached short-term overlay keyed by data hash."""
+    cache_root = cache_dir or SHORT_TERM_CACHE_DIR
+    cached = _load_short_term_cache(cache_root, data_hash)
+    if cached is not None:
+        LOGGER.info("Loaded cached short-term overlay (hash=%s)", data_hash[:12])
+        return cached
+    built = build_short_term_signals(
+        price_panel,
+        market_col,
+        lookback_mom_1m=lookback_mom_1m,
+        lookback_rev_5d=lookback_rev_5d,
+        lookback_vol_1m=lookback_vol_1m,
+        lookback_mom_12m=lookback_mom_12m,
+        skip_1m=skip_1m,
+    )
+    _save_short_term_cache(cache_root, data_hash, built)
+    LOGGER.info("Saved short-term overlay cache (hash=%s)", data_hash[:12])
+    return built
