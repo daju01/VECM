@@ -354,7 +354,13 @@ def _build_grid_config(path: Optional[Path], overrides: Dict[str, Any]) -> GridC
             setattr(config, field_name, value)
     if "max_grid" in merged and merged["max_grid"] is not None:
         config.max_grid = int(merged["max_grid"])
-    config.max_grid = _env_int("VECM_MAX_GRID", config.max_grid)
+    env_max_grid = os.getenv("VECM_MAX_GRID")
+    if env_max_grid:
+        try:
+            config.max_grid = int(env_max_grid)
+            LOGGER.info("Quick override active: VECM_MAX_GRID=%d", config.max_grid)
+        except ValueError:
+            LOGGER.warning("Ignoring VECM_MAX_GRID=%r (not an int)", env_max_grid)
     return config
 
 
@@ -736,6 +742,7 @@ def _build_config(
     *,
     fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
 ) -> RunnerConfig:
+    grid_config = grid_config or GridConfig()
     input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
     out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -755,6 +762,9 @@ def _build_config(
     run_label = f"{stage}-{dt.datetime.utcnow():%Y%m%d_%H%M%S}"
     time_budget = _env_float("VECM_TIME_BUDGET_SEC", 0.0)
     max_jobs = _env_int("VECM_MAX_JOBS", 0)
+    if stage.lower() == "stage2" and max_jobs == 0 and grid_config.max_grid:
+        max_jobs = grid_config.max_grid
+        LOGGER.info("Stage2 cap applied: max_jobs=%d (from VECM_MAX_GRID)", max_jobs)
     date_align = os.getenv("VECM_DATE_ALIGN", "true").lower() != "false"
     min_obs = _env_int("VECM_MIN_OBS", 60)
     use_mom_stage1 = os.getenv("VECM_MOM_STAGE1", "false").lower() == "true"
@@ -778,7 +788,7 @@ def _build_config(
         min_obs=min_obs,
         use_momentum=use_momentum,
         subsets=subsets,
-        grid_config=grid_config or GridConfig(),
+        grid_config=grid_config,
     )
 
 
@@ -1167,16 +1177,15 @@ def _cli_grid_overrides(args: argparse.Namespace) -> Dict[str, Any]:
 def run_parallel(
     subsets: Optional[Iterable[str]] = None,
     grid_config: Optional[GridConfig] = None,
-) -> None:
-    global GLOBAL_CONFIG
-    config = _build_config(subsets_override=subsets, grid_config=grid_config)
-def run_parallel(
-    subsets: Optional[Iterable[str]] = None,
     *,
     fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
 ) -> None:
     global GLOBAL_CONFIG
-    config = _build_config(subsets_override=subsets, fallback_defaults=fallback_defaults)
+    config = _build_config(
+        subsets_override=subsets,
+        grid_config=grid_config,
+        fallback_defaults=fallback_defaults,
+    )
     GLOBAL_CONFIG = config
     LOGGER.info("Parallel plan: stage=%s workers=%s oos_start=%s", config.stage, config.max_workers, config.oos_start)
     jobs = _build_jobs(config)
@@ -1267,6 +1276,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mom-cool-set",
         help="Comma-separated momentum cooldown values (e.g., 4,5)",
+    )
+    parser.add_argument(
         "--fallback-defaults",
         dest="fallback_defaults",
         action="store_true",
@@ -1284,8 +1295,11 @@ if __name__ == "__main__":
         override = _cli_subset_override(cli_args)
         grid_overrides = _cli_grid_overrides(cli_args)
         grid_config = _build_grid_config(cli_args.grid_config, grid_overrides)
-        run_parallel(override, grid_config)
-        run_parallel(override, fallback_defaults=cli_args.fallback_defaults)
+        run_parallel(
+            override,
+            grid_config=grid_config,
+            fallback_defaults=cli_args.fallback_defaults,
+        )
     except FileNotFoundError as exc:
         LOGGER.error("Parallel run failed: %s", exc)
         sys.exit(1)

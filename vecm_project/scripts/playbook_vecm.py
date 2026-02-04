@@ -595,6 +595,27 @@ def load_and_validate_data(path: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
     df = df.drop_duplicates(subset="date", keep="last")
+    quick_flag = os.getenv("VECM_QUICK_TEST", "").lower() in {"1", "true", "yes", "on"}
+    quick_days = os.getenv("VECM_QUICK_TEST_DAYS")
+    if quick_flag and quick_days:
+        try:
+            day_count = int(quick_days)
+        except ValueError:
+            LOGGER.warning("Quick-test override ignored: VECM_QUICK_TEST_DAYS=%r (not an int)", quick_days)
+        else:
+            if day_count > 0:
+                max_date = df["date"].max()
+                cutoff = max_date - pd.Timedelta(days=day_count)
+                before_rows = len(df)
+                df = df.loc[df["date"] >= cutoff]
+                LOGGER.info(
+                    "Quick-test truncation enabled: VECM_QUICK_TEST_DAYS=%s rows=%d->%d",
+                    day_count,
+                    before_rows,
+                    len(df),
+                )
+    elif quick_flag and not quick_days:
+        LOGGER.info("Quick-test mode enabled but VECM_QUICK_TEST_DAYS is unset; skipping truncation.")
     price_cols = [c for c in df.columns if c != "date"]
     for col in price_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
