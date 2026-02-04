@@ -50,7 +50,7 @@ from . import storage
 from .cache_keys import hash_config, hash_dataframe
 from .data_streaming import ensure_price_data, load_cached_prices
 from .ms_spread import compute_regime_prob, fit_ms_spread
-from .short_term_signals import build_short_term_signals
+from .short_term_signals import build_short_term_overlay
 
 # ---------------------------------------------------------------------------
 # Logging / paths -----------------------------------------------------------
@@ -1410,8 +1410,8 @@ def build_features(
 
     short_panel: Optional[pd.DataFrame] = None
     try:
-        short_panel = build_short_term_signals(df, market_col="^JKSE")
-        LOGGER.info("Short-term signals panel built with shape %s", short_panel.shape)
+        short_panel = build_short_term_overlay(df, market_col="^JKSE", data_hash=panel_hash)
+        LOGGER.info("Short-term signals panel ready with shape %s", short_panel.shape)
     except Exception as exc:
         LOGGER.warning("Short-term signals construction failed; disabling overlay: %s", exc)
 
