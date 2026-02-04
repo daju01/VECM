@@ -1,8 +1,8 @@
 # VECM
 
-for stock market price analysis
+A Python toolkit for stock market price analysis using Vector Error Correction Models (VECM) and pairs trading strategies.
 
-## Getting started
+## Getting Started
 
 1. **Siapkan virtual environment dan dependensi.**
    ```bash
@@ -12,7 +12,7 @@ for stock market price analysis
    ```
    Langkah ini memastikan modul inti seperti `duckdb`, `pandas`, dan `statsmodels`
    tersedia sebelum pipeline dijalankan. File `requirements.txt` di root hanya
-   meng-include `vecm_project/requirements.txt`, jadi satu-satunya sumber
+   meng-include [`vecm_project/requirements.txt`](vecm_project/requirements.txt), jadi satu-satunya sumber
    kebenaran tetap berada di subfolder tersebut.
 
 2. **Unduh dan validasi data harga pertama kali.**
@@ -21,13 +21,13 @@ for stock market price analysis
    python vecm_project/run_demo.py
    ```
    Skrip akan memanggil `ensure_price_data()` dari
-   `vecm_project/scripts/data_streaming.py` sehingga file cache
+   [`vecm_project/scripts/data_streaming.py`](vecm_project/scripts/data_streaming.py) sehingga file cache
    `adj_close_data.csv` dibuat/di-update otomatis dengan minimal dua ticker dan
    kolom tanggal tervalidasi. Jika cache rusak, fungsi tersebut mengunduh ulang
    harga penutupan disesuaikan dari Yahoo Finance sebelum analisis dimulai.
 
 3. **Konfirmasi storage DuckDB.**
-   `run_demo.py` menggunakan konteks `managed_storage()` untuk memanggil
+   [`run_demo.py`](vecm_project/run_demo.py) menggunakan konteks `managed_storage()` untuk memanggil
    `storage_init`, membuat seluruh tabel dan indeks yang dibutuhkan agar metrik,
    artefak model, dan log optimisasi tersimpan konsisten untuk audit berikutnya.
 
@@ -37,7 +37,7 @@ for stock market price analysis
    DuckDB. Keluaran terstruktur inilah yang diperlukan untuk verifikasi ulang
    Sharpe/Drawdown serta audit performa.
 
-## Operational checklist
+## Operational Checklist
 
 Sebelum menjalankan eksperimen lanjutan, pastikan empat pilar berikut sudah
 dipenuhi—ini menjawab pertanyaan _“apakah Anda sudah melakukan ini?”_ yang
@@ -54,7 +54,7 @@ sering muncul saat men-deploy playbook:
 4. **Artefak lengkap.** Pastikan `persist=True` sehingga artefak dan metrik
    terekam untuk audit maupun analisis lanjutan.
 
-### When `pip install` is blocked
+### When `pip install` Is Blocked
 
 Some sandboxed or corporate environments intercept outbound HTTPS traffic and
 return `403 Forbidden` for the Python Package Index. If you see repeated
@@ -98,7 +98,7 @@ yang ingin dianalisis tanpa perlu mengubah kode ataupun daftar default pada
 
 ### Mengelola daftar ticker default
 
-Daftar ticker bawaan kini disimpan di `vecm_project/config/ticker_groups.json`.
+Daftar ticker bawaan kini disimpan di [`vecm_project/config/ticker_groups.json`](vecm_project/config/ticker_groups.json).
 Untuk menambah atau mengganti ticker, cukup edit file JSON tersebut tanpa
 menyentuh kode Python. Setiap kunci berisi daftar ticker untuk satu kelompok
 (misalnya `banking_group`, `coal_group`). Jika ingin memakai lokasi lain,
@@ -118,8 +118,8 @@ menggunakan default. Contoh menambah ticker ke kelompok perbankan:
 ### Contoh satu pasangan (playbook_vecm)
 
 Perintah berikut memuat cache `adj_close_data.csv`, memastikan harga BBRI/BBNI
-tersedia (akan diunduh otomatis jika belum ada), lalu menjalankan playbook
-TVECM pada pasangan tersebut:
+tersedia (akan diunduh otomatis jika belum ada), lalu menjalankan
+[`playbook_vecm`](vecm_project/scripts/playbook_vecm.py) pada pasangan tersebut:
 
 ```bash
 python -m vecm_project.scripts.playbook_vecm \
@@ -145,7 +145,7 @@ python -m vecm_project.scripts.playbook_vecm \
 
 ### Contoh multi-pair (parallel_run)
 
-Jika ingin memproses beberapa pasangan sekaligus, `parallel_run.py` menerima
+Jika ingin memproses beberapa pasangan sekaligus, [`parallel_run.py`](vecm_project/scripts/parallel_run.py) menerima
 daftar subset yang sama. Pasangan yang tidak ada di cache akan otomatis
 diunduh sebelum analisis dijalankan.
 
@@ -158,7 +158,7 @@ python -m vecm_project.scripts.parallel_run \
 Set variabel lingkungan `VECM_PRICE_DOWNLOAD=force` apabila ingin memaksa
 pembaruan data harga terlepas dari keberadaan cache lokal.
 
-## Runtime controls
+## Runtime Controls
 
 Pipeline demo menjalankan rangkaian penuh: skor cepat, playbook utama dengan
 `persist=True`, hook ekspor, optimisasi Bayesian (`run_bo`), successive halving,
@@ -184,7 +184,7 @@ Default ini menjaga optimisasi tetap responsif, tetapi seluruh data dan artefak
 tetap lengkap sehingga dapat dianalisis lebih lanjut ketika Anda memperluas
 pencarian parameter.
 
-## Regime-aware pairs trading & short-term overlay
+## Regime-Aware Pairs Trading & Short-Term Overlay
 
 Sejak versi terbaru, pipeline VECM tidak lagi hanya mengandalkan z-score spread
 klasik. Ada tiga layer tambahan yang aktif secara default:
@@ -214,7 +214,7 @@ klasik. Ada tiga layer tambahan yang aktif secara default:
 
 3. **Short-term signal overlay (Blitz-style)**
 
-   - Modul `short_term_signals.py` membangun sinyal jangka pendek dari
+   - Modul [`short_term_signals.py`](vecm_project/scripts/short_term_signals.py) membangun sinyal jangka pendek dari
      `adj_close_data.csv`, antara lain:
        - 1M momentum,
        - 5D reversal (return 5 hari terakhir),
@@ -301,7 +301,7 @@ langsung mengingat:
 * dan kenapa sebuah run dengan Sharpe tinggi bisa tetap disingkirkan (misalnya
   karena half-life terlalu lambat atau turnover terlalu agresif).
 
-### Factor-aware pairs trading & monitoring
+### Factor-Aware Pairs Trading & Monitoring
 
 Playbook ini tidak hanya mengandalkan sinyal harga jangka pendek, tetapi
 didesain selaras dengan literatur factor-based investing modern.
@@ -342,7 +342,7 @@ Secara garis besar:
   kombinasi multi-sinyal dengan turnover terkendali masih bisa menghasilkan
   alpha yang secara praktis dapat diimplementasikan.
 
-#### Mode konfigurasi
+#### Configuration Modes
 
 Pipeline bisa dijalankan dalam dua mode besar:
 
