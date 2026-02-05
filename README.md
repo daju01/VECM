@@ -89,6 +89,38 @@ python -m compileall vecm_project
 The command only compiles the sources, so it runs quickly and does not require
 network access once the packages are available in your virtual environment.
 
+## Notifikasi daily signal (Telegram/Email)
+
+Skrip [`notify.py`](vecm_project/scripts/notify.py) membaca output JSON/CSV dari
+`daily_signal.py`, menyusun ringkasan singkat (pair, arah trade, confidence,
+expected holding period, z-score, regime), lalu mengirimkan notifikasi via
+Telegram dan/atau email. Skrip ini juga menyimpan state agar pesan hanya terkirim
+saat sinyal berubah.
+
+### Contoh env vars
+
+```bash
+# Telegram
+export TELEGRAM_BOT_TOKEN="123456:ABCDEF"
+export TELEGRAM_CHAT_ID="987654321"
+
+# Email (SMTP)
+export SMTP_HOST="smtp.example.com"
+export SMTP_PORT="587"
+export SMTP_USER="alerts@example.com"
+export SMTP_PASS="yourpassword"
+export SMTP_TO="trader@example.com"
+export SMTP_FROM="alerts@example.com"
+export SMTP_STARTTLS="true"
+```
+
+### Contoh penggunaan
+
+```bash
+python -m vecm_project.scripts.daily_signal
+python -m vecm_project.scripts.notify --only-changed
+```
+
 ## Menjalankan analisis untuk ticker kustom
 
 Pipeline VECM dapat dieksekusi dengan pasangan ticker apa pun yang tersedia di
