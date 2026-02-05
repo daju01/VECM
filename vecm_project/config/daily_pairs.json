@@ -1,5 +1,20 @@
 {
-  "persist_artifacts": true,
-  "default_params": {},
-  "pairs": []
+  "pairs": [
+    {
+      "tickerA": "AAPL",
+      "tickerB": "MSFT",
+      "z_entry": 2.0,
+      "z_stop": 3.0,
+      "max_hold": 5,
+      "cooldown": 2
+    },
+    {
+      "tickerA": "GOOGL",
+      "tickerB": "META",
+      "z_entry": 2.2,
+      "z_stop": 3.2,
+      "max_hold": 7,
+      "cooldown": 3
+    }
+  ]
 }
