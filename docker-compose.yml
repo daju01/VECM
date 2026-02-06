@@ -1,0 +1,18 @@
+services:
+  pipeline:
+    build: .
+    command: ["python", "vecm_project/run_demo.py"]
+    volumes:
+      - ./vecm_project/out:/app/vecm_project/out
+      - ./vecm_project/config:/app/vecm_project/config
+    environment:
+      VECM_PRICE_DOWNLOAD: ${VECM_PRICE_DOWNLOAD:-}
+
+  dashboard:
+    build: .
+    command: ["python", "-m", "vecm_project.scripts.dashboard_aggregator"]
+    depends_on:
+      - pipeline
+    volumes:
+      - ./vecm_project/out:/app/vecm_project/out
+      - ./vecm_project/config:/app/vecm_project/config

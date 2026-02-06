@@ -37,6 +37,34 @@ A Python toolkit for stock market price analysis using Vector Error Correction M
    DuckDB. Keluaran terstruktur inilah yang diperlukan untuk verifikasi ulang
    Sharpe/Drawdown serta audit performa.
 
+## Docker (pipeline + dashboard)
+
+Repositori ini menyertakan `Dockerfile` dan `docker-compose.yml` agar pipeline
+dan agregasi dashboard dapat dijalankan di container.
+
+1. **Build image dan jalankan pipeline.**
+   ```bash
+   docker compose up --build pipeline
+   ```
+   Container akan mengeksekusi `python vecm_project/run_demo.py` seperti langkah
+   lokal.
+
+2. **Jalankan agregasi dashboard (mengambil run terbaru).**
+   ```bash
+   docker compose run --rm dashboard
+   ```
+   Hasil ringkasan dashboard akan ditulis ke `vecm_project/out/dashboard/`.
+
+### Volume penting
+
+`docker-compose.yml` sudah menambahkan bind mount untuk:
+
+* `./vecm_project/out` → `/app/vecm_project/out` (output + DuckDB di `out/db`).
+* `./vecm_project/config` → `/app/vecm_project/config` (konfigurasi ticker).
+
+Dengan volume ini, output/duckdb dan konfigurasi tetap tersimpan di host dan
+tidak hilang saat container dimatikan.
+
 ## Operational Checklist
 
 Sebelum menjalankan eksperimen lanjutan, pastikan empat pilar berikut sudah
