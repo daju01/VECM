@@ -30,7 +30,7 @@ def _coerce_value(value: Any) -> Any:
             return False
         if re.fullmatch(r"[+-]?\d+", text):
             return int(text)
-        if re.fullmatch(r"[+-]?(?:\d*\.\d+|\d+\.\d*)(?:[eE][+-]?\d+)?", text):
+        if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
             return float(text)
         return text
     if isinstance(value, MutableMapping):
