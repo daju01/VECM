@@ -143,6 +143,110 @@ mailx -s "Daily Signal" you@example.com < "$latest_csv"
 ---
 
 Jika Anda ingin memperluas notifikasi (misalnya Slack/Discord), cukup gunakan output JSON/CSV harian sebagai input ke integrasi Anda.
+
+## Desain integrasi notifikasi mobile (push alert)
+
+Bagian ini menjelaskan desain integrasi **push alert mobile** yang mengirim notifikasi langsung dari hasil `daily_signal.py` tanpa mengeksekusi broker. Integrasi dibuat sebagai *wrapper* yang membaca output harian lalu mengirim payload ke provider push via HTTP API.
+
+### Arsitektur singkat (tanpa eksekusi broker)
+1. Jalankan `python -m vecm_project.scripts.daily_signal`.
+2. Ambil file output terbaru (`daily_signal_YYYYMMDD.json`).
+3. Format ringkasan sinyal (pair, direction, confidence, z-score).
+4. Kirim ke provider push (contoh: OneSignal/FCM/Pushover).
+5. Simpan audit log hasil pengiriman.
+
+> Fokus notifikasi ini **hanya alert** (informasi sinyal), bukan instruksi eksekusi trading.
+
+### Rekomendasi provider & alasan
+**OneSignal** direkomendasikan untuk implementasi awal karena:
+- Mendukung multi-platform (iOS/Android/Web).
+- API sederhana untuk mengirim notifikasi ke *segments* atau *user IDs*.
+- Mudah diintegrasikan dengan pipeline backend via HTTP.
+
+Alternatif:
+- **FCM (Firebase Cloud Messaging)** jika aplikasi sudah berbasis Firebase.
+- **Pushover** untuk tim kecil tanpa aplikasi khusus.
+
+### Format payload (OneSignal)
+Contoh payload ringkas yang dikirim via HTTP `POST` ke `https://onesignal.com/api/v1/notifications`:
+```json
+{
+  "app_id": "ONESIGNAL_APP_ID",
+  "include_external_user_ids": ["user_123", "user_456"],
+  "headings": {"en": "Daily Signal Alert"},
+  "contents": {
+    "en": "BBCA.JK/BBRI.JK: LONG (conf=0.82, z=2.1)\nBMRI.JK/BBNI.JK: FLAT"
+  },
+  "data": {
+    "source": "daily_signal",
+    "as_of": "2024-01-31",
+    "version": "v1"
+  }
+}
+```
+
+### Contoh alur pengiriman (pseudo-code)
+```bash
+python -m vecm_project.scripts.daily_signal
+latest_json=$(ls -t vecm_project/outputs/daily/daily_signal_*.json | head -n 1)
+payload=$(python - <<'PY'
+import json, sys, datetime
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    data = json.load(f)
+lines = [
+    f"{item['pair']}: {item['direction']} (conf={item.get('confidence')}, z={item.get('metrics', {}).get('z_score')})"
+    for item in data
+]
+print(json.dumps({
+    "app_id": "ONESIGNAL_APP_ID",
+    "include_external_user_ids": ["user_123"],
+    "headings": {"en": "Daily Signal Alert"},
+    "contents": {"en": "\\n".join(lines)},
+    "data": {"source": "daily_signal", "as_of": datetime.date.today().isoformat()}
+}))
+PY
+"$latest_json")
+
+curl -s -X POST "https://onesignal.com/api/v1/notifications" \
+  -H "Authorization: Basic ${ONESIGNAL_REST_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "$payload"
+```
+
+### Pengelolaan secrets (env vars + vault/secret manager)
+**Wajib** menyimpan kredensial sebagai secrets, bukan di repo.
+
+Minimal env vars:
+- `ONESIGNAL_APP_ID`
+- `ONESIGNAL_REST_API_KEY`
+- `PUSH_USER_IDS` (opsional, daftar user IDs)
+
+Rekomendasi *secret manager*:
+- **Vault** (self-hosted) atau **AWS Secrets Manager/GCP Secret Manager**.
+- `daily_signal` wrapper membaca secrets dari env var yang di-*inject* oleh secret manager.
+
+Contoh alur:
+1. Simpan `ONESIGNAL_REST_API_KEY` di Vault.
+2. Atur job cron agar *inject* env var saat runtime.
+3. Jalankan wrapper dengan env var tersedia (tanpa hardcode di script).
+
+### Guardrail compliance
+Agar alert aman dan patuh compliance, implementasikan guardrail berikut:
+
+1. **Opt-in user**
+   - Notifikasi hanya dikirim ke user yang *explicitly opted-in*.
+   - Simpan daftar user opt-in di database (atau file) yang diaudit.
+
+2. **Rate limiting**
+   - Batasi pengiriman, misal maksimal **1 notifikasi per user per hari**.
+   - Jika sinyal banyak, gunakan *summary* (ringkas) alih-alih spam.
+
+3. **Audit log**
+   - Simpan log pengiriman: timestamp, user_id, ringkasan payload, status API.
+   - Contoh lokasi log: `vecm_project/outputs/daily/notification_audit.log`.
+   - Pastikan log aman (masking token, tidak menulis secrets).
+
+Dengan desain ini, notifikasi mobile menjadi bagian dari pipeline harian namun tetap **informational-only**, terkontrol, dan aman.
 # Trading Guide
 
 ## Konfigurasi Pair Harian
