@@ -27,7 +27,7 @@ jobs:
           black --check .
       - name: Tests + coverage
         run: |
-          pytest --cov=vecm_project --cov-report=term-missing --cov-report=xml --cov-fail-under=60
+          pytest --cov=vecm_project --cov-report=term-missing --cov-report=xml --cov-fail-under=80
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         with:

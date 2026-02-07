@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     vecm_yf_impersonate: str = "chrome124"
     vecm_yf_verify: Optional[str] = None
     vecm_proxy_auth: Optional[str] = None
+    vecm_rate_limit_per_sec: Optional[float] = 4.0
     offline_fallback_path: Optional[Path] = None
 
     # Execution Settings

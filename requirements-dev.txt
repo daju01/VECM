@@ -4,3 +4,4 @@ ruff
 black
 mypy
 pre-commit
+hypothesis

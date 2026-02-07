@@ -158,6 +158,28 @@ python -m compileall vecm_project
 The command only compiles the sources, so it runs quickly and does not require
 network access once the packages are available in your virtual environment.
 
+## Performance Benchmarking & Profiling
+
+Gunakan skrip benchmark di bawah untuk mengukur runtime playbook dan, bila
+perlu, menghasilkan profil `cProfile`:
+
+```bash
+python -m vecm_project.scripts.ops.benchmark_playbook --subset ANTM,INCO --iters 3
+python -m vecm_project.scripts.ops.benchmark_playbook --subset ANTM,INCO --profile reports/playbook.prof
+```
+
+Jika koneksi data eksternal sering memicu rate limit, Anda bisa menurunkan
+kecepatan download dengan environment variable:
+
+```bash
+export VECM_RATE_LIMIT_PER_SEC=2
+```
+
+## API & Monitoring
+
+Dokumentasi endpoint dashboard dan artefak monitoring tersedia di
+[`docs/api.md`](docs/api.md).
+
 ## Notifikasi daily signal (Telegram/Email)
 
 Skrip [`notify.py`](vecm_project/scripts/notify.py) membaca output JSON/CSV dari
