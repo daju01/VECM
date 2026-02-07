@@ -170,10 +170,11 @@ def _apply_guardrails(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     item.setdefault("reason_codes", []).append("MAX_GROSS_EXPOSURE")
     loss_limit = settings.risk_daily_loss_limit
     if loss_limit is not None:
+        loss_limit_value = abs(float(loss_limit))
         for item in results:
             risk = item.get("risk_metrics", {})
             maxdd = risk.get("potential_drawdown")
-            if maxdd is not None and float(maxdd) >= loss_limit:
+            if maxdd is not None and abs(float(maxdd)) >= loss_limit_value:
                 item["action"] = "HOLD"
                 item.setdefault("reason_codes", []).append("DAILY_LOSS_LIMIT")
     return results
