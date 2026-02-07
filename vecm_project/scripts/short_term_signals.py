@@ -186,19 +186,26 @@ def _apply_ml_overlay(
         },
         axis=1,
     )
+    if len(px.index) <= lookahead_days + 1:
+        LOGGER.info("ML overlay skipped; insufficient history for lookahead=%d", lookahead_days)
+        return score_short
+    train_end_date = px.index[-lookahead_days - 1]
+    train_mask = feature_panel.index.get_level_values(0) <= train_end_date
     model = _train_or_load_ml_model(
         cache_dir=cache_dir,
         data_hash=data_hash,
-        features=feature_panel,
-        target=target.astype(float),
+        features=feature_panel.loc[train_mask],
+        target=target.loc[train_mask].astype(float),
     )
     if model is None:
         LOGGER.info("ML overlay unavailable; using base short-term score")
         return score_short
 
-    valid_features = feature_panel.dropna()
+    cutoff_date = px.index[-1]
+    score_mask = feature_panel.index.get_level_values(0) >= cutoff_date
+    valid_features = feature_panel.loc[score_mask].dropna()
     if valid_features.empty:
-        LOGGER.info("ML overlay skipped; no valid feature rows")
+        LOGGER.info("ML overlay skipped; no valid feature rows after cutoff=%s", cutoff_date.date())
         return score_short
 
     proba = model.predict_proba(valid_features.to_numpy(dtype=float))[:, 1]
@@ -206,7 +213,9 @@ def _apply_ml_overlay(
     ml_prob = prob_series.unstack().reindex(px.index)
     ml_prob = ml_prob.reindex(columns=score_short.columns)
     ml_score = _robust_zscore_cross_section(ml_prob)
-    blended = (score_short + ml_score) / 2.0
+    blended = score_short.copy()
+    if cutoff_date in blended.index:
+        blended.loc[cutoff_date] = (score_short.loc[cutoff_date] + ml_score.loc[cutoff_date]) / 2.0
     blended.attrs["ml_prob"] = ml_prob
     blended.attrs["ml_score"] = ml_score
     return blended
