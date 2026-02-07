@@ -23,6 +23,8 @@ try:  # pragma: no cover - optional dependency for robust downloads
 except Exception:  # pragma: no cover - curl_cffi not available
     curl_requests = None
 
+from vecm_project.config.settings import settings
+
 from . import storage
 from .cache_keys import hash_dataframe
 
@@ -35,9 +37,7 @@ CACHE_ROOT = BASE_DIR / "cache"
 TICKER_CACHE_DIR = CACHE_ROOT / "tickers"
 TICKER_CONFIG_PATH = BASE_DIR / "config" / "ticker_groups.json"
 TICKER_CONFIG_ENV = "VECM_TICKER_CONFIG"
-OFFLINE_FALLBACK_PATH = pathlib.Path(
-    os.getenv("OFFLINE_FALLBACK_PATH", str(DATA_DIR / "offline_prices.csv"))
-)
+OFFLINE_FALLBACK_PATH = settings.offline_fallback_path or (DATA_DIR / "offline_prices.csv")
 DEFAULT_START_DATE = dt.date(2013, 1, 1)
 MAX_WORKERS = 4
 MAX_RETRIES = 3
@@ -288,16 +288,16 @@ def _get_requests_session() -> Any:
     if _REQUESTS_SESSION is not None and _REQUESTS_SESSION_PID == current_pid:
         return _REQUESTS_SESSION
 
-    user_agent = os.getenv(YF_USER_AGENT_ENV, "").strip() or YF_DEFAULT_USER_AGENT
-    impersonate = os.getenv(YF_IMPERSONATE_ENV, "chrome124").strip() or "chrome124"
-    verify_path = os.getenv(YF_VERIFY_ENV, "").strip() or os.getenv("CODEX_PROXY_CERT", "").strip()
+    user_agent = settings.vecm_yf_user_agent or YF_DEFAULT_USER_AGENT
+    impersonate = settings.vecm_yf_impersonate or "chrome124"
+    verify_path = (settings.vecm_yf_verify or "").strip() or os.getenv("CODEX_PROXY_CERT", "").strip()
     if not verify_path:
         for env_var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
             verify_candidate = os.getenv(env_var, "").strip()
             if verify_candidate:
                 verify_path = verify_candidate
                 break
-    proxy_auth = os.getenv(YF_PROXY_AUTH_ENV, "").strip()
+    proxy_auth = (settings.vecm_proxy_auth or "").strip()
     proxies = get_environ_proxies("https://query1.finance.yahoo.com")
 
     if curl_requests is not None:
@@ -639,7 +639,7 @@ def ensure_price_data(
     if not ticker_list:
         raise ValueError("No tickers provided for download")
 
-    download_mode = os.getenv(DOWNLOAD_CONTROL_ENV, "auto").strip().lower()
+    download_mode = settings.vecm_price_download.strip().lower()
     if download_mode in _DOWNLOAD_FORCE:
         force_refresh = True
     offline_requested = download_mode in _DOWNLOAD_DISABLE and not force_refresh
