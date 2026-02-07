@@ -1867,6 +1867,8 @@ def pipeline(
 # ---------------------------------------------------------------------------
 def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object]) -> None:
     exec_res: ExecutionResult = result["execution"]
+    artifacts_dir = OUT_DIR / "artifacts" / run_id
+    journal_dir = OUT_DIR / "trade_journal"
     pos_path = OUT_DIR / f"positions_{run_id}.csv"
     ret_path = OUT_DIR / f"returns_{run_id}.csv"
     trades_path = OUT_DIR / f"trades_{run_id}.csv"
@@ -1899,6 +1901,52 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
     status = result.get("status")
     if not status:
         status = "OK_HAS_TRADES" if exec_res.trades.shape[0] else "OK_NO_TRADES"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    run_manifest = {
+        "run_id": run_id,
+        "timestamp": _now_utc().isoformat(),
+        "params": cfg.to_dict(),
+        "metrics": result.get("metrics", {}),
+        "status": status,
+    }
+    with open(artifacts_dir / "manifest.json", "w", encoding="utf-8") as fh:
+        json.dump(run_manifest, fh, indent=2, ensure_ascii=False, default=str)
+    with open(artifacts_dir / "status.json", "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "run_id": run_id,
+                "status": status,
+                "trades": int(exec_res.trades.shape[0]),
+                "duration_sec": result.get("metrics", {}).get("elapsed_s"),
+                "timestamp": _now_utc().isoformat(),
+            },
+            fh,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    trade_summary = {
+        "run_id": run_id,
+        "pair": cfg.subset,
+        "expected_hold_days": result.get("metrics", {}).get("avg_hold_days"),
+        "n_trades": int(exec_res.trades.shape[0]),
+        "total_return": float(exec_res.ret.sum()),
+        "core_return": float(exec_res.ret_core.sum()) if hasattr(exec_res, "ret_core") else None,
+        "cost_total": float(exec_res.cost.sum()),
+        "attribution": {
+            "alpha_core": float(exec_res.ret_core.sum()) if hasattr(exec_res, "ret_core") else None,
+            "transaction_costs": float(exec_res.cost.sum()),
+        },
+    }
+    if not exec_res.trades.empty:
+        if "days" in exec_res.trades.columns:
+            trade_summary["actual_avg_hold_days"] = float(exec_res.trades["days"].mean())
+        if "pnl" in exec_res.trades.columns:
+            trade_summary["avg_trade_pnl"] = float(exec_res.trades["pnl"].mean())
+    with open(journal_dir / f"trade_journal_{run_id}.json", "w", encoding="utf-8") as fh:
+        json.dump(trade_summary, fh, indent=2, ensure_ascii=False, default=str)
+    pd.DataFrame([trade_summary]).to_csv(journal_dir / f"trade_journal_{run_id}.csv", index=False)
     manifest_row = {
         "run_id": run_id,
         "ts_utc": _now_utc().isoformat(),
@@ -1926,8 +1974,22 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
         _append_manifest(manifest_path, manifest_row)
 
     # Persist model checks to DuckDB
+    tickers = [token.strip() for token in cfg.subset.split(",") if token.strip()]
     with storage.managed_storage(cfg.tag) as conn:
         with storage.with_transaction(conn):
+            storage.write_run_metrics(
+                conn,
+                run_id,
+                metric_ts=_now_utc(),
+                universe_id=_panel_universe_id(tickers, cfg),
+                pairs_count=1,
+                trades_count=int(exec_res.trades.shape[0]),
+                sharpe_oos=float(result["metrics"].get("sharpe_oos", 0.0)),
+                turnover_annualised=float(result["metrics"].get("turnover_annualised", 0.0)),
+                score=float(result["metrics"].get("score", 0.0)),
+                maxdd=float(result["metrics"].get("maxdd", 0.0)),
+                fees_total=float(exec_res.cost.sum()),
+            )
             storage.write_model_checks(
                 conn,
                 run_id,

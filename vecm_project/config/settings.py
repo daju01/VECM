@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     smtp_from: Optional[str] = None
     smtp_starttls: bool = True
 
+    # Risk guardrails (Optional)
+    risk_max_open_pairs: Optional[int] = None
+    risk_max_gross_exposure: Optional[float] = None
+    risk_daily_loss_limit: Optional[float] = None
+    risk_kill_switch: bool = False
+
     @field_validator(
         "playbook_z_exit",
         "playbook_z_stop",

@@ -42,6 +42,9 @@ DEFAULT_START_DATE = dt.date(2013, 1, 1)
 MAX_WORKERS = 4
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 0.75
+_CIRCUIT_BREAKER = {"failures": 0, "opened_until": None}
+CB_MAX_FAILURES = 3
+CB_COOLDOWN_MINUTES = 30
 DOWNLOAD_CONTROL_ENV = "VECM_PRICE_DOWNLOAD"
 _DOWNLOAD_DISABLE = {"0", "false", "no", "off", "skip", "never"}
 _DOWNLOAD_FORCE = {"force", "always"}
@@ -139,6 +142,73 @@ DEFAULT_TICKER_CONFIG: Dict[str, List[str]] = {
     "energy_resources": ["MEDC.JK"],
     "renewables_utilities": ["KEEN.JK", "ARKO.JK", "PGEO.JK"],
 }
+
+
+def _circuit_allows() -> bool:
+    opened_until = _CIRCUIT_BREAKER["opened_until"]
+    if opened_until is None:
+        return True
+    if dt.datetime.now(dt.timezone.utc) >= opened_until:
+        _CIRCUIT_BREAKER["opened_until"] = None
+        _CIRCUIT_BREAKER["failures"] = 0
+        return True
+    return False
+
+
+def _circuit_record_failure() -> None:
+    _CIRCUIT_BREAKER["failures"] += 1
+    if _CIRCUIT_BREAKER["failures"] >= CB_MAX_FAILURES:
+        _CIRCUIT_BREAKER["opened_until"] = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            minutes=CB_COOLDOWN_MINUTES
+        )
+
+
+def _circuit_record_success() -> None:
+    _CIRCUIT_BREAKER["failures"] = 0
+    _CIRCUIT_BREAKER["opened_until"] = None
+
+
+def _download_alpha_vantage(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    url = (
+        "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED"
+        f"&symbol={ticker}&outputsize=full&apikey={api_key}"
+    )
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # pragma: no cover - network/runtime errors
+        LOGGER.warning("Alpha Vantage fallback failed for %s: %s", ticker, exc)
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    series = payload.get("Time Series (Daily)") or {}
+    if not series:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    rows = []
+    for date_str, values in series.items():
+        if not values:
+            continue
+        rows.append(
+            {
+                "Date": pd.to_datetime(date_str),
+                "Ticker": ticker,
+                "AdjClose": float(values.get("5. adjusted close", "nan")),
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame[(frame["Date"] >= start) & (frame["Date"] <= pd.Timestamp(end))]
+    return frame
+
+
+def _download_fallback_provider(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
+    alpha_frame = _download_alpha_vantage(ticker, start, end)
+    if not alpha_frame.empty:
+        return alpha_frame
+    return _offline_prices_for(ticker, start, end)
 
 
 def _normalise_ticker_config(config: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -573,6 +643,9 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
     if start >= pd.Timestamp(end):
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     proxy_url = os.getenv("https_proxy") or os.getenv("HTTPS_PROXY")
+    if not _circuit_allows():
+        LOGGER.warning("Circuit breaker open; using fallback provider for %s", ticker)
+        return _download_fallback_provider(ticker, start, end)
     try:
         session = _get_requests_session()
         history = yf.download(
@@ -586,13 +659,16 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         )
     except Exception as exc:  # pragma: no cover - network/runtime errors
         LOGGER.warning("Failed to download %s: %s", ticker, exc)
+        _circuit_record_failure()
         return _offline_prices_for(ticker, start, end)
     if history.empty or "Adj Close" not in history.columns:
         LOGGER.warning("No adjusted close data returned for %s", ticker)
+        _circuit_record_failure()
         fallback = _offline_prices_for(ticker, start, end)
         if not fallback.empty:
             return fallback
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    _circuit_record_success()
     frame = history.reset_index()[["Date", "Adj Close"]].rename(columns={"Adj Close": "AdjClose"})
     frame["Ticker"] = ticker
     return frame

@@ -1,1 +1,5 @@
 pyarrow
+prometheus_client
+boto3
+google-cloud-storage
+prefect
