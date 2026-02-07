@@ -96,6 +96,40 @@ def _infer_trade_direction(signals: pd.DataFrame) -> str:
     return "FLAT"
 
 
+def _infer_action(direction: str) -> str:
+    normalized = direction.upper()
+    if normalized == "LONG":
+        return "BUY_SPREAD"
+    if normalized == "SHORT":
+        return "SELL_SPREAD"
+    if normalized == "CLOSE":
+        return "CLOSE"
+    return "HOLD"
+
+
+def _extract_entry_prices(signals: pd.DataFrame) -> Dict[str, Optional[float]]:
+    if signals.empty:
+        return {"entry_price_l": None, "entry_price_r": None}
+    last = signals.iloc[-1].to_dict()
+    for key in ("entry_price_l", "entry_price_r"):
+        if key not in last:
+            last[key] = None
+    return {
+        "entry_price_l": _coerce_float(last.get("entry_price_l")),
+        "entry_price_r": _coerce_float(last.get("entry_price_r")),
+    }
+
+
+def _extract_target_ratio(signals: pd.DataFrame) -> Optional[float]:
+    if signals.empty:
+        return None
+    last = signals.iloc[-1].to_dict()
+    for key in ("target_ratio", "hedge_ratio", "beta"):
+        if key in last:
+            return _coerce_float(last.get(key))
+    return None
+
+
 def _compute_confidence(z_score: Optional[float], z_th: Optional[float]) -> Optional[float]:
     if z_score is None or z_th in (None, 0):
         return None
@@ -172,12 +206,27 @@ def run_daily_signals(config_path: pathlib.Path = CONFIG_PATH) -> List[Dict[str,
         metrics = result.get("metrics", {})
         z_th = metrics.get("z_th") if isinstance(metrics, Mapping) else None
         confidence = _compute_confidence(z_score, z_th)
+        direction = _infer_trade_direction(signals_df)
+        action = _infer_action(direction)
+        entry_prices = _extract_entry_prices(signals_df)
+        target_ratio = _extract_target_ratio(signals_df)
+        risk_metrics = {
+            "potential_drawdown": metrics.get("maxdd") if isinstance(metrics, Mapping) else None,
+            "capital_at_risk": metrics.get("capital_at_risk") if isinstance(metrics, Mapping) else None,
+        }
+        allocation = metrics.get("allocation") if isinstance(metrics, Mapping) else None
 
         summary = {
             "pair": pair,
-            "direction": _infer_trade_direction(signals_df),
+            "direction": direction,
+            "action": action,
             "confidence": confidence,
             "expected_holding_period": metrics.get("avg_hold_days") if isinstance(metrics, Mapping) else None,
+            "entry_price_l": entry_prices["entry_price_l"],
+            "entry_price_r": entry_prices["entry_price_r"],
+            "target_ratio": target_ratio,
+            "allocation": allocation,
+            "risk_metrics": risk_metrics,
             "timestamp": timestamp,
             "metrics": {
                 "z_score": z_score,
@@ -204,15 +253,22 @@ def _write_outputs(results: List[Dict[str, Any]], output_dir: pathlib.Path = OUT
     for item in results:
         metrics = item.get("metrics", {})
         overlay = metrics.get("overlay", {}) if isinstance(metrics, Mapping) else {}
+        risk = item.get("risk_metrics", {}) if isinstance(item.get("risk_metrics"), Mapping) else {}
         rows.append(
             {
                 "pair": item.get("pair"),
                 "direction": item.get("direction"),
+                "action": item.get("action"),
                 "confidence": item.get("confidence"),
                 "expected_holding_period": item.get("expected_holding_period"),
+                "entry_price_l": item.get("entry_price_l"),
+                "entry_price_r": item.get("entry_price_r"),
+                "target_ratio": item.get("target_ratio"),
                 "timestamp": item.get("timestamp"),
                 "z_score": metrics.get("z_score") if isinstance(metrics, Mapping) else None,
                 "regime": metrics.get("regime") if isinstance(metrics, Mapping) else None,
+                "potential_drawdown": risk.get("potential_drawdown"),
+                "capital_at_risk": risk.get("capital_at_risk"),
                 "delta_score": overlay.get("delta_score"),
                 "delta_mom12": overlay.get("delta_mom12"),
                 "run_id": item.get("run_id"),
