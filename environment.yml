@@ -3,8 +3,6 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - numpy
-  - pandas
-  - scipy
+  - pip
   - pip:
-    - scikit-learn
+    - -r vecm_project/requirements.txt
