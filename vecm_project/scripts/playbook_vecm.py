@@ -43,6 +43,8 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from vecm_project.config.settings import settings
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import VECM
 
@@ -316,14 +318,61 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         outlier_max_ratio=float(args.outlier_max_ratio),
     )
 
-    # Allow quick overrides via environment variables without touching CLI defaults.
-    env_fee_buy = os.getenv("PLAYBOOK_FEE_BUY")
-    env_fee_sell = os.getenv("PLAYBOOK_FEE_SELL")
-    if env_fee_buy is not None:
-        cfg.fee_buy = float(env_fee_buy)
-    if env_fee_sell is not None:
-        cfg.fee_sell = float(env_fee_sell)
+    _apply_settings_overrides(cfg)
     return cfg
+
+
+def _apply_settings_overrides(cfg: PlaybookConfig) -> None:
+    overrides = {
+        "input_file": str(settings.playbook_input_file) if settings.playbook_input_file else None,
+        "subset": settings.playbook_subset,
+        "method": settings.playbook_method,
+        "roll_years": settings.playbook_roll_years,
+        "oos_start": settings.playbook_oos_start,
+        "horizon": settings.playbook_horizon,
+        "stage": settings.playbook_stage,
+        "notes": settings.playbook_notes,
+        "exit": settings.playbook_exit,
+        "z_entry": settings.playbook_z_entry,
+        "z_exit": settings.playbook_z_exit,
+        "z_stop": settings.playbook_z_stop,
+        "max_hold": settings.playbook_max_hold,
+        "cooldown": settings.playbook_cooldown,
+        "z_auto_method": settings.playbook_z_auto_method,
+        "z_auto_q": settings.playbook_z_auto_q,
+        "z_entry_cap": settings.playbook_z_entry_cap,
+        "gate_require_corr": settings.playbook_gate_require_corr,
+        "gate_corr_min": settings.playbook_gate_corr_min,
+        "gate_corr_win": settings.playbook_gate_corr_win,
+        "gate_enforce": settings.playbook_gate_enforce,
+        "short_filter": settings.playbook_short_filter,
+        "beta_weight": settings.playbook_beta_weight,
+        "cost_bps": settings.playbook_cost_bps,
+        "half_life_max": settings.playbook_half_life_max,
+        "dd_stop": settings.playbook_dd_stop,
+        "fee_buy": settings.playbook_fee_buy,
+        "fee_sell": settings.playbook_fee_sell,
+        "p_th": settings.playbook_p_th,
+        "regime_confirm": settings.playbook_regime_confirm,
+        "long_only": settings.playbook_long_only,
+        "kelly_frac": settings.playbook_kelly_frac,
+        "vol_cap": settings.playbook_vol_cap,
+        "ann_days": settings.playbook_ann_days,
+        "debug": settings.playbook_debug,
+        "selftest": settings.playbook_selftest,
+        "seed": settings.playbook_seed,
+        "tag": settings.playbook_tag,
+        "mom_enable": settings.playbook_mom_enable,
+        "mom_z": settings.playbook_mom_z,
+        "mom_k": settings.playbook_mom_k,
+        "mom_gate_k": settings.playbook_mom_gate_k,
+        "mom_cooldown": settings.playbook_mom_cooldown,
+        "outlier_iqr_mult": settings.playbook_outlier_iqr_mult,
+        "outlier_max_ratio": settings.playbook_outlier_max_ratio,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(cfg, key, value)
 
 
 # ---------------------------------------------------------------------------
