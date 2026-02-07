@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import time
+import threading
 from functools import lru_cache
 from itertools import chain
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -62,6 +63,53 @@ YF_PROXY_AUTH_ENV = "VECM_PROXY_AUTH"
 
 _REQUESTS_SESSION: Any = None
 _REQUESTS_SESSION_PID: Optional[int] = None
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_LAST_CALL: Optional[float] = None
+
+
+def _rate_limit_pause() -> None:
+    """Throttle outbound requests to respect external API limits."""
+    rate_limit = settings.vecm_rate_limit_per_sec
+    if not rate_limit or rate_limit <= 0:
+        return
+    min_interval = 1.0 / rate_limit
+    global _RATE_LIMIT_LAST_CALL
+    with _RATE_LIMIT_LOCK:
+        now = time.monotonic()
+        if _RATE_LIMIT_LAST_CALL is None:
+            _RATE_LIMIT_LAST_CALL = now
+            return
+        elapsed = now - _RATE_LIMIT_LAST_CALL
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+            now = time.monotonic()
+        _RATE_LIMIT_LAST_CALL = now
+
+
+MONITORING_DIR = BASE_DIR / "out_ms" / "monitoring"
+
+
+def _write_download_metrics(
+    *,
+    refreshed: Sequence[str],
+    failed: Sequence[str],
+    throttled: Sequence[str],
+    duration_s: float,
+) -> None:
+    """Persist a small JSON snapshot for monitoring the download pipeline."""
+    MONITORING_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "refreshed": list(refreshed),
+        "failed": list(failed),
+        "skipped": list(throttled),
+        "duration_s": float(duration_s),
+        "timestamp": dt.datetime.utcnow().isoformat(),
+    }
+    path = MONITORING_DIR / "price_download.json"
+    try:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:  # pragma: no cover - best effort observability
+        LOGGER.warning("Failed to write download metrics: %s", exc)
 
 
 DEFAULT_TICKER_CONFIG: Dict[str, List[str]] = {
@@ -177,6 +225,7 @@ def _download_alpha_vantage(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         f"&symbol={ticker}&outputsize=full&apikey={api_key}"
     )
     try:
+        _rate_limit_pause()
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         payload = response.json()
@@ -648,6 +697,7 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         return _download_fallback_provider(ticker, start, end)
     try:
         session = _get_requests_session()
+        _rate_limit_pause()
         history = yf.download(
             ticker,
             start=start.to_pydatetime().date(),
@@ -711,6 +761,7 @@ def ensure_price_data(
     """Ensure the adjusted close cache exists and return it in wide format."""
 
     _ensure_data_dir()
+    start_time = time.perf_counter()
     ticker_list = sorted(set(tickers or ALL_TICKERS))
     if not ticker_list:
         raise ValueError("No tickers provided for download")
@@ -873,6 +924,13 @@ def ensure_price_data(
         )
         if len(failed_tickers) > 10:
             LOGGER.warning("...and %d more", len(failed_tickers) - 10)
+    duration_s = time.perf_counter() - start_time
+    _write_download_metrics(
+        refreshed=refreshed_tickers,
+        failed=failed_tickers,
+        throttled=throttled,
+        duration_s=duration_s,
+    )
     if meta_changed:
         _write_cache_meta(meta)
     return wide

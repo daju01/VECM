@@ -23,6 +23,7 @@ from vecm_project.config.settings import settings
 
 from . import storage
 from .data_streaming import ensure_price_data
+from .parallel_utils import coerce_list, env_float, env_int, env_path, parse_csv_values
 from .playbook_vecm import (
     PlaybookConfig,
     load_and_validate_data,
@@ -242,40 +243,6 @@ def _available_workers() -> int:
     return max(1, math.floor(cores * 0.75))
 
 
-def _env_path(name: str, default: Path) -> Path:
-    value = os.getenv(name)
-    return Path(value) if value else default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _parse_csv_values(raw: Optional[str], cast) -> Optional[List[Any]]:
-    if raw is None:
-        return None
-    items = [item.strip() for item in raw.split(",") if item.strip()]
-    if not items:
-        return []
-    return [cast(item) for item in items]
-
-
 def _read_grid_config_file(path: Optional[Path]) -> Dict[str, Any]:
     if path is None:
         return {}
@@ -291,17 +258,6 @@ def _read_grid_config_file(path: Optional[Path]) -> Dict[str, Any]:
         LOGGER.error("Grid config %s must contain a JSON object", path)
         raise SystemExit(1)
     return payload
-
-
-def _coerce_list(name: str, payload: Dict[str, Any], cast) -> Optional[List[Any]]:
-    if name not in payload:
-        return None
-    value = payload[name]
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [cast(item) for item in value]
-    return [cast(value)]
 
 
 def _build_grid_config(path: Optional[Path], overrides: Dict[str, Any]) -> GridConfig:
@@ -351,7 +307,7 @@ def _build_grid_config(path: Optional[Path], overrides: Dict[str, Any]) -> GridC
         "mom_cool_set": int,
     }
     for field_name, cast in list_fields.items():
-        value = _coerce_list(field_name, merged, cast)
+        value = coerce_list(field_name, merged, cast)
         if value is not None:
             setattr(config, field_name, value)
     if "max_grid" in merged and merged["max_grid"] is not None:
@@ -744,14 +700,14 @@ def _build_config(
     fallback_defaults: bool = DEFAULT_FALLBACK_DEFAULTS,
 ) -> RunnerConfig:
     grid_config = grid_config or GridConfig()
-    input_csv = _env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
-    out_dir = _env_path("VECM_OUT", BASE_DIR / "out" / "ms")
+    input_csv = env_path("VECM_INPUT", BASE_DIR / "data" / "adj_close_data.csv")
+    out_dir = env_path("VECM_OUT", BASE_DIR / "out" / "ms")
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "run_manifest.csv"
     cache_dir = out_dir / "aligned_cache"
     lock_file = out_dir / ".start_gate.lock"
     stamp_file = out_dir / ".last_start_time"
-    max_workers = max(1, _env_int("VECM_MAX_WORKERS", _available_workers()))
+    max_workers = max(1, env_int("VECM_MAX_WORKERS", _available_workers()))
     subsets = _gather_subsets(input_csv, subsets_override, fallback_defaults=fallback_defaults)
     tickers = _download_tickers_for_subsets(subsets)
     ensure_price_data(tickers=tickers or None)
@@ -761,13 +717,13 @@ def _build_config(
     oos_full = os.getenv("VECM_OOS_FULL", "2024-09-01")
     oos_start = oos_full if stage.lower() == "stage2" else oos_short
     run_label = f"{stage}-{dt.datetime.utcnow():%Y%m%d_%H%M%S}"
-    time_budget = _env_float("VECM_TIME_BUDGET_SEC", 0.0)
-    max_jobs = _env_int("VECM_MAX_JOBS", 0)
+    time_budget = env_float("VECM_TIME_BUDGET_SEC", 0.0)
+    max_jobs = env_int("VECM_MAX_JOBS", 0)
     if stage.lower() == "stage2" and max_jobs == 0 and grid_config.max_grid:
         max_jobs = grid_config.max_grid
         LOGGER.info("Stage2 cap applied: max_jobs=%d (from VECM_MAX_GRID)", max_jobs)
     date_align = os.getenv("VECM_DATE_ALIGN", "true").lower() != "false"
-    min_obs = _env_int("VECM_MIN_OBS", 60)
+    min_obs = env_int("VECM_MIN_OBS", 60)
     use_mom_stage1 = os.getenv("VECM_MOM_STAGE1", "false").lower() == "true"
     use_mom_stage2 = os.getenv("VECM_MOM_STAGE2", "true").lower() != "false"
     use_momentum = (stage.lower() == "stage2" and use_mom_stage2) or (stage.lower() == "stage1" and use_mom_stage1)
@@ -1158,20 +1114,20 @@ def _cli_subset_override(args: argparse.Namespace) -> Optional[List[str]]:
 
 def _cli_grid_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     return {
-        "z_methods": _parse_csv_values(args.grid_z_methods, str),
-        "z_quantiles": _parse_csv_values(args.grid_z_quantiles, float),
-        "p_thresh": _parse_csv_values(args.grid_p_thresh, float),
-        "regime_confirm": _parse_csv_values(args.grid_regime_confirm, int),
-        "gate_corr_min": _parse_csv_values(args.grid_gate_corr_min, float),
-        "gate_corr_win": _parse_csv_values(args.grid_gate_corr_win, int),
-        "cooldown": _parse_csv_values(args.grid_cooldown, int),
-        "z_exit": _parse_csv_values(args.grid_z_exit, float),
-        "z_stop": _parse_csv_values(args.grid_z_stop, float),
+        "z_methods": parse_csv_values(args.grid_z_methods, str),
+        "z_quantiles": parse_csv_values(args.grid_z_quantiles, float),
+        "p_thresh": parse_csv_values(args.grid_p_thresh, float),
+        "regime_confirm": parse_csv_values(args.grid_regime_confirm, int),
+        "gate_corr_min": parse_csv_values(args.grid_gate_corr_min, float),
+        "gate_corr_win": parse_csv_values(args.grid_gate_corr_win, int),
+        "cooldown": parse_csv_values(args.grid_cooldown, int),
+        "z_exit": parse_csv_values(args.grid_z_exit, float),
+        "z_stop": parse_csv_values(args.grid_z_stop, float),
         "max_grid": args.grid_max,
-        "mom_z_set": _parse_csv_values(args.mom_z_set, float),
-        "mom_k_set": _parse_csv_values(args.mom_k_set, int),
-        "mom_gate_k_set": _parse_csv_values(args.mom_gate_k_set, int),
-        "mom_cool_set": _parse_csv_values(args.mom_cool_set, int),
+        "mom_z_set": parse_csv_values(args.mom_z_set, float),
+        "mom_k_set": parse_csv_values(args.mom_k_set, int),
+        "mom_gate_k_set": parse_csv_values(args.mom_gate_k_set, int),
+        "mom_cool_set": parse_csv_values(args.mom_cool_set, int),
     }
 
 
