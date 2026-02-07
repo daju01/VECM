@@ -1,0 +1,60 @@
+{
+  "beginner": {
+    "label": "Beginner (safe defaults)",
+    "description": "Preset sederhana untuk pemula dengan entry konservatif dan cooldown lebih panjang.",
+    "params": {
+      "method": "TVECM",
+      "p_th": 0.65,
+      "z_entry_cap": 0.9,
+      "z_exit": 0.55,
+      "z_stop": 0.8,
+      "max_hold": 10,
+      "cooldown": 2,
+      "cost_bps": 7.5,
+      "long_only": true
+    }
+  },
+  "conservative": {
+    "label": "Conservative",
+    "description": "Lebih ketat pada filter regime dan drawdown guard.",
+    "params": {
+      "method": "TVECM",
+      "p_th": 0.85,
+      "z_entry_cap": 0.95,
+      "z_exit": 0.5,
+      "z_stop": 0.75,
+      "max_hold": 12,
+      "cooldown": 3,
+      "dd_stop": 0.2,
+      "long_only": true
+    }
+  },
+  "balanced": {
+    "label": "Balanced",
+    "description": "Default seimbang untuk eksperimen umum.",
+    "params": {
+      "method": "TVECM",
+      "p_th": 0.7,
+      "z_entry_cap": 0.85,
+      "z_exit": 0.55,
+      "z_stop": 0.8,
+      "max_hold": 8,
+      "cooldown": 1,
+      "long_only": true
+    }
+  },
+  "aggressive": {
+    "label": "Aggressive",
+    "description": "Lebih cepat masuk/keluar dengan threshold lebih rendah.",
+    "params": {
+      "method": "TVECM",
+      "p_th": 0.6,
+      "z_entry_cap": 0.8,
+      "z_exit": 0.6,
+      "z_stop": 0.9,
+      "max_hold": 6,
+      "cooldown": 1,
+      "long_only": false
+    }
+  }
+}

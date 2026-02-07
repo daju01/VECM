@@ -35,6 +35,7 @@ TRACKED_TABLES: Sequence[str] = (
     "runs",
     "trials",
     "exec_metrics",
+    "run_metrics",
     "trade_stats",
     "storage_metrics",
     "model_checks",
@@ -129,6 +130,20 @@ def storage_init(conn: DuckDBConnection) -> None:
             worker_idle_pct DOUBLE,
             chunk_size INT,
             progress_latency_s DOUBLE
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS run_metrics (
+            run_id TEXT PRIMARY KEY,
+            metric_ts TIMESTAMP,
+            universe_id TEXT,
+            pairs_count INT,
+            trades_count INT,
+            sharpe_oos DOUBLE,
+            turnover_annualised DOUBLE,
+            score DOUBLE,
+            maxdd DOUBLE,
+            fees_total DOUBLE
         );
         """,
         """
@@ -439,6 +454,40 @@ def write_exec_metrics(
         ],
     )
     storage_schedule_analyze(conn, "exec_metrics")
+
+
+def write_run_metrics(
+    conn: DuckDBConnection,
+    run_id: str,
+    *,
+    metric_ts: dt.datetime,
+    universe_id: str,
+    pairs_count: int,
+    trades_count: int,
+    sharpe_oos: float,
+    turnover_annualised: float,
+    score: float,
+    maxdd: float,
+    fees_total: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO run_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            metric_ts,
+            universe_id,
+            pairs_count,
+            trades_count,
+            sharpe_oos,
+            turnover_annualised,
+            score,
+            maxdd,
+            fees_total,
+        ),
+    )
+    storage_schedule_analyze(conn, "run_metrics")
 
 
 def write_storage_metrics(

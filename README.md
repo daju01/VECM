@@ -37,6 +37,37 @@ A Python toolkit for stock market price analysis using Vector Error Correction M
    DuckDB. Keluaran terstruktur inilah yang diperlukan untuk verifikasi ulang
    Sharpe/Drawdown serta audit performa.
 
+## Quickstart (Beginner)
+
+Tujuan bagian ini: jalan dalam 5 menit tanpa mikir panjang.
+
+**Opsi Docker**
+```bash
+docker compose up --build pipeline
+```
+
+**Opsi Lokal**
+```bash
+python vecm_project/run_demo.py
+```
+
+**Daily signal + notifikasi**
+```bash
+python -m vecm_project.scripts.daily_signal
+python -m vecm_project.scripts.notify --only-changed
+```
+
+**Contoh output singkat (daily_signal)**
+```
+pair, direction, confidence, expected_holding_period, z_score, regime, timestamp
+ANTM,INCO, LONG, 0.71, 8.0, -1.92, 0.88, 2025-02-07T03:00:00Z
+```
+
+Output akan tersimpan di:
+
+- `vecm_project/outputs/daily/daily_signal_<timestamp>.json`
+- `vecm_project/outputs/daily/daily_signal_<timestamp>.csv`
+
 ## Docker (pipeline + dashboard)
 
 Repositori ini menyertakan `Dockerfile` dan `docker-compose.yml` agar pipeline
@@ -81,6 +112,16 @@ sering muncul saat men-deploy playbook:
    penulisan Pareto/dashboard.
 4. **Artefak lengkap.** Pastikan `persist=True` sehingga artefak dan metrik
    terekam untuk audit maupun analisis lanjutan.
+
+## Troubleshooting (Top 5)
+
+| Masalah | Gejala | Solusi cepat |
+| --- | --- | --- |
+| Download data gagal | `HTTPError` / `Timeout` | set `VECM_PRICE_DOWNLOAD=force` dan coba lagi, atau set `OFFLINE_FALLBACK_PATH` ke CSV lokal. |
+| Dependency error | `ModuleNotFoundError` | pastikan `pip install -r requirements.txt -r requirements-dev.txt`. |
+| Notifikasi tidak terkirim | Telegram/SMTP tidak terkirim | cek env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_TO`. |
+| Runtime terlalu lama | proses berjam-jam | gunakan `VECM_STAGE=stage1` dan `VECM_PREFILTER=on` untuk uji cepat. |
+| Cache data rusak | `adj_close_data.csv` invalid | hapus file cache atau jalankan dengan `VECM_PRICE_DOWNLOAD=force`. |
 
 ### When `pip install` Is Blocked
 

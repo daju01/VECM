@@ -23,6 +23,8 @@ try:  # pragma: no cover - optional dependency for robust downloads
 except Exception:  # pragma: no cover - curl_cffi not available
     curl_requests = None
 
+from vecm_project.config.settings import settings
+
 from . import storage
 from .cache_keys import hash_dataframe
 
@@ -35,13 +37,14 @@ CACHE_ROOT = BASE_DIR / "cache"
 TICKER_CACHE_DIR = CACHE_ROOT / "tickers"
 TICKER_CONFIG_PATH = BASE_DIR / "config" / "ticker_groups.json"
 TICKER_CONFIG_ENV = "VECM_TICKER_CONFIG"
-OFFLINE_FALLBACK_PATH = pathlib.Path(
-    os.getenv("OFFLINE_FALLBACK_PATH", str(DATA_DIR / "offline_prices.csv"))
-)
+OFFLINE_FALLBACK_PATH = settings.offline_fallback_path or (DATA_DIR / "offline_prices.csv")
 DEFAULT_START_DATE = dt.date(2013, 1, 1)
 MAX_WORKERS = 4
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 0.75
+_CIRCUIT_BREAKER = {"failures": 0, "opened_until": None}
+CB_MAX_FAILURES = 3
+CB_COOLDOWN_MINUTES = 30
 DOWNLOAD_CONTROL_ENV = "VECM_PRICE_DOWNLOAD"
 _DOWNLOAD_DISABLE = {"0", "false", "no", "off", "skip", "never"}
 _DOWNLOAD_FORCE = {"force", "always"}
@@ -139,6 +142,73 @@ DEFAULT_TICKER_CONFIG: Dict[str, List[str]] = {
     "energy_resources": ["MEDC.JK"],
     "renewables_utilities": ["KEEN.JK", "ARKO.JK", "PGEO.JK"],
 }
+
+
+def _circuit_allows() -> bool:
+    opened_until = _CIRCUIT_BREAKER["opened_until"]
+    if opened_until is None:
+        return True
+    if dt.datetime.now(dt.timezone.utc) >= opened_until:
+        _CIRCUIT_BREAKER["opened_until"] = None
+        _CIRCUIT_BREAKER["failures"] = 0
+        return True
+    return False
+
+
+def _circuit_record_failure() -> None:
+    _CIRCUIT_BREAKER["failures"] += 1
+    if _CIRCUIT_BREAKER["failures"] >= CB_MAX_FAILURES:
+        _CIRCUIT_BREAKER["opened_until"] = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            minutes=CB_COOLDOWN_MINUTES
+        )
+
+
+def _circuit_record_success() -> None:
+    _CIRCUIT_BREAKER["failures"] = 0
+    _CIRCUIT_BREAKER["opened_until"] = None
+
+
+def _download_alpha_vantage(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+    if not api_key:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    url = (
+        "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED"
+        f"&symbol={ticker}&outputsize=full&apikey={api_key}"
+    )
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # pragma: no cover - network/runtime errors
+        LOGGER.warning("Alpha Vantage fallback failed for %s: %s", ticker, exc)
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    series = payload.get("Time Series (Daily)") or {}
+    if not series:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    rows = []
+    for date_str, values in series.items():
+        if not values:
+            continue
+        rows.append(
+            {
+                "Date": pd.to_datetime(date_str),
+                "Ticker": ticker,
+                "AdjClose": float(values.get("5. adjusted close", "nan")),
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame[(frame["Date"] >= start) & (frame["Date"] <= pd.Timestamp(end))]
+    return frame
+
+
+def _download_fallback_provider(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
+    alpha_frame = _download_alpha_vantage(ticker, start, end)
+    if not alpha_frame.empty:
+        return alpha_frame
+    return _offline_prices_for(ticker, start, end)
 
 
 def _normalise_ticker_config(config: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -288,16 +358,16 @@ def _get_requests_session() -> Any:
     if _REQUESTS_SESSION is not None and _REQUESTS_SESSION_PID == current_pid:
         return _REQUESTS_SESSION
 
-    user_agent = os.getenv(YF_USER_AGENT_ENV, "").strip() or YF_DEFAULT_USER_AGENT
-    impersonate = os.getenv(YF_IMPERSONATE_ENV, "chrome124").strip() or "chrome124"
-    verify_path = os.getenv(YF_VERIFY_ENV, "").strip() or os.getenv("CODEX_PROXY_CERT", "").strip()
+    user_agent = settings.vecm_yf_user_agent or YF_DEFAULT_USER_AGENT
+    impersonate = settings.vecm_yf_impersonate or "chrome124"
+    verify_path = (settings.vecm_yf_verify or "").strip() or os.getenv("CODEX_PROXY_CERT", "").strip()
     if not verify_path:
         for env_var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
             verify_candidate = os.getenv(env_var, "").strip()
             if verify_candidate:
                 verify_path = verify_candidate
                 break
-    proxy_auth = os.getenv(YF_PROXY_AUTH_ENV, "").strip()
+    proxy_auth = (settings.vecm_proxy_auth or "").strip()
     proxies = get_environ_proxies("https://query1.finance.yahoo.com")
 
     if curl_requests is not None:
@@ -573,6 +643,9 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
     if start >= pd.Timestamp(end):
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     proxy_url = os.getenv("https_proxy") or os.getenv("HTTPS_PROXY")
+    if not _circuit_allows():
+        LOGGER.warning("Circuit breaker open; using fallback provider for %s", ticker)
+        return _download_fallback_provider(ticker, start, end)
     try:
         session = _get_requests_session()
         history = yf.download(
@@ -586,13 +659,16 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         )
     except Exception as exc:  # pragma: no cover - network/runtime errors
         LOGGER.warning("Failed to download %s: %s", ticker, exc)
+        _circuit_record_failure()
         return _offline_prices_for(ticker, start, end)
     if history.empty or "Adj Close" not in history.columns:
         LOGGER.warning("No adjusted close data returned for %s", ticker)
+        _circuit_record_failure()
         fallback = _offline_prices_for(ticker, start, end)
         if not fallback.empty:
             return fallback
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    _circuit_record_success()
     frame = history.reset_index()[["Date", "Adj Close"]].rename(columns={"Adj Close": "AdjClose"})
     frame["Ticker"] = ticker
     return frame
@@ -639,7 +715,7 @@ def ensure_price_data(
     if not ticker_list:
         raise ValueError("No tickers provided for download")
 
-    download_mode = os.getenv(DOWNLOAD_CONTROL_ENV, "auto").strip().lower()
+    download_mode = settings.vecm_price_download.strip().lower()
     if download_mode in _DOWNLOAD_FORCE:
         force_refresh = True
     offline_requested = download_mode in _DOWNLOAD_DISABLE and not force_refresh

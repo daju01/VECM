@@ -9,6 +9,8 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 
 import pandas as pd
 
+from vecm_project.config.settings import settings
+
 from . import playbook_vecm
 
 LOGGER = logging.getLogger(__name__)
@@ -96,6 +98,87 @@ def _infer_trade_direction(signals: pd.DataFrame) -> str:
     return "FLAT"
 
 
+def _infer_action(direction: str) -> str:
+    normalized = direction.upper()
+    if normalized == "LONG":
+        return "BUY_SPREAD"
+    if normalized == "SHORT":
+        return "SELL_SPREAD"
+    if normalized == "CLOSE":
+        return "CLOSE"
+    return "HOLD"
+
+
+def _extract_entry_prices(signals: pd.DataFrame) -> Dict[str, Optional[float]]:
+    if signals.empty:
+        return {"entry_price_l": None, "entry_price_r": None}
+    last = signals.iloc[-1].to_dict()
+    for key in ("entry_price_l", "entry_price_r"):
+        if key not in last:
+            last[key] = None
+    return {
+        "entry_price_l": _coerce_float(last.get("entry_price_l")),
+        "entry_price_r": _coerce_float(last.get("entry_price_r")),
+    }
+
+
+def _extract_target_ratio(signals: pd.DataFrame) -> Optional[float]:
+    if signals.empty:
+        return None
+    last = signals.iloc[-1].to_dict()
+    for key in ("target_ratio", "hedge_ratio", "beta"):
+        if key in last:
+            return _coerce_float(last.get(key))
+    return None
+
+
+def _exit_conditions(cfg: playbook_vecm.PlaybookConfig) -> Dict[str, Optional[float]]:
+    return {
+        "z_score_target": cfg.z_exit,
+        "max_holding_days": cfg.max_hold,
+        "stop_loss_z": cfg.z_stop,
+    }
+
+
+def _apply_guardrails(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not results:
+        return results
+    if settings.risk_kill_switch:
+        for item in results:
+            item["action"] = "HOLD"
+            item.setdefault("reason_codes", []).append("KILL_SWITCH")
+        return results
+    max_open = settings.risk_max_open_pairs
+    if max_open is not None:
+        actionable = [item for item in results if item.get("action") in {"BUY_SPREAD", "SELL_SPREAD"}]
+        actionable_sorted = sorted(
+            actionable, key=lambda x: (x.get("confidence") or 0), reverse=True
+        )
+        allowed = {item.get("pair") for item in actionable_sorted[:max_open]}
+        for item in results:
+            if item.get("action") in {"BUY_SPREAD", "SELL_SPREAD"} and item.get("pair") not in allowed:
+                item["action"] = "HOLD"
+                item.setdefault("reason_codes", []).append("MAX_OPEN_PAIRS")
+    max_exposure = settings.risk_max_gross_exposure
+    if max_exposure is not None:
+        for item in results:
+            allocation = item.get("allocation")
+            if isinstance(allocation, Mapping):
+                gross = sum(abs(float(value)) for value in allocation.values() if value is not None)
+                if gross > max_exposure:
+                    item["action"] = "HOLD"
+                    item.setdefault("reason_codes", []).append("MAX_GROSS_EXPOSURE")
+    loss_limit = settings.risk_daily_loss_limit
+    if loss_limit is not None:
+        for item in results:
+            risk = item.get("risk_metrics", {})
+            maxdd = risk.get("potential_drawdown")
+            if maxdd is not None and float(maxdd) >= loss_limit:
+                item["action"] = "HOLD"
+                item.setdefault("reason_codes", []).append("DAILY_LOSS_LIMIT")
+    return results
+
+
 def _compute_confidence(z_score: Optional[float], z_th: Optional[float]) -> Optional[float]:
     if z_score is None or z_th in (None, 0):
         return None
@@ -172,12 +255,30 @@ def run_daily_signals(config_path: pathlib.Path = CONFIG_PATH) -> List[Dict[str,
         metrics = result.get("metrics", {})
         z_th = metrics.get("z_th") if isinstance(metrics, Mapping) else None
         confidence = _compute_confidence(z_score, z_th)
+        direction = _infer_trade_direction(signals_df)
+        action = _infer_action(direction)
+        entry_prices = _extract_entry_prices(signals_df)
+        target_ratio = _extract_target_ratio(signals_df)
+        risk_metrics = {
+            "potential_drawdown": metrics.get("maxdd") if isinstance(metrics, Mapping) else None,
+            "capital_at_risk": metrics.get("capital_at_risk") if isinstance(metrics, Mapping) else None,
+        }
+        allocation = metrics.get("allocation") if isinstance(metrics, Mapping) else None
+        exit_conditions = _exit_conditions(cfg)
 
         summary = {
             "pair": pair,
-            "direction": _infer_trade_direction(signals_df),
+            "direction": direction,
+            "action": action,
             "confidence": confidence,
             "expected_holding_period": metrics.get("avg_hold_days") if isinstance(metrics, Mapping) else None,
+            "entry_price_l": entry_prices["entry_price_l"],
+            "entry_price_r": entry_prices["entry_price_r"],
+            "target_ratio": target_ratio,
+            "allocation": allocation,
+            "risk_metrics": risk_metrics,
+            "exit_conditions": exit_conditions,
+            "reason_codes": [],
             "timestamp": timestamp,
             "metrics": {
                 "z_score": z_score,
@@ -188,7 +289,7 @@ def run_daily_signals(config_path: pathlib.Path = CONFIG_PATH) -> List[Dict[str,
         }
         results.append(summary)
 
-    return results
+    return _apply_guardrails(results)
 
 
 def _write_outputs(results: List[Dict[str, Any]], output_dir: pathlib.Path = OUTPUT_DIR) -> Tuple[pathlib.Path, pathlib.Path]:
@@ -204,15 +305,27 @@ def _write_outputs(results: List[Dict[str, Any]], output_dir: pathlib.Path = OUT
     for item in results:
         metrics = item.get("metrics", {})
         overlay = metrics.get("overlay", {}) if isinstance(metrics, Mapping) else {}
+        risk = item.get("risk_metrics", {}) if isinstance(item.get("risk_metrics"), Mapping) else {}
+        exit_conditions = item.get("exit_conditions", {}) if isinstance(item.get("exit_conditions"), Mapping) else {}
         rows.append(
             {
                 "pair": item.get("pair"),
                 "direction": item.get("direction"),
+                "action": item.get("action"),
                 "confidence": item.get("confidence"),
                 "expected_holding_period": item.get("expected_holding_period"),
+                "entry_price_l": item.get("entry_price_l"),
+                "entry_price_r": item.get("entry_price_r"),
+                "target_ratio": item.get("target_ratio"),
+                "exit_z_target": exit_conditions.get("z_score_target"),
+                "exit_max_days": exit_conditions.get("max_holding_days"),
+                "exit_stop_loss_z": exit_conditions.get("stop_loss_z"),
+                "reason_codes": ",".join(item.get("reason_codes", [])),
                 "timestamp": item.get("timestamp"),
                 "z_score": metrics.get("z_score") if isinstance(metrics, Mapping) else None,
                 "regime": metrics.get("regime") if isinstance(metrics, Mapping) else None,
+                "potential_drawdown": risk.get("potential_drawdown"),
+                "capital_at_risk": risk.get("capital_at_risk"),
                 "delta_score": overlay.get("delta_score"),
                 "delta_mom12": overlay.get("delta_mom12"),
                 "run_id": item.get("run_id"),
