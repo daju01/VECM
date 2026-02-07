@@ -101,6 +101,23 @@ def _latest_daily_signal_age() -> Optional[float]:
     return _file_age_hours(candidates[-1])
 
 
+def _load_strategy_profiles() -> Dict[str, Any]:
+    profile_path = BASE_DIR / "config" / "strategy_profiles.json"
+    if not profile_path.exists():
+        return {}
+    return json.loads(profile_path.read_text(encoding="utf-8"))
+
+
+def _load_ticker_groups() -> Dict[str, List[str]]:
+    path = BASE_DIR / "config" / "ticker_groups.json"
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+    return {key: value for key, value in payload.items() if isinstance(value, list)}
+
+
 @app.route("/healthz")
 def healthz() -> Dict[str, object]:
     base_dir = Path(__file__).resolve().parents[1]
@@ -115,6 +132,30 @@ def healthz() -> Dict[str, object]:
         "price_data_age_hours": price_age_hours,
         "daily_signal_age_hours": signal_age_hours,
     }
+
+
+@app.route("/config", methods=["GET", "POST"])
+def config_wizard() -> str:
+    profiles = _load_strategy_profiles()
+    ticker_groups = _load_ticker_groups()
+    selected_profile = request.form.get("profile", "beginner")
+    selected_pair = request.form.get("pair", "")
+    preview: Optional[Dict[str, Any]] = None
+    if request.method == "POST":
+        profile_data = profiles.get(selected_profile, {})
+        preview = {
+            "profile": selected_profile,
+            "pair": selected_pair,
+            "params": profile_data.get("params", {}),
+        }
+    return render_template(
+        "config_wizard.html",
+        profiles=profiles,
+        ticker_groups=ticker_groups,
+        selected_profile=selected_profile,
+        selected_pair=selected_pair,
+        preview=preview,
+    )
 
 
 @app.route("/")
