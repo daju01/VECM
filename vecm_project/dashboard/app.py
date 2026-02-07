@@ -1,6 +1,7 @@
 """Simple read-only dashboard for VECM outputs."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 from dataclasses import dataclass
@@ -85,9 +86,35 @@ def _basic_auth_guard() -> Optional[Response]:
     return _require_basic_auth()
 
 
+def _file_age_hours(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - mtime).total_seconds() / 3600
+
+
+def _latest_daily_signal_age() -> Optional[float]:
+    output_dir = Path(__file__).resolve().parents[1] / "outputs" / "daily"
+    candidates = sorted(output_dir.glob("daily_signal_*.json"))
+    if not candidates:
+        return None
+    return _file_age_hours(candidates[-1])
+
+
 @app.route("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> Dict[str, object]:
+    base_dir = Path(__file__).resolve().parents[1]
+    data_path = base_dir / "data" / "adj_close_data.csv"
+    price_age_hours = _file_age_hours(data_path)
+    signal_age_hours = _latest_daily_signal_age()
+    status = "ok"
+    if signal_age_hours is None or signal_age_hours > 48:
+        status = "stale"
+    return {
+        "status": status,
+        "price_data_age_hours": price_age_hours,
+        "daily_signal_age_hours": signal_age_hours,
+    }
 
 
 @app.route("/")

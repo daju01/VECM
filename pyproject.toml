@@ -32,6 +32,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "flake8",
+    "pre-commit",
+    "ruff",
+    "black",
+    "mypy",
+    "pytest",
+    "pytest-cov",
 ]
 
 [project.scripts]
