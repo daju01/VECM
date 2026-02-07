@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     vecm_yf_user_agent: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     )
-    vecm_yf_impersonate: Optional[str] = None
-    vecm_yf_verify: str = "true"
+    vecm_yf_impersonate: str = "chrome124"
+    vecm_yf_verify: Optional[str] = None
     vecm_proxy_auth: Optional[str] = None
     offline_fallback_path: Optional[Path] = None
 

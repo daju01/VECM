@@ -4,7 +4,6 @@ import argparse
 import csv
 import json
 import logging
-import os
 import pathlib
 import smtplib
 import ssl
@@ -12,6 +11,8 @@ import urllib.parse
 import urllib.request
 from email.message import EmailMessage
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+from vecm_project.config.settings import settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,8 +105,8 @@ def _save_state(path: pathlib.Path, state: Mapping[str, Any]) -> None:
 
 
 def _send_telegram(message: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    token = settings.telegram_bot_token
+    chat_id = settings.telegram_chat_id
     if not token or not chat_id:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -117,15 +118,15 @@ def _send_telegram(message: str) -> None:
 
 
 def _send_email(message: str, subject: str) -> None:
-    host = os.getenv("SMTP_HOST")
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASS")
-    to_raw = os.getenv("SMTP_TO")
+    host = settings.smtp_host
+    user = settings.smtp_user
+    password = settings.smtp_pass
+    to_raw = settings.smtp_to
     if not host or not user or not password or not to_raw:
         raise RuntimeError("Missing SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_TO")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    use_tls = os.getenv("SMTP_STARTTLS", "true").lower() not in {"0", "false", "no"}
-    sender = os.getenv("SMTP_FROM", user)
+    port = settings.smtp_port
+    use_tls = settings.smtp_starttls
+    sender = settings.smtp_from or user
     recipients = [addr.strip() for addr in to_raw.split(",") if addr.strip()]
     if not recipients:
         raise RuntimeError("SMTP_TO must contain at least one recipient")
@@ -209,13 +210,8 @@ def main() -> None:
     message = _format_message(changed)
     subject = "VECM Daily Signal Update"
 
-    telegram_ready = os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")
-    email_ready = (
-        os.getenv("SMTP_HOST")
-        and os.getenv("SMTP_USER")
-        and os.getenv("SMTP_PASS")
-        and os.getenv("SMTP_TO")
-    )
+    telegram_ready = settings.telegram_bot_token and settings.telegram_chat_id
+    email_ready = settings.smtp_host and settings.smtp_user and settings.smtp_pass and settings.smtp_to
 
     channels = args.channels
     if channels == "auto":

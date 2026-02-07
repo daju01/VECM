@@ -1,0 +1,48 @@
+name: Daily VECM Run
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Create daily status artifacts
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          output_dir = Path("vecm_project/outputs/daily")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          now = datetime.now(timezone.utc).isoformat()
+          status = {
+              "status": "ok",
+              "generated_at": now,
+          }
+          manifest = {
+              "generated_at": now,
+              "artifacts": ["status.json", "manifest.json"],
+          }
+          (output_dir / "status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+          (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          PY
+      - name: Upload daily artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-status
+          path: vecm_project/outputs/daily/

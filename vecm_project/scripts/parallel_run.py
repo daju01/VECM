@@ -19,6 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import pandas as pd
 
+from vecm_project.config.settings import settings
+
 from . import storage
 from .data_streaming import ensure_price_data
 from .playbook_vecm import (
@@ -583,14 +585,13 @@ def _align_pair(
 
 def _choose_stage(manifest_path: Path, subsets: Iterable[str]) -> str:
     manifest = _load_manifest(manifest_path)
-    env_stage = os.getenv("VECM_STAGE")
-    if env_stage:
-        return env_stage
+    if settings.vecm_stage:
+        return settings.vecm_stage
     return _auto_stage(subsets, manifest)
 
 
 def _should_prefilter() -> bool:
-    return os.getenv("VECM_PREFILTER", "off").lower() == "on"
+    return settings.vecm_prefilter.lower() == "on"
 
 
 def _parse_subset_entries(entries: Iterable[str], *, source: str) -> List[str]:

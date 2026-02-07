@@ -32,6 +32,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "flake8",
+    "pre-commit",
+    "ruff",
 ]
 
 [project.scripts]
