@@ -40,6 +40,7 @@ BO_BOUNDS: Dict[str, Bound] = {
     "z_exit": Bound(0.2, 1.0),
     "max_hold": Bound(2, 15, is_int=True),
     "cooldown": Bound(0, 10, is_int=True),
+    "p_th": Bound(0.45, 0.85),
 }
 
 
@@ -190,6 +191,7 @@ def run_bo(
             z_exit=float(params["z_exit"]),
             max_hold=int(params["max_hold"]),
             cooldown=int(params["cooldown"]),
+            p_th=float(params["p_th"]),
             run_id=trial_run_id,
         )
         diagnostics = score_rules(

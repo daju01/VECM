@@ -69,6 +69,7 @@ class FeatureConfig:
     horizon: str = ""
     data_frame: Optional[pd.DataFrame] = None
     run_id: Optional[str] = None
+    macro_exog: Optional[pd.DataFrame] = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class DecisionParams:
     z_exit: float
     max_hold: int
     cooldown: int
+    p_th: Optional[float] = None
     run_id: Optional[str] = None
 
 

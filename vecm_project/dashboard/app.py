@@ -1,6 +1,7 @@
 """Simple read-only dashboard for VECM outputs."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import importlib
 import json
@@ -11,7 +12,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from flask import Flask, Response, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
+
+from vecm_project.scripts import playbook_vecm
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -95,6 +98,15 @@ class DashboardData:
     latest_signal: Optional[LatestSignal]
     metrics: Optional[MetricSummary]
     pair_charts: List[PairChart]
+
+
+@dataclass
+class BacktestDefaults:
+    z_entry: Optional[float]
+    z_exit: Optional[float]
+    max_hold: Optional[int]
+    cooldown: Optional[int]
+    p_th: Optional[float]
 
 
 @app.before_request
@@ -200,9 +212,12 @@ def config_wizard() -> str:
 @app.route("/")
 def index() -> str:
     data = build_dashboard()
+    defaults = _load_backtest_defaults()
     return render_template(
         "index.html",
         dashboard=data,
+        backtest_defaults=defaults,
+        backtest_defaults_json=json.dumps(dataclasses.asdict(defaults)),
         charts_json=json.dumps(
             [
                 {
@@ -215,6 +230,62 @@ def index() -> str:
             ]
         ),
     )
+
+
+@app.route("/api/backtest", methods=["POST"])
+def api_backtest() -> Response:
+    run_id, _ = _latest_run()
+    if not run_id:
+        return jsonify({"error": "no_run"}), 404
+    params = _load_manifest_params(run_id)
+    if not params:
+        params = playbook_vecm.parse_args([]).to_dict()
+    payload = request.get_json(silent=True) or {}
+
+    cfg_dict = dict(params)
+    for key in ["z_entry", "z_exit", "max_hold", "cooldown", "p_th"]:
+        if key in payload and payload[key] is not None:
+            if key in {"max_hold", "cooldown"}:
+                coerced = _as_int(payload[key])
+            else:
+                coerced = _as_float(payload[key])
+            if coerced is not None:
+                cfg_dict[key] = coerced
+    cfg = playbook_vecm.PlaybookConfig(**cfg_dict)
+
+    data_frame = playbook_vecm.load_and_validate_data(cfg.input_file)
+    feature_result = playbook_vecm.build_features(
+        cfg.subset,
+        playbook_vecm.FeatureConfig(
+            base_config=cfg,
+            pair=cfg.subset,
+            method=cfg.method,
+            horizon=cfg.horizon,
+            data_frame=data_frame,
+            run_id=run_id,
+        ),
+    )
+    if feature_result.skip_result is not None:
+        return jsonify({"error": "feature_skip", "details": feature_result.skip_result}), 400
+    decision_params = playbook_vecm.DecisionParams(
+        z_entry=cfg.z_entry,
+        z_exit=cfg.z_exit,
+        max_hold=cfg.max_hold,
+        cooldown=cfg.cooldown,
+        p_th=cfg.p_th,
+        run_id=run_id,
+    )
+    result = playbook_vecm.evaluate_rules(feature_result, decision_params)
+    metrics = result.get("metrics", {})
+    summary = {
+        "sharpe_oos": metrics.get("sharpe_oos"),
+        "maxdd": metrics.get("maxdd"),
+        "turnover": metrics.get("turnover"),
+        "turnover_annualised": metrics.get("turnover_annualised"),
+        "n_trades": metrics.get("n_trades"),
+        "cagr": metrics.get("cagr"),
+    }
+    return jsonify(summary)
 
 
 def build_dashboard() -> DashboardData:
@@ -245,6 +316,32 @@ def _latest_run() -> Tuple[Optional[str], Optional[pd.Series]]:
     latest_file = max(candidates, key=lambda path: path.stat().st_mtime)
     run_id = latest_file.stem.replace("metrics_", "")
     return run_id, None
+
+
+def _load_manifest_params(run_id: str) -> Dict[str, Any]:
+    manifest_path = OUT_DIR / "artifacts" / run_id / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    params = payload.get("params", {})
+    return params if isinstance(params, dict) else {}
+
+
+def _load_backtest_defaults() -> BacktestDefaults:
+    run_id, _ = _latest_run()
+    params = _load_manifest_params(run_id) if run_id else {}
+    if not params:
+        params = playbook_vecm.parse_args([]).to_dict()
+    return BacktestDefaults(
+        z_entry=_as_float(params.get("z_entry")),
+        z_exit=_as_float(params.get("z_exit")),
+        max_hold=_as_int(params.get("max_hold")),
+        cooldown=_as_int(params.get("cooldown")),
+        p_th=_as_float(params.get("p_th")),
+    )
 
 
 def _load_metrics(run_id: str) -> Optional[MetricSummary]:
