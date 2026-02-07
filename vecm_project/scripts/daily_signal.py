@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import pathlib
 import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -67,6 +68,11 @@ def _load_config(path: pathlib.Path) -> Tuple[List[Dict[str, Any]], Dict[str, An
             entry_dict = dict(entry)
             pair = entry_dict.pop("pair", entry_dict.pop("subset", None))
             if not pair:
+                ticker_a = entry_dict.pop("tickerA", None)
+                ticker_b = entry_dict.pop("tickerB", None)
+                if ticker_a and ticker_b:
+                    pair = f"{ticker_a},{ticker_b}"
+            if not pair:
                 raise ValueError(f"Pair entry missing 'pair'/'subset': {entry}")
             params = dict(entry_dict.pop("params", {}))
             params.update(entry_dict)
@@ -75,6 +81,13 @@ def _load_config(path: pathlib.Path) -> Tuple[List[Dict[str, Any]], Dict[str, An
         raise ValueError(f"Unsupported pair entry type: {type(entry)}")
 
     return pairs, default_params, persist_artifacts
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() in BOOLEAN_TRUE
 
 
 def _build_config(pair: str, params: Mapping[str, Any]) -> playbook_vecm.PlaybookConfig:
@@ -202,6 +215,13 @@ def _summarize_overlay(execution: playbook_vecm.ExecutionResult) -> Dict[str, Op
 
 
 def run_daily_signals(config_path: pathlib.Path = CONFIG_PATH) -> List[Dict[str, Any]]:
+    if _env_truthy("VECM_AUTO_RETRAIN"):
+        try:
+            from .auto_retrain import run_auto_retraining
+
+            run_auto_retraining(config_path=config_path)
+        except Exception:
+            LOGGER.exception("Auto-retraining job failed; continuing daily signal run")
     pairs, default_params, persist_artifacts = _load_config(config_path)
     timestamp = dt.datetime.utcnow().isoformat()
     results: List[Dict[str, Any]] = []
@@ -233,6 +253,7 @@ def run_daily_signals(config_path: pathlib.Path = CONFIG_PATH) -> List[Dict[str,
                 z_exit=cfg.z_exit,
                 max_hold=cfg.max_hold,
                 cooldown=cfg.cooldown,
+                p_th=cfg.p_th,
                 run_id=run_id,
             )
             result = playbook_vecm.evaluate_rules(feature_result, decision_params)

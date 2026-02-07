@@ -6,8 +6,10 @@ import logging
 import pathlib
 from typing import Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 
 LOGGER = logging.getLogger(__name__)
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -58,16 +60,23 @@ def _robust_zscore_cross_section(df: pd.DataFrame, cap: float = 3.0) -> pd.DataF
     return df.apply(_z, axis=1)
 
 
-def _short_term_cache_paths(cache_dir: pathlib.Path, data_hash: str) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+def _short_term_cache_paths(
+    cache_dir: pathlib.Path, data_hash: str
+) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
     base = cache_dir / f"short_term_{data_hash}"
-    return base.with_suffix(".parquet"), base.with_suffix(".mom12.parquet"), base.with_suffix(".json")
+    return (
+        base.with_suffix(".parquet"),
+        base.with_suffix(".mom12.parquet"),
+        base.with_suffix(".json"),
+        base.with_suffix(".model.joblib"),
+    )
 
 
 def _load_short_term_cache(
     cache_dir: pathlib.Path,
     data_hash: str,
 ) -> Optional[pd.DataFrame]:
-    cache_path, mom12_path, meta_path = _short_term_cache_paths(cache_dir, data_hash)
+    cache_path, mom12_path, meta_path, _ = _short_term_cache_paths(cache_dir, data_hash)
     if not cache_path.exists():
         return None
     try:
@@ -99,7 +108,7 @@ def _save_short_term_cache(
     data_hash: str,
     panel: pd.DataFrame,
 ) -> None:
-    cache_path, mom12_path, meta_path = _short_term_cache_paths(cache_dir, data_hash)
+    cache_path, mom12_path, meta_path, _ = _short_term_cache_paths(cache_dir, data_hash)
     cache_dir.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(cache_path)
     z_mom12 = panel.attrs.get("z_mom12")
@@ -114,15 +123,107 @@ def _save_short_term_cache(
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
 
 
+def _train_or_load_ml_model(
+    *,
+    cache_dir: pathlib.Path,
+    data_hash: str,
+    features: pd.DataFrame,
+    target: pd.Series,
+) -> Optional[RandomForestClassifier]:
+    _, _, _, model_path = _short_term_cache_paths(cache_dir, data_hash)
+    if model_path.exists():
+        try:
+            return joblib.load(model_path)
+        except Exception as exc:
+            LOGGER.warning("Failed to load cached short-term ML model: %s", exc)
+    if features.empty or target.empty:
+        return None
+    aligned = features.join(target.rename("target"), how="inner").dropna()
+    if len(aligned) < 500:
+        LOGGER.info("Skipping ML overlay training; insufficient samples=%d", len(aligned))
+        return None
+    x = aligned[features.columns].to_numpy(dtype=float)
+    y = aligned["target"].to_numpy(dtype=int)
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=6,
+        min_samples_leaf=20,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(x, y)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, model_path)
+    return model
+
+
+def _apply_ml_overlay(
+    *,
+    cache_dir: pathlib.Path,
+    data_hash: str,
+    px: pd.DataFrame,
+    z_mom12: pd.DataFrame,
+    z_mom1: pd.DataFrame,
+    z_rev: pd.DataFrame,
+    z_idio: pd.DataFrame,
+    z_season: pd.DataFrame,
+    score_short: pd.DataFrame,
+    lookahead_days: int = 5,
+) -> pd.DataFrame:
+    future_ret = px.shift(-lookahead_days) / px - 1.0
+    rev_5d = px / px.shift(5) - 1.0
+    target = (future_ret * rev_5d) < 0
+    target = target.where(future_ret.notna() & rev_5d.notna())
+    target = target.stack(dropna=False)
+
+    feature_panel = pd.concat(
+        {
+            "z_mom12": z_mom12.stack(dropna=False),
+            "z_mom1": z_mom1.stack(dropna=False),
+            "z_rev": z_rev.stack(dropna=False),
+            "z_idio": z_idio.stack(dropna=False),
+            "z_season": z_season.stack(dropna=False),
+        },
+        axis=1,
+    )
+    model = _train_or_load_ml_model(
+        cache_dir=cache_dir,
+        data_hash=data_hash,
+        features=feature_panel,
+        target=target.astype(float),
+    )
+    if model is None:
+        LOGGER.info("ML overlay unavailable; using base short-term score")
+        return score_short
+
+    valid_features = feature_panel.dropna()
+    if valid_features.empty:
+        LOGGER.info("ML overlay skipped; no valid feature rows")
+        return score_short
+
+    proba = model.predict_proba(valid_features.to_numpy(dtype=float))[:, 1]
+    prob_series = pd.Series(proba, index=valid_features.index, name="ml_prob")
+    ml_prob = prob_series.unstack().reindex(px.index)
+    ml_prob = ml_prob.reindex(columns=score_short.columns)
+    ml_score = _robust_zscore_cross_section(ml_prob)
+    blended = (score_short + ml_score) / 2.0
+    blended.attrs["ml_prob"] = ml_prob
+    blended.attrs["ml_score"] = ml_score
+    return blended
+
+
 def build_short_term_signals(
     price_panel: pd.DataFrame,
     market_col: str,
     *,
+    data_hash: Optional[str] = None,
+    cache_dir: Optional[pathlib.Path] = None,
     lookback_mom_1m: int = 21,
     lookback_rev_5d: int = 5,
     lookback_vol_1m: int = 21,
     lookback_mom_12m: int = 252,
     skip_1m: int = 21,
+    ml_lookahead_days: int = 5,
 ) -> pd.DataFrame:
     """
     Bangun sinyal jangka pendek + 12M momentum ala factor investing dari panel harga.
@@ -227,6 +328,21 @@ def build_short_term_signals(
     out.columns = eq_cols
     out = out.astype(float)
 
+    if data_hash:
+        cache_root = cache_dir or SHORT_TERM_CACHE_DIR
+        out = _apply_ml_overlay(
+            cache_dir=cache_root,
+            data_hash=data_hash,
+            px=px,
+            z_mom12=z_mom12.astype(float),
+            z_mom1=z_mom1.astype(float),
+            z_rev=z_rev.astype(float),
+            z_idio=z_idio.astype(float),
+            z_season=z_season.astype(float),
+            score_short=out,
+            lookahead_days=ml_lookahead_days,
+        )
+
     # Simpan z-score 12M momentum di attrs, supaya bisa diambil kalau perlu
     out.attrs["z_mom12"] = z_mom12.astype(float)
 
@@ -254,6 +370,8 @@ def build_short_term_overlay(
     built = build_short_term_signals(
         price_panel,
         market_col,
+        data_hash=data_hash,
+        cache_dir=cache_root,
         lookback_mom_1m=lookback_mom_1m,
         lookback_rev_5d=lookback_rev_5d,
         lookback_vol_1m=lookback_vol_1m,

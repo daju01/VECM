@@ -611,6 +611,61 @@ def _maybe_attach_market_index(df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
+def _load_macro_tickers() -> List[str]:
+    ticker_path = BASE_DIR / "config" / "ticker_groups.json"
+    if not ticker_path.exists():
+        return []
+    try:
+        payload = json.loads(ticker_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning("Failed to read macro tickers: %s", exc)
+        return []
+    if not isinstance(payload, dict):
+        return []
+    macro = payload.get("macro_tickers", [])
+    if not isinstance(macro, list):
+        return []
+    return [str(ticker) for ticker in macro if ticker]
+
+
+def _build_macro_exog(price_panel: pd.DataFrame, target_index: pd.Index) -> Optional[pd.DataFrame]:
+    macro_tickers = _load_macro_tickers()
+    if not macro_tickers:
+        return None
+
+    df = price_panel.copy()
+    if "date" not in df.columns:
+        df = df.reset_index().rename(columns={df.index.name or "index": "date"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df = df.sort_values("date")
+
+    available_cols = [c for c in macro_tickers if c in df.columns]
+    missing = [c for c in macro_tickers if c not in df.columns]
+    if missing:
+        LOGGER.info("Fetching missing macro tickers: %s", ", ".join(missing))
+        fetched = _safe_ensure_price_cache(tickers=missing, force_refresh=False)
+        if not fetched.empty and "date" in fetched.columns:
+            fetched["date"] = pd.to_datetime(fetched["date"], errors="coerce")
+            fetched = fetched.dropna(subset=["date"]).sort_values("date")
+            df = df.merge(fetched[["date", *[c for c in missing if c in fetched.columns]]], on="date", how="left")
+            available_cols = [c for c in macro_tickers if c in df.columns]
+
+    if not available_cols:
+        LOGGER.warning("Macro exogenous series unavailable; skipping exog integration")
+        return None
+
+    macro_df = df[["date", *available_cols]].copy()
+    macro_df = macro_df.set_index("date").sort_index()
+    macro_df = macro_df.reindex(target_index).ffill().bfill()
+    macro_df = macro_df.replace([np.inf, -np.inf], np.nan)
+    macro_df = macro_df.dropna(how="all")
+    if macro_df.empty:
+        LOGGER.warning("Macro exogenous series empty after alignment")
+        return None
+    return np.log(macro_df.astype(float))
+
+
 def preprocess_data(
     df: pd.DataFrame, cfg: PlaybookConfig
 ) -> Tuple[pd.DataFrame, List[str], Dict[str, float]]:
@@ -721,14 +776,37 @@ def preprocess_data(
 # ---------------------------------------------------------------------------
 # Pair selection -------------------------------------------------------------
 # ---------------------------------------------------------------------------
-def _johansen_beta(log_prices: pd.DataFrame) -> float:
+def _align_exog(
+    log_prices: pd.DataFrame,
+    exog: Optional[pd.DataFrame],
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    if exog is None or exog.empty:
+        return log_prices, None
+    exog_aligned = exog.reindex(log_prices.index).ffill().bfill()
+    combined = pd.concat([log_prices, exog_aligned], axis=1).replace([np.inf, -np.inf], np.nan)
+    combined = combined.dropna()
+    if combined.empty:
+        LOGGER.warning("Exog alignment produced empty panel; proceeding without exogenous inputs")
+        return log_prices, None
+    log_aligned = combined[log_prices.columns]
+    exog_aligned = combined[exog_aligned.columns]
+    return log_aligned, exog_aligned
+
+
+def _johansen_beta(log_prices: pd.DataFrame, exog: Optional[pd.DataFrame] = None) -> float:
+    if len(log_prices) < 120:
+        return float("nan")
+    log_prices, exog = _align_exog(log_prices, exog)
     if len(log_prices) < 120:
         return float("nan")
     vecm_kwargs = {"k_ar_diff": 1, "deterministic": "ci"}
     try:
-        vecm = VECM(log_prices, coint_rank=1, **vecm_kwargs)
+        vecm = VECM(log_prices, coint_rank=1, exog=exog, **vecm_kwargs)
     except TypeError:
-        vecm = VECM(log_prices, rank=1, **vecm_kwargs)
+        try:
+            vecm = VECM(log_prices, rank=1, exog=exog, **vecm_kwargs)
+        except TypeError:
+            vecm = VECM(log_prices, rank=1, **vecm_kwargs)
     result = vecm.fit()
     beta = result.beta[:, 0]
     if len(beta) != 2 or not np.all(np.isfinite(beta)):
@@ -776,6 +854,8 @@ def select_pair(
     df: pd.DataFrame,
     cfg: PlaybookConfig,
     outlier_ratios: Optional[Mapping[str, float]] = None,
+    *,
+    macro_exog: Optional[pd.DataFrame] = None,
 ) -> Tuple[str, str, float]:
     tickers = list(df.columns)
     max_ratio = float(cfg.outlier_max_ratio)
@@ -786,7 +866,7 @@ def select_pair(
                 "Pair rejected due to extreme-value ratio exceeding threshold "
                 f"({max_ratio:.2%})."
             )
-        beta = _johansen_beta(np.log(df.iloc[:, :2]))
+        beta = _johansen_beta(np.log(df.iloc[:, :2]), exog=macro_exog)
         lp = np.log(df.iloc[:, :2].dropna())
         obs = len(lp)
         if obs < 120:
@@ -801,7 +881,7 @@ def select_pair(
                 pair=f"{tickers[0]}~{tickers[1]}",
                 observations=obs,
             )
-        beta = _johansen_beta(lp)
+        beta = _johansen_beta(lp, exog=macro_exog)
         if not np.isfinite(beta):
             beta = 1.0
         return tickers[0], tickers[1], beta
@@ -833,7 +913,7 @@ def select_pair(
             )
             skipped_obs += 1
             continue
-        beta = _johansen_beta(lp)
+        beta = _johansen_beta(lp, exog=macro_exog)
         if not np.isfinite(beta):
             beta = _eg_beta(lp)
         if not np.isfinite(beta):
@@ -1311,6 +1391,7 @@ def _apply_decision_params(
         max_hold=int(decision_params.max_hold),
         cooldown=int(decision_params.cooldown),
         z_stop=float(max(decision_params.z_entry or 0.0, decision_params.z_exit)),
+        p_th=decision_params.p_th if decision_params.p_th is not None else cfg.p_th,
     )
     if updated_cfg.z_entry is not None:
         if not np.isfinite(updated_cfg.z_entry) or updated_cfg.z_entry <= 0:
@@ -1390,8 +1471,11 @@ def build_features(
     else:
         df_clean, _, outlier_ratios = preprocess_data(df, cfg)
         _write_panel_cache(panel_path, df_clean, panel_meta_path, {"outlier_ratios": outlier_ratios})
+    macro_exog = feature_config.macro_exog
+    if macro_exog is None:
+        macro_exog = _build_macro_exog(df, df_clean.index)
     try:
-        selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios)
+        selected_l, selected_r, beta0 = select_pair(df_clean, cfg, outlier_ratios, macro_exog=macro_exog)
     except PairSelectionError as exc:
         LOGGER.warning("Pair selection failed: %s", exc)
         result = _build_invalid_result(
@@ -1753,6 +1837,7 @@ def run_playbook(
         z_exit=cfg.z_exit,
         max_hold=cfg.max_hold,
         cooldown=cfg.cooldown,
+        p_th=cfg.p_th,
         run_id=run_id,
     )
     result = evaluate_rules(feature_result, decision_params)
