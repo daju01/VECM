@@ -133,6 +133,26 @@
               <span class="badge text-bg-secondary" id="whatif-status">Idle</span>
             </div>
 
+            <div class="row g-3 mt-2 align-items-end">
+              <div class="col-12 col-md-7 col-lg-8">
+                <label class="form-label" for="pair-selector">Pair</label>
+                <select id="pair-selector" class="form-select">
+                  {% if whatif_pairs %}
+                    {% for option in whatif_pairs %}
+                    <option value="{{ option.value }}" {% if backtest_defaults.pair == option.value %}selected{% endif %}>
+                      {{ option.label }}
+                    </option>
+                    {% endfor %}
+                  {% else %}
+                    <option value="">No pair available</option>
+                  {% endif %}
+                </select>
+              </div>
+              <div class="col-12 col-md-5 col-lg-4">
+                <button id="run-whatif" class="btn btn-primary w-100">Run What-If Analysis</button>
+              </div>
+            </div>
+
             <div class="row g-3 mt-2">
               <div class="col-12 col-md-6">
                 <label class="form-label">p_th</label>
@@ -276,11 +296,11 @@
       });
 
       const sliderConfigs = {
-        p_th: { min: 0.4, max: 0.9, step: 0.01, value: backtestDefaults.p_th ?? 0.5 },
+        p_th: { min: 0.5, max: 0.95, step: 0.01, value: backtestDefaults.p_th ?? 0.5 },
         z_entry: { min: 0.5, max: 2.5, step: 0.05, value: backtestDefaults.z_entry ?? 1.5 },
         z_exit: { min: 0.2, max: 1.5, step: 0.05, value: backtestDefaults.z_exit ?? 0.55 },
-        max_hold: { min: 2, max: 20, step: 1, value: backtestDefaults.max_hold ?? 8 },
-        cooldown: { min: 0, max: 10, step: 1, value: backtestDefaults.cooldown ?? 1 },
+        max_hold: { min: 1, max: 60, step: 1, value: backtestDefaults.max_hold ?? 8 },
+        cooldown: { min: 0, max: 30, step: 1, value: backtestDefaults.cooldown ?? 1 },
       };
 
       function initSlider(key, sliderId, valueId) {
@@ -314,10 +334,18 @@
       };
 
       const statusBadge = document.getElementById("whatif-status");
-      let pendingTimer;
+      const pairSelector = document.getElementById("pair-selector");
+      const runWhatifButton = document.getElementById("run-whatif");
+
+      function setStatus(text, styleClass) {
+        if (!statusBadge) return;
+        statusBadge.textContent = text;
+        statusBadge.className = `badge ${styleClass}`;
+      }
 
       function gatherPayload() {
         return {
+          pair: pairSelector?.value || backtestDefaults.pair || null,
           p_th: Number(sliders.p_th?.noUiSlider.get()),
           z_entry: Number(sliders.z_entry?.noUiSlider.get()),
           z_exit: Number(sliders.z_exit?.noUiSlider.get()),
@@ -326,50 +354,64 @@
         };
       }
 
+      function formatNumber(value, decimals) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return "-";
+        return parsed.toFixed(decimals);
+      }
+
       function updateMetrics(data) {
-        document.getElementById("whatif-sharpe").textContent = data.sharpe_oos ?? "-";
-        document.getElementById("whatif-maxdd").textContent = data.maxdd ?? "-";
-        document.getElementById("whatif-turnover").textContent = data.turnover ?? "-";
-        document.getElementById("whatif-turnover-ann").textContent = data.turnover_annualised ?? "-";
-        document.getElementById("whatif-trades").textContent = data.n_trades ?? "-";
-        document.getElementById("whatif-cagr").textContent = data.cagr ?? "-";
+        document.getElementById("whatif-sharpe").textContent = formatNumber(data.sharpe_oos, 3);
+        document.getElementById("whatif-maxdd").textContent = formatNumber(data.maxdd, 4);
+        document.getElementById("whatif-turnover").textContent = formatNumber(data.turnover, 3);
+        document.getElementById("whatif-turnover-ann").textContent = formatNumber(data.turnover_annualised, 3);
+        document.getElementById("whatif-trades").textContent = data.trades ?? data.n_trades ?? "-";
+        document.getElementById("whatif-cagr").textContent = formatNumber(data.cagr, 4);
       }
 
-      function triggerBacktest() {
-        if (!statusBadge) return;
-        statusBadge.textContent = "Updating...";
-        statusBadge.className = "badge text-bg-warning";
-        fetch("/api/backtest", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(gatherPayload()),
-        })
-          .then((response) => response.json())
-          .then((data) => {
-            if (data.error) {
-              statusBadge.textContent = "Error";
-              statusBadge.className = "badge text-bg-danger";
-              return;
-            }
-            updateMetrics(data);
-            statusBadge.textContent = "Updated";
-            statusBadge.className = "badge text-bg-success";
-          })
-          .catch(() => {
-            statusBadge.textContent = "Error";
-            statusBadge.className = "badge text-bg-danger";
+      async function triggerBacktest() {
+        if (!pairSelector?.value) {
+          setStatus("No Pair", "text-bg-danger");
+          return;
+        }
+        setStatus("Updating...", "text-bg-warning");
+        try {
+          const response = await fetch("/api/whatif", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(gatherPayload()),
           });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok || data.error) {
+            if (response.status === 429) {
+              setStatus("Rate Limited", "text-bg-danger");
+            } else {
+              setStatus("Error", "text-bg-danger");
+            }
+            return;
+          }
+          updateMetrics(data);
+          setStatus("Updated", "text-bg-success");
+        } catch {
+          setStatus("Error", "text-bg-danger");
+        }
       }
 
-      function scheduleBacktest() {
-        clearTimeout(pendingTimer);
-        pendingTimer = setTimeout(triggerBacktest, 500);
+      if (runWhatifButton) {
+        runWhatifButton.addEventListener("click", triggerBacktest);
+      }
+      if (pairSelector) {
+        pairSelector.addEventListener("change", () => setStatus("Idle", "text-bg-secondary"));
       }
 
       Object.values(sliders).forEach((slider) => {
         if (!slider) return;
-        slider.noUiSlider.on("change", scheduleBacktest);
+        slider.noUiSlider.on("change", () => setStatus("Idle", "text-bg-secondary"));
       });
+
+      if (pairSelector?.value) {
+        triggerBacktest();
+      }
     </script>
   </body>
 </html>

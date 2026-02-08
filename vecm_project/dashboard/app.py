@@ -6,15 +6,23 @@ import datetime as dt
 import importlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from flask import Flask, Response, jsonify, render_template, request
 
 from vecm_project.scripts import playbook_vecm
+
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+except ImportError:  # pragma: no cover - optional dependency fallback
+    Limiter = None
+    get_remote_address = None
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -44,7 +52,29 @@ def _require_basic_auth() -> Optional[Response]:
 
 
 app = Flask(__name__)
+app.config.setdefault(
+    "RATELIMIT_STORAGE_URI",
+    os.getenv("RATELIMIT_STORAGE_URI", "memory://"),
+)
 _PROM_METRICS = None
+_WHATIF_FEATURE_CACHE: Dict[str, playbook_vecm.FeatureBuildResult] = {}
+if Limiter is not None and get_remote_address is not None:
+    _LIMITER = Limiter(
+        key_func=get_remote_address,
+        default_limits=["200 per day", "50 per hour"],
+    )
+    _LIMITER.init_app(app)
+else:
+    _LIMITER = None
+
+
+def _with_rate_limit(limit: str) -> Callable[[Callable[..., Response]], Callable[..., Response]]:
+    def _decorator(fn: Callable[..., Response]) -> Callable[..., Response]:
+        if _LIMITER is None:
+            return fn
+        return _LIMITER.limit(limit)(fn)
+
+    return _decorator
 
 
 def _ensure_prom_metrics() -> Optional[Dict[str, Any]]:
@@ -107,6 +137,7 @@ class BacktestDefaults:
     max_hold: Optional[int]
     cooldown: Optional[int]
     p_th: Optional[float]
+    pair: Optional[str]
 
 
 @app.before_request
@@ -146,6 +177,64 @@ def _load_ticker_groups() -> Dict[str, List[str]]:
     if not isinstance(payload, dict):
         return {}
     return {key: value for key, value in payload.items() if isinstance(value, list)}
+
+
+def _normalise_pair(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        tokens = [str(token).strip() for token in value if str(token).strip()]
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        compact = raw.replace(" ", "")
+        if "~" in compact:
+            tokens = [token for token in compact.split("~") if token]
+        else:
+            tokens = [token for token in compact.split(",") if token]
+    if len(tokens) != 2:
+        return None
+    return f"{tokens[0]},{tokens[1]}"
+
+
+def _pair_label(pair_value: str) -> str:
+    lhs, rhs = pair_value.split(",", 1)
+    return f"{lhs} ~ {rhs}"
+
+
+def _load_whatif_pair_options(default_pair: Optional[str]) -> List[Dict[str, str]]:
+    options: List[Dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(raw_value: Any) -> None:
+        pair_value = _normalise_pair(raw_value)
+        if pair_value is None or pair_value in seen:
+            return
+        seen.add(pair_value)
+        options.append({"value": pair_value, "label": _pair_label(pair_value)})
+
+    _add(default_pair)
+    if RUN_MANIFEST.exists():
+        manifest = pd.read_csv(RUN_MANIFEST)
+        for column in ("subset", "pair"):
+            if column not in manifest.columns:
+                continue
+            for raw_value in manifest[column].dropna().tolist():
+                _add(raw_value)
+                if len(options) >= 24:
+                    return options
+    return options
+
+
+def _latest_backtest_context() -> Tuple[Optional[str], Optional[pd.Series], Dict[str, Any]]:
+    run_id, manifest_row = _latest_run()
+    if not run_id:
+        return None, manifest_row, {}
+    params = _load_manifest_params(run_id)
+    if not params:
+        params = playbook_vecm.parse_args([]).to_dict()
+    return run_id, manifest_row, dict(params)
 
 
 @app.route("/healthz")
@@ -213,11 +302,13 @@ def config_wizard() -> str:
 def index() -> str:
     data = build_dashboard()
     defaults = _load_backtest_defaults()
+    whatif_pairs = _load_whatif_pair_options(defaults.pair)
     return render_template(
         "index.html",
         dashboard=data,
         backtest_defaults=defaults,
         backtest_defaults_json=json.dumps(dataclasses.asdict(defaults)),
+        whatif_pairs=whatif_pairs,
         charts_json=json.dumps(
             [
                 {
@@ -232,27 +323,92 @@ def index() -> str:
     )
 
 
-@app.route("/api/backtest", methods=["POST"])
-def api_backtest() -> Response:
-    run_id, _ = _latest_run()
-    if not run_id:
-        return jsonify({"error": "no_run"}), 404
-    params = _load_manifest_params(run_id)
-    if not params:
-        params = playbook_vecm.parse_args([]).to_dict()
-    payload = request.get_json(silent=True) or {}
+def _json_error(error: str, status: int, **extra: Any) -> Response:
+    payload: Dict[str, Any] = {"error": error}
+    payload.update(extra)
+    response = jsonify(payload)
+    response.status_code = status
+    return response
 
-    cfg_dict = dict(params)
-    for key in ["z_entry", "z_exit", "max_hold", "cooldown", "p_th"]:
-        if key in payload and payload[key] is not None:
-            if key in {"max_hold", "cooldown"}:
-                coerced = _as_int(payload[key])
-            else:
-                coerced = _as_float(payload[key])
-            if coerced is not None:
-                cfg_dict[key] = coerced
-    cfg = playbook_vecm.PlaybookConfig(**cfg_dict)
 
+def _coerce_bounded_float(name: str, value: Any, low: float, high: float) -> float:
+    parsed = _as_float(value)
+    if parsed is None:
+        raise ValueError(f"{name} must be numeric")
+    if parsed < low or parsed > high:
+        raise ValueError(f"{name} must be between {low} and {high}")
+    return float(parsed)
+
+
+def _coerce_bounded_int(name: str, value: Any, low: int, high: int) -> int:
+    parsed = _as_int(value)
+    if parsed is None:
+        raise ValueError(f"{name} must be integer")
+    if parsed < low or parsed > high:
+        raise ValueError(f"{name} must be between {low} and {high}")
+    return int(parsed)
+
+
+def _build_whatif_decision_params(
+    payload: Dict[str, Any],
+    base_cfg: playbook_vecm.PlaybookConfig,
+) -> playbook_vecm.DecisionParams:
+    z_entry_default = base_cfg.z_entry if base_cfg.z_entry is not None else 1.5
+    z_exit_default = base_cfg.z_exit
+    max_hold_default = base_cfg.max_hold
+    cooldown_default = base_cfg.cooldown
+    p_th_default = base_cfg.p_th
+    return playbook_vecm.DecisionParams(
+        z_entry=_coerce_bounded_float(
+            "z_entry",
+            payload.get("z_entry", z_entry_default),
+            low=0.50,
+            high=2.50,
+        ),
+        z_exit=_coerce_bounded_float(
+            "z_exit",
+            payload.get("z_exit", z_exit_default),
+            low=0.20,
+            high=1.50,
+        ),
+        max_hold=_coerce_bounded_int(
+            "max_hold",
+            payload.get("max_hold", max_hold_default),
+            low=1,
+            high=60,
+        ),
+        cooldown=_coerce_bounded_int(
+            "cooldown",
+            payload.get("cooldown", cooldown_default),
+            low=0,
+            high=30,
+        ),
+        p_th=_coerce_bounded_float(
+            "p_th",
+            payload.get("p_th", p_th_default),
+            low=0.50,
+            high=0.95,
+        ),
+        run_id=f"whatif_{int(time.time())}",
+    )
+
+
+def _whatif_feature_cache_key(run_id: str, cfg: playbook_vecm.PlaybookConfig) -> str:
+    cfg_payload = cfg.to_dict()
+    for key in ("z_entry", "z_exit", "z_stop", "max_hold", "cooldown", "p_th"):
+        cfg_payload.pop(key, None)
+    cfg_payload["run_id"] = run_id
+    return json.dumps(cfg_payload, sort_keys=True, default=str)
+
+
+def _load_whatif_features(
+    run_id: str,
+    cfg: playbook_vecm.PlaybookConfig,
+) -> playbook_vecm.FeatureBuildResult:
+    cache_key = _whatif_feature_cache_key(run_id, cfg)
+    cached = _WHATIF_FEATURE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     data_frame = playbook_vecm.load_and_validate_data(cfg.input_file)
     feature_result = playbook_vecm.build_features(
         cfg.subset,
@@ -262,30 +418,80 @@ def api_backtest() -> Response:
             method=cfg.method,
             horizon=cfg.horizon,
             data_frame=data_frame,
-            run_id=run_id,
+            run_id=f"{run_id}_whatif",
         ),
     )
-    if feature_result.skip_result is not None:
-        return jsonify({"error": "feature_skip", "details": feature_result.skip_result}), 400
-    decision_params = playbook_vecm.DecisionParams(
-        z_entry=cfg.z_entry,
-        z_exit=cfg.z_exit,
-        max_hold=cfg.max_hold,
-        cooldown=cfg.cooldown,
-        p_th=cfg.p_th,
-        run_id=run_id,
+    _WHATIF_FEATURE_CACHE[cache_key] = feature_result
+    return feature_result
+
+
+def _run_whatif(payload: Dict[str, Any]) -> Response:
+    run_id, manifest_row, params = _latest_backtest_context()
+    if not run_id:
+        return _json_error("no_run", 404)
+
+    default_pair = _normalise_pair(params.get("subset"))
+    if default_pair is None and manifest_row is not None:
+        default_pair = _normalise_pair(manifest_row.get("pair"))
+    requested_pair = _normalise_pair(
+        payload.get("pair") or payload.get("subset") or payload.get("universe")
     )
+    pair_value = requested_pair or default_pair
+    if pair_value is None:
+        return _json_error(
+            "invalid_pair",
+            400,
+            details="Pair wajib dalam format 'AAA,BBB' atau 'AAA~BBB'.",
+        )
+
+    cfg_dict = dict(params)
+    cfg_dict["subset"] = pair_value
+    cfg = playbook_vecm.PlaybookConfig(**cfg_dict)
+    try:
+        decision_params = _build_whatif_decision_params(payload, cfg)
+    except ValueError as exc:
+        return _json_error("invalid_payload", 400, details=str(exc))
+
+    feature_result = _load_whatif_features(run_id, cfg)
+    if feature_result.skip_result is not None:
+        skip_result = feature_result.skip_result
+        details = skip_result.get("status") or skip_result.get("metrics", {}).get("skip_reason")
+        return _json_error("feature_skip", 400, pair=pair_value, details=details)
+
     result = playbook_vecm.evaluate_rules(feature_result, decision_params)
     metrics = result.get("metrics", {})
+    execution = result.get("execution")
+    trades_count = _as_int(metrics.get("n_trades")) or 0
+    if execution is not None and hasattr(execution, "trades"):
+        trades_frame = getattr(execution, "trades")
+        if isinstance(trades_frame, pd.DataFrame):
+            trades_count = int(trades_frame.shape[0])
     summary = {
-        "sharpe_oos": metrics.get("sharpe_oos"),
-        "maxdd": metrics.get("maxdd"),
-        "turnover": metrics.get("turnover"),
-        "turnover_annualised": metrics.get("turnover_annualised"),
-        "n_trades": metrics.get("n_trades"),
-        "cagr": metrics.get("cagr"),
+        "pair": pair_value,
+        "run_id": run_id,
+        "sharpe_oos": _as_float(metrics.get("sharpe_oos")),
+        "maxdd": _as_float(metrics.get("maxdd")),
+        "turnover": _as_float(metrics.get("turnover")),
+        "turnover_annualised": _as_float(metrics.get("turnover_annualised")),
+        "cagr": _as_float(metrics.get("cagr")),
+        "n_trades": int(trades_count),
+        "trades": int(trades_count),
     }
     return jsonify(summary)
+
+
+@app.route("/api/whatif", methods=["POST"])
+@_with_rate_limit("10 per minute")
+def api_whatif() -> Response:
+    payload = request.get_json(silent=True) or {}
+    return _run_whatif(payload)
+
+
+@app.route("/api/backtest", methods=["POST"])
+@_with_rate_limit("10 per minute")
+def api_backtest() -> Response:
+    payload = request.get_json(silent=True) or {}
+    return _run_whatif(payload)
 
 
 def build_dashboard() -> DashboardData:
@@ -331,16 +537,19 @@ def _load_manifest_params(run_id: str) -> Dict[str, Any]:
 
 
 def _load_backtest_defaults() -> BacktestDefaults:
-    run_id, _ = _latest_run()
-    params = _load_manifest_params(run_id) if run_id else {}
+    _, manifest_row, params = _latest_backtest_context()
     if not params:
         params = playbook_vecm.parse_args([]).to_dict()
+    pair_value = _normalise_pair(params.get("subset"))
+    if pair_value is None and manifest_row is not None:
+        pair_value = _normalise_pair(manifest_row.get("pair"))
     return BacktestDefaults(
         z_entry=_as_float(params.get("z_entry")),
         z_exit=_as_float(params.get("z_exit")),
         max_hold=_as_int(params.get("max_hold")),
         cooldown=_as_int(params.get("cooldown")),
         p_th=_as_float(params.get("p_th")),
+        pair=pair_value,
     )
 
 

@@ -40,7 +40,7 @@ BO_BOUNDS: Dict[str, Bound] = {
     "z_exit": Bound(0.2, 1.0),
     "max_hold": Bound(2, 15, is_int=True),
     "cooldown": Bound(0, 10, is_int=True),
-    "p_th": Bound(0.45, 0.85),
+    "p_th": Bound(0.50, 0.95),
 }
 
 
@@ -72,6 +72,23 @@ def _resolve_input_file(base_cfg: Mapping[str, Any]) -> str:
     return default_cfg.input_file
 
 
+def _resolve_turnover_lambda() -> float:
+    lambda_str = os.getenv("STAGE2_LAMBDA_TURNOVER", "0.01")
+    try:
+        return float(lambda_str)
+    except ValueError:
+        return 0.01
+
+
+def _resolve_min_trades() -> int:
+    min_trades_str = os.getenv("STAGE2_MIN_TRADES", "5")
+    try:
+        min_trades = int(min_trades_str)
+    except ValueError:
+        min_trades = 5
+    return max(0, min_trades)
+
+
 def score_rules(
     *,
     feature_result: Any,
@@ -86,14 +103,16 @@ def score_rules(
     sharpe = float(metrics.get("sharpe_oos", 0.0))
     turnover = float(metrics.get("turnover", 0.0))
     turnover_ann = float(metrics.get("turnover_annualised", turnover))
-
-    lambda_str = os.getenv("STAGE2_LAMBDA_TURNOVER", "0.01")
-    try:
-        lambda_turnover = float(lambda_str)
-    except ValueError:
-        lambda_turnover = 0.01
+    n_trades = int(metrics.get("n_trades", 0) or 0)
+    min_trades = _resolve_min_trades()
+    lambda_turnover = _resolve_turnover_lambda()
 
     score = sharpe - lambda_turnover * turnover_ann
+    min_trades_penalty = 0.0
+    valid_trial = n_trades >= min_trades
+    if not valid_trial:
+        min_trades_penalty = 1_000_000.0 + float(min_trades - n_trades)
+        score -= min_trades_penalty
 
     diagnostics = {
         "Score": float(score),
@@ -102,6 +121,10 @@ def score_rules(
         "maxdd": float(metrics.get("maxdd", 0.0)),
         "turnover": turnover,
         "turnover_annualised": turnover_ann,
+        "n_trades": float(n_trades),
+        "min_trades_required": float(min_trades),
+        "min_trades_penalty": float(min_trades_penalty),
+        "valid_trial": float(1.0 if valid_trial else 0.0),
         "alpha_ec": float(metrics.get("alpha_ec", math.nan)),
         "half_life_full": float(metrics.get("half_life_full", math.nan)),
     }
@@ -205,13 +228,16 @@ def run_bo(
         }
         trial.set_user_attr("record", record)
         LOGGER.info(
-            "BO trial=%s Score=%.4f sharpe=%.4f maxdd=%.4f turnover=%.4f t_ann=%.4f",
+            "BO trial=%s Score=%.4f sharpe=%.4f maxdd=%.4f turnover=%.4f t_ann=%.4f trades=%d p_th=%.3f valid=%s",
             trial.number,
             diagnostics["Score"],
             diagnostics["sharpe_oos"],
             diagnostics["maxdd"],
             diagnostics["turnover"],
             diagnostics["turnover_annualised"],
+            int(diagnostics["n_trades"]),
+            float(params["p_th"]),
+            bool(int(diagnostics["valid_trial"])),
         )
         return diagnostics["Score"]
 
