@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from dataclasses import dataclass
 import datetime as dt
 import json
 import logging
