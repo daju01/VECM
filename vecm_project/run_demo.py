@@ -75,7 +75,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.refresh:
         LOGGER.info("Refreshing Yahoo price data into %s", DATA_PATH)
-        ensure_price_data(DATA_PATH)
+        ensure_price_data(force_refresh=True)
 
     # Load panel harga (adj_close_data.csv) – dipakai oleh playbook, short-term
     # overlay, dan gating regime spread.

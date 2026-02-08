@@ -17,7 +17,7 @@ class DummyStudy:
     best_trial = DummyTrial()
 
 
-def test_run_demo_smoke(monkeypatch) -> None:
+def _patch_run_demo_dependencies(monkeypatch) -> None:
     monkeypatch.setattr(run_demo, "ensure_price_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         run_demo,
@@ -34,4 +34,22 @@ def test_run_demo_smoke(monkeypatch) -> None:
         type("StorageStub", (), {"managed_storage": lambda *_args, **_kwargs: contextlib.nullcontext()}),
     )
 
+
+def test_run_demo_smoke(monkeypatch) -> None:
+    _patch_run_demo_dependencies(monkeypatch)
     run_demo.main(["--pair", "AAA,BBB", "--iters", "1", "--n-init", "1"])
+
+
+def test_run_demo_refresh_forces_price_refresh(monkeypatch) -> None:
+    calls = {"kwargs": None}
+
+    def _capture_refresh(*_args, **kwargs):
+        calls["kwargs"] = kwargs
+
+    _patch_run_demo_dependencies(monkeypatch)
+    monkeypatch.setattr(run_demo, "ensure_price_data", _capture_refresh)
+
+    run_demo.main(["--pair", "AAA,BBB", "--iters", "1", "--n-init", "1", "--refresh"])
+
+    assert calls["kwargs"] is not None
+    assert calls["kwargs"].get("force_refresh") is True

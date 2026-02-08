@@ -110,7 +110,12 @@ def _save_short_term_cache(
 ) -> None:
     cache_path, mom12_path, meta_path, _ = _short_term_cache_paths(cache_dir, data_hash)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    panel.to_parquet(cache_path)
+
+    # Do not persist DataFrame attrs directly: parquet metadata must be JSON-serializable.
+    panel_to_store = panel.copy()
+    panel_to_store.attrs = {}
+    panel_to_store.to_parquet(cache_path)
+
     z_mom12 = panel.attrs.get("z_mom12")
     if isinstance(z_mom12, pd.DataFrame):
         z_mom12.to_parquet(mom12_path)
