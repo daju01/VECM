@@ -7,16 +7,20 @@ from __future__ import annotations
 
 import argparse
 import logging
+import pathlib
 import sys
 import uuid
 from typing import Sequence
 
-from scripts import storage
-from scripts.dashboard_aggregator import dashboard_aggregate
-from scripts.data_streaming import DATA_PATH, ensure_price_data, load_cached_prices
-from scripts.pareto import write_pareto_front
-from scripts.playbook_api import playbook_score_once
-from scripts.stage2_bo import run_bo
+if __package__ in (None, ""):
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from vecm_project.scripts import storage
+from vecm_project.scripts.dashboard_aggregator import dashboard_aggregate
+from vecm_project.scripts.data_streaming import DATA_PATH, ensure_price_data, load_cached_prices
+from vecm_project.scripts.pareto import write_pareto_front
+from vecm_project.scripts.playbook_api import playbook_score_once
+from vecm_project.scripts.stage2_bo import run_bo
 
 LOGGER = logging.getLogger(__name__)
 
