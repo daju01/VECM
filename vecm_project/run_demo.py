@@ -88,6 +88,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_id = f"demo-{uuid.uuid4().hex[:8]}"
     base_params = {
         "input_file": str(DATA_PATH),
+        "subset": args.pair,
         "method": args.method,
         "horizon": args.horizon,
         "stage": 2,

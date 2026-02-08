@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -177,7 +177,7 @@ class RunnerConfig:
     min_obs: int
     use_momentum: bool
     subsets: List[str]
-    grid_config: GridConfig
+    grid_config: GridConfig = field(default_factory=GridConfig)
 
 
 @dataclass

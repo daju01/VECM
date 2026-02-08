@@ -114,8 +114,47 @@ def _extract_converged(result: Any) -> bool:
         return False
     retvals = getattr(result, "mle_retvals", None)
     if isinstance(retvals, Mapping):
-        return bool(retvals.get("converged", False))
-    return bool(getattr(result, "converged", False))
+        if "converged" in retvals:
+            return bool(retvals.get("converged"))
+        return True
+    converged = getattr(result, "converged", None)
+    if converged is None:
+        return True
+    return bool(converged)
+
+
+def _fit_markov_with_compat(
+    model: Any,
+    *,
+    maxiter: int,
+    tol: Optional[float],
+    start_params: Optional[np.ndarray],
+) -> Any:
+    kwargs: Dict[str, Any] = {"maxiter": maxiter, "disp": False}
+    if tol is not None:
+        kwargs["tol"] = tol
+    if start_params is not None:
+        kwargs["start_params"] = start_params
+
+    removed: set[str] = set()
+    while True:
+        try:
+            return model.fit(**kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument 'tol'" in message and "tol" in kwargs and "tol" not in removed:
+                removed.add("tol")
+                kwargs.pop("tol", None)
+                continue
+            if (
+                "unexpected keyword argument 'start_params'" in message
+                and "start_params" in kwargs
+                and "start_params" not in removed
+            ):
+                removed.add("start_params")
+                kwargs.pop("start_params", None)
+                continue
+            raise
 
 
 def fit_ms_spread(
@@ -204,16 +243,21 @@ def fit_ms_spread(
         switching_variance=True,
     )
     start_params = _load_warm_start(cache_key_value)
-    if start_params is not None and start_params.size != mod.k_params:
+    model_k_params = getattr(mod, "k_params", None)
+    if (
+        start_params is not None
+        and isinstance(model_k_params, (int, np.integer))
+        and start_params.size != int(model_k_params)
+    ):
         start_params = None
 
     res = None
     fit_error: Optional[str] = None
     for attempt, iter_limit in enumerate([resolved_max_iter, max(resolved_max_iter * 2, resolved_max_iter + 50)]):
         try:
-            res = mod.fit(
+            res = _fit_markov_with_compat(
+                model=mod,
                 maxiter=iter_limit,
-                disp=False,
                 tol=resolved_tol,
                 start_params=start_params,
             )
@@ -255,7 +299,8 @@ def fit_ms_spread(
         else:
             sigma2_vals.append(np.nan)
 
-    regime_mr = int(np.nanargmin(sigma2_vals)) if np.isfinite(np.nanmin(sigma2_vals)) else 0
+    sigma2_arr = np.asarray(sigma2_vals, dtype=float)
+    regime_mr = int(np.nanargmin(sigma2_arr)) if np.isfinite(sigma2_arr).any() else 0
 
     try:
         probs = res.filtered_marginal_probabilities

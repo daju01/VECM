@@ -711,7 +711,8 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         LOGGER.warning("Failed to download %s: %s", ticker, exc)
         _circuit_record_failure()
         return _offline_prices_for(ticker, start, end)
-    if history.empty or "Adj Close" not in history.columns:
+    frame = _history_to_tidy_frame(history, ticker)
+    if frame.empty:
         LOGGER.warning("No adjusted close data returned for %s", ticker)
         _circuit_record_failure()
         fallback = _offline_prices_for(ticker, start, end)
@@ -719,9 +720,50 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
             return fallback
         return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
     _circuit_record_success()
-    frame = history.reset_index()[["Date", "Adj Close"]].rename(columns={"Adj Close": "AdjClose"})
-    frame["Ticker"] = ticker
     return frame
+
+
+def _history_to_tidy_frame(history: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if history is None or history.empty:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+
+    price_series: Optional[pd.Series] = None
+    for field in ("Adj Close", "Close"):
+        if isinstance(history.columns, pd.MultiIndex):
+            level0 = history.columns.get_level_values(0)
+            if field not in level0:
+                continue
+            field_frame = history.xs(field, axis=1, level=0)
+            if isinstance(field_frame, pd.Series):
+                price_series = field_frame
+            elif ticker in field_frame.columns:
+                price_series = field_frame[ticker]
+            elif len(field_frame.columns):
+                price_series = field_frame.iloc[:, 0]
+            else:
+                price_series = None
+            if price_series is not None:
+                break
+        else:
+            if field in history.columns:
+                series = history[field]
+                if isinstance(series, pd.DataFrame):
+                    price_series = series.iloc[:, 0]
+                else:
+                    price_series = series
+                break
+
+    if price_series is None:
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+
+    frame = price_series.to_frame(name="AdjClose").reset_index()
+    date_col = frame.columns[0]
+    frame = frame.rename(columns={date_col: "Date"})
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame["AdjClose"] = pd.to_numeric(frame["AdjClose"], errors="coerce")
+    frame["Ticker"] = ticker
+    frame = frame.dropna(subset=["Date", "AdjClose"])
+    return frame[["Date", "Ticker", "AdjClose"]]
 
 
 def _download_with_retry(

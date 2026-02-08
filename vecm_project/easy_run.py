@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
+import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from vecm_project.scripts import playbook_vecm
 
