@@ -18,24 +18,25 @@ A Python toolkit for stock market price analysis using Vector Error Correction M
 2. **Unduh dan validasi data harga pertama kali.**
    Jalankan demo end-to-end sesaat setelah instalasi:
    ```bash
-   python vecm_project/run_demo.py
+   python vecm_project/run_demo.py --refresh
    ```
-   Skrip akan memanggil `ensure_price_data()` dari
-   [`vecm_project/scripts/data_streaming.py`](vecm_project/scripts/data_streaming.py) sehingga file cache
-   `adj_close_data.csv` dibuat/di-update otomatis dengan minimal dua ticker dan
-   kolom tanggal tervalidasi. Jika cache rusak, fungsi tersebut mengunduh ulang
-   harga penutupan disesuaikan dari Yahoo Finance sebelum analisis dimulai.
+   Gunakan flag `--refresh` agar skrip memanggil
+   `ensure_price_data(force_refresh=True)` dari
+   [`vecm_project/scripts/data_streaming.py`](vecm_project/scripts/data_streaming.py)
+   sebelum proses demo dimulai. Tanpa flag ini, `run_demo.py` hanya memuat cache
+   lokal `adj_close_data.csv` melalui `load_cached_prices`.
 
 3. **Konfirmasi storage DuckDB.**
    [`run_demo.py`](vecm_project/run_demo.py) menggunakan konteks `managed_storage()` untuk memanggil
    `storage_init`, membuat seluruh tabel dan indeks yang dibutuhkan agar metrik,
    artefak model, dan log optimisasi tersimpan konsisten untuk audit berikutnya.
 
-4. **Pastikan artefak pipeline dipersistenkan.**
-   Jalankan demo hingga selesai sehingga fungsi `persist_artifacts` menyimpan
-   posisi, return, trade, metrik, manifest, dan catatan model ke filesystem dan
-   DuckDB. Keluaran terstruktur inilah yang diperlukan untuk verifikasi ulang
-   Sharpe/Drawdown serta audit performa.
+4. **Pastikan output demo dipahami dengan benar.**
+   Jalankan demo hingga selesai untuk menghasilkan metrik single-pass, hasil
+   Stage-2 Bayesian optimisation, Pareto front, dan ringkasan dashboard.
+   Catatan penting: `run_demo.py` memakai `playbook_score_once(..., persist=False)`,
+   jadi artefak penuh (`returns/positions/trades/manifest`) tidak otomatis
+   dipersist dari jalur ini.
 
 ## Quickstart (Beginner)
 
@@ -65,8 +66,8 @@ ANTM,INCO, LONG, 0.71, 8.0, -1.92, 0.88, 2025-02-07T03:00:00Z
 
 Output akan tersimpan di:
 
-- `vecm_project/outputs/daily/daily_signal_<timestamp>.json`
-- `vecm_project/outputs/daily/daily_signal_<timestamp>.csv`
+- `vecm_project/outputs/daily/daily_signal_<YYYYMMDD>.json`
+- `vecm_project/outputs/daily/daily_signal_<YYYYMMDD>.csv`
 
 ## Docker (pipeline + dashboard)
 
@@ -88,18 +89,20 @@ dan agregasi dashboard dapat dijalankan di container.
 
 ### Volume penting
 
-`docker-compose.yml` sudah menambahkan bind mount untuk:
+`docker-compose.yml` saat ini menambahkan bind mount untuk:
 
-* `./vecm_project/out` → `/app/vecm_project/out` (output + DuckDB di `out/db`).
-* `./vecm_project/config` → `/app/vecm_project/config` (konfigurasi ticker).
+* `./vecm_project/out` -> `/app/vecm_project/out` (output dashboard + DuckDB di `out/db`).
+* `./vecm_project/config` -> `/app/vecm_project/config` (konfigurasi ticker).
 
-Dengan volume ini, output/duckdb dan konfigurasi tetap tersimpan di host dan
-tidak hilang saat container dimatikan.
+Catatan: artefak playbook (`returns_<run_id>.csv`, `positions_<run_id>.csv`)
+ditulis ke `vecm_project/out_ms/`. Jika folder ini ingin persisten dari
+container ke host, tambahkan volume
+`./vecm_project/out_ms:/app/vecm_project/out_ms` di `docker-compose.yml`.
 
 ## Operational Checklist
 
 Sebelum menjalankan eksperimen lanjutan, pastikan empat pilar berikut sudah
-dipenuhi—ini menjawab pertanyaan _“apakah Anda sudah melakukan ini?”_ yang
+dipenuhi. Ini menjawab pertanyaan "apakah Anda sudah melakukan ini?" yang
 sering muncul saat men-deploy playbook:
 
 1. **Kualitas data harga.** Pastikan `ensure_price_data()` dijalankan sampai
@@ -107,11 +110,13 @@ sering muncul saat men-deploy playbook:
    lebih, tanggal tervalidasi, serta duplikat tersaring.
 2. **Konsistensi storage.** Gunakan konteks `managed_storage()` agar
    `storage_init` menyiapkan tabel DuckDB sebelum metrik dicatat.
-3. **Pipeline menyeluruh.** Biarkan `run_demo.main()` mengeksekusi skor cepat,
-   playbook penuh, hook ekspor, Bayesian optimisation, successive halving, dan
-   penulisan Pareto/dashboard.
-4. **Artefak lengkap.** Pastikan `persist=True` sehingga artefak dan metrik
-   terekam untuk audit maupun analisis lanjutan.
+3. **Pipeline demo.** `run_demo.main()` mengeksekusi skor cepat
+   (`playbook_score_once`), lalu Stage-2 Bayesian optimisation (`run_bo`),
+   kemudian menulis Pareto front dan ringkasan dashboard.
+4. **Artefak lengkap.** Untuk artefak lengkap per-run
+   (`returns/positions/trades/manifest`), gunakan jalur yang memanggil
+   `persist_artifacts` secara eksplisit (misalnya `daily_signal.py` saat
+   `persist_artifacts=true`).
 
 ## Troubleshooting (Top 5)
 
@@ -283,29 +288,20 @@ pembaruan data harga terlepas dari keberadaan cache lokal.
 
 ## Runtime Controls
 
-Pipeline demo menjalankan rangkaian penuh: skor cepat, playbook utama dengan
-`persist=True`, hook ekspor, optimisasi Bayesian (`run_bo`), successive halving,
-hingga penulisan front Pareto dan ringkasan dashboard. Seluruh keluaran yang
-terstruktur—posisi, return, trades, manifest, metrik—dibuat secara otomatis
-melalui `persist_artifacts` sehingga presisi Sharpe/Drawdown dan histori run
-dapat diverifikasi ulang.
+`run_demo.py` saat ini menjalankan alur berikut:
 
-Penerjemahan Python ini tetap memakai default konservatif sehingga satu kali
-demo selesai dalam ±1 jam di laptop. Anda dapat menyesuaikan beban kerja melalui
-variabel lingkungan:
+* Single-pass scoring via `playbook_score_once` (menggunakan `pipeline(..., persist=False)`).
+* Stage-2 Bayesian optimisation via `run_bo`.
+* Penulisan Pareto front dan ringkasan dashboard untuk `run_id` BO.
 
-* ``VECM_MAX_GRID`` membatasi jumlah job yang dibuat ``parallel_run``
-  (default ``48``). Naikkan nilainya jika ingin menyapu grid Stage-1 lebih luas.
-* ``run_bo`` menjalankan 16 trial secara baku (4 inisiasi + 12 langkah TPE) dan
-  membatasi pekerja paralel pada empat core logis. Ganti ``n_init`` atau
-  ``iters`` bila Anda memerlukan eksplorasi Bayesian lebih dalam.
-* ``run_successive_halving`` mengevaluasi hingga 12 trial pada horizon
-  ``("short", "long")`` sambil membatasi paralelisme ke empat pekerja. Tambah
-  ``n_trials`` atau beri tuple ``horizons`` kustom untuk pass yang lebih ekstensif.
+Jadi, komponen seperti successive halving dan ekspor artefak penuh bukan bagian
+dari jalur default `run_demo.py` saat ini.
 
-Default ini menjaga optimisasi tetap responsif, tetapi seluruh data dan artefak
-tetap lengkap sehingga dapat dianalisis lebih lanjut ketika Anda memperluas
-pencarian parameter.
+Kontrol beban kerja utama:
+
+* `--n-init` mengatur jumlah initial points BO (default `4`).
+* `--iters` mengatur jumlah iterasi TPE tambahan (default `12`).
+* `--refresh` memaksa refresh data harga dari Yahoo sebelum demo.
 
 ## Regime-Aware Pairs Trading & Short-Term Overlay
 
@@ -316,8 +312,8 @@ klasik. Ada tiga layer tambahan yang aktif secara default:
 
    - Untuk setiap pair, playbook mengestimasi hubungan jangka panjang
      (cointegration + error-correction) dan menghitung:
-       - `alpha_ec` – speed of adjustment dari error-correction,
-       - `half_life_full` – estimasi half-life konvergensi spread.
+       - `alpha_ec` - speed of adjustment dari error-correction,
+       - `half_life_full` - estimasi half-life konvergensi spread.
    - Pada tahap prefilter (`parallel_run`), pair dengan half-life terlalu besar
      atau tidak cukup mean-reverting akan dibuang terlebih dahulu, sehingga grid
      Stage-1/Stage-2 hanya diisi pair yang memang cenderung kembali ke
@@ -344,13 +340,13 @@ klasik. Ada tiga layer tambahan yang aktif secara default:
        - idiosyncratic volatility 1 bulan vs indeks pasar,
        - seasonality bulanan (efek bulan dalam setahun).
    - Setiap sinyal diubah menjadi robust cross-sectional z-score yang
-     di-cap pada ±3 dan dirata-ratakan menjadi `score_short`.
+     di-cap pada +/-3 dan dirata-ratakan menjadi `score_short`.
    - Untuk setiap pasangan (A,B), pipeline menghitung
      `delta_score = score_short_A - score_short_B` dan hanya mengizinkan entry
      jika arah `delta_score` konsisten dengan arah mispricing spread:
-       - kalau `z_t > 0` (A relatif mahal vs B) → butuh `delta_score > 0`
+       - kalau `z_t > 0` (A relatif mahal vs B) -> butuh `delta_score > 0`
          (A kelihatan "lebih jelek" secara sinyal jangka pendek),
-       - kalau `z_t < 0` → butuh `delta_score < 0`.
+       - kalau `z_t < 0` -> butuh `delta_score < 0`.
 
 Hasilnya, trade hanya muncul ketika:
 **spread mispricing + hubungan pair masih MR + sinyal jangka pendek setuju.**
@@ -397,13 +393,13 @@ Beberapa parameter penting yang bisa diutak-atik:
       * `PLAYBOOK_FEE_SELL`.
   * Stage-2 BO dan SH menggunakan objective berbasis:
 
-    > `Score = sharpe_oos – λ × turnover_annualised`
+    > `Score = sharpe_oos - lambda x turnover_annualised`
 
-    di mana λ dikontrol oleh environment:
+    di mana `lambda` dikontrol oleh environment:
 
     * `STAGE2_LAMBDA_TURNOVER` (default `"0.01"`).
 
-    Semakin besar λ, semakin kuat penalti untuk strategi dengan
+    Semakin besar `lambda`, semakin kuat penalti untuk strategi dengan
     `turnover_annualised` tinggi (lebih cocok untuk market ber-biaya tinggi
     seperti IDX).
 
@@ -444,7 +440,7 @@ Secara garis besar:
   seperti Berkin & Swedroe (2017) menunjukkan bahwa momentum adalah salah
   satu faktor dengan Sharpe ratio tertinggi dan termasuk dalam delapan
   faktor yang benar-benar lolos kriteria ketat (persistent, pervasive,
-  robust, investable, intuitive). :contentReference[oaicite:0]{index=0}
+  robust, investable, intuitive).
 
 - **Filter faktor jangka panjang (value, quality, profitability).**
   Di atas sinyal harga, modul faktor opsional menambahkan layer screening:
@@ -452,10 +448,10 @@ Secara garis besar:
   - buang saham dengan kualitas akuntansi / profitabilitas yang sangat
     buruk,
   - dan, jika diaktifkan, memberi bobot lebih besar untuk pasangan di mana
-    mispricing harga konsisten dengan “fundamental spread”. Temuan CFA
+    mispricing harga konsisten dengan "fundamental spread". Temuan CFA
     Institute dan ringkasan practitioner seperti NEPC menegaskan bahwa
     kombinasi value, quality, dan profitability adalah faktor yang robust
-    untuk portofolio jangka panjang. :contentReference[oaicite:1]{index=1}
+    untuk portofolio jangka panjang.
 
 - **Penalty turnover & biaya transaksi.** Objective optimasi Stage-2 tidak
   lagi hanya memaksimalkan Sharpe, tetapi juga memasukkan penalty terhadap
@@ -475,14 +471,14 @@ Pipeline bisa dijalankan dalam dua mode besar:
 
 - **Factor-aware mode.**
   - Aktifkan modul berikut lewat flag / environment variable:
-    - `ENABLE_MS_REGIME=1` → gunakan gating Markov-switching di spread.
-    - `ENABLE_SHORT_TERM_OVERLAY=1` → gunakan sinyal jangka pendek
+    - `ENABLE_MS_REGIME=1` -> gunakan gating Markov-switching di spread.
+    - `ENABLE_SHORT_TERM_OVERLAY=1` -> gunakan sinyal jangka pendek
       (1M momentum, reversal, dll).
-    - `ENABLE_FACTOR_OVERLAY=1` → aktifkan filter value/quality/profitability.
+    - `ENABLE_FACTOR_OVERLAY=1` -> aktifkan filter value/quality/profitability.
   - Pada mode ini, sinyal trade hanya muncul ketika:
     1. Spread jauh dari equilibrium (z-score melewati threshold),
-    2. Probabilitas regime mean-reverting tinggi (`p_regime ≥ p_threshold`),
-    3. Overlay sinyal jangka pendek dan faktor fundamental “setuju” dengan
+    2. Probabilitas regime mean-reverting tinggi (`p_regime >= p_threshold`),
+    3. Overlay sinyal jangka pendek dan faktor fundamental "setuju" dengan
        arah trade yang diusulkan.
 
 Dashboard menyimpan ringkasan metrik factor-aware per `run_id`, termasuk
