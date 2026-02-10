@@ -1,12 +1,16 @@
 {
+  "data_hash": "a11b8eed454200889bad21c75e57b79f13ee62a2aaa41b4526ac22a0d9ceab17",
   "tickers": {
     "AMMN.JK": {
       "last_attempt": "2024-01-08T00:00:00",
       "last_refresh": "2099-01-01"
     },
     "ANTM.JK": {
-      "last_attempt": "2024-01-08T00:00:00",
-      "last_refresh": "2099-01-01"
+      "data_hash": "f2b55e4b06ebc858ebd810e636d962606a940ad41bb00ada0d505fd9c194dd77",
+      "last_attempt": "2026-02-10T15:18:58.259295",
+      "last_date": "2026-02-06",
+      "last_refresh": "2026-02-10T15:18:58.259295",
+      "rows": 3276
     },
     "BBCA.JK": {
       "last_attempt": "2025-11-14T14:31:44.241640",
@@ -32,9 +36,26 @@
       "last_attempt": "2024-01-08T00:00:00",
       "last_refresh": "2099-01-01"
     },
+    "TLKM.JK": {
+      "data_hash": "48ac1dac91eff82a25d04649b27c9bfda9d2046b8d1ac84561b153313bc4eaa3",
+      "last_attempt": "2026-02-10T15:18:58.276379",
+      "last_date": "2026-02-10",
+      "last_refresh": "2026-02-10T15:18:58.276379",
+      "rows": 3225
+    },
+    "USDIDR=X": {
+      "data_hash": "30bb28d5427847b68783717eee67f812a93d67092b147e83fc07c621f6cc6aa1",
+      "last_attempt": "2026-02-10T15:18:58.292215",
+      "last_date": "2026-02-08",
+      "last_refresh": "2026-02-10T15:18:58.292215",
+      "rows": 3411
+    },
     "^JKSE": {
-      "failures": 1,
-      "last_attempt": "2025-11-23T15:35:10.609322"
+      "data_hash": "137bbaf7f16b4234b51e384a4c7f0221d480f0d1e01beca75a77c3665146ff3f",
+      "last_attempt": "2026-02-10T15:18:58.309224",
+      "last_date": "2026-02-06",
+      "last_refresh": "2026-02-10T15:18:58.309224",
+      "rows": 3172
     }
   }
 }

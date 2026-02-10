@@ -43,6 +43,18 @@ def _coerce_value(value: Any) -> Any:
     return value
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(coerced):
+        return None
+    return coerced
+
+
 def _load_config(path: pathlib.Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any], bool]:
     if not path.exists():
         raise FileNotFoundError(f"daily pairs config not found at {path}")

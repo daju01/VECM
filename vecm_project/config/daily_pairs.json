@@ -1,20 +1,22 @@
 {
+  "persist_artifacts": true,
+  "default_params": {
+    "method": "TVECM",
+    "long_only": false,
+    "short_filter": false,
+    "gate_enforce": false,
+    "p_th": 0.7232230565077221
+  },
   "pairs": [
     {
-      "tickerA": "AAPL",
-      "tickerB": "MSFT",
-      "z_entry": 2.0,
-      "z_stop": 3.0,
-      "max_hold": 5,
-      "cooldown": 2
-    },
-    {
-      "tickerA": "GOOGL",
-      "tickerB": "META",
-      "z_entry": 2.2,
-      "z_stop": 3.2,
-      "max_hold": 7,
-      "cooldown": 3
+      "pair": "ANTM.JK,TLKM.JK",
+      "params": {
+        "z_entry": 0.6806557148329586,
+        "z_exit": 0.25381627876857044,
+        "z_stop": 0.8,
+        "max_hold": 14,
+        "cooldown": 4
+      }
     }
   ]
 }
