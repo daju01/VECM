@@ -120,6 +120,45 @@
         </div>
       </div>
 
+      <div class="row g-3 mt-3">
+        <div class="col-12">
+          <div class="card shadow-sm border-info">
+            <div class="card-body">
+              <h2 class="h6 mb-2">Penjelasan Untuk Pemula</h2>
+              <p class="mb-1">{{ beginner_explain.headline }}</p>
+              <p class="mb-1 text-muted">{{ beginner_explain.signal_summary }}</p>
+              <p class="mb-2">{{ beginner_explain.one_year_projection }}</p>
+              <p class="small text-muted mb-3">{{ beginner_explain.caveat }}</p>
+
+              <div class="table-responsive">
+                <table class="table table-sm align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>Metrik</th>
+                      <th>Nilai</th>
+                      <th>Arti Sederhana</th>
+                      <th>Status Saat Ini</th>
+                      <th>Implikasi Praktis</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for item in beginner_explain.metric_items %}
+                    <tr>
+                      <td>{{ item.name }}</td>
+                      <td><strong>{{ item.value }}</strong></td>
+                      <td>{{ item.meaning }}</td>
+                      <td>{{ item.status }}</td>
+                      <td>{{ item.implication }}</td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="mt-4">
         <div class="card shadow-sm mb-4">
           <div class="card-body">

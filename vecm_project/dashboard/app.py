@@ -140,6 +140,24 @@ class BacktestDefaults:
     pair: Optional[str]
 
 
+@dataclass
+class BeginnerMetricExplain:
+    name: str
+    value: str
+    meaning: str
+    status: str
+    implication: str
+
+
+@dataclass
+class BeginnerExplain:
+    headline: str
+    signal_summary: str
+    one_year_projection: str
+    caveat: str
+    metric_items: List[BeginnerMetricExplain]
+
+
 @app.before_request
 def _basic_auth_guard() -> Optional[Response]:
     if request.endpoint in {"healthz"}:
@@ -302,11 +320,13 @@ def config_wizard() -> str:
 def index() -> str:
     data = build_dashboard()
     defaults = _load_backtest_defaults()
+    beginner_explain = _build_beginner_explain(data.metrics, data.latest_signal)
     whatif_pairs = _load_whatif_pair_options(defaults.pair)
     return render_template(
         "index.html",
         dashboard=data,
         backtest_defaults=defaults,
+        beginner_explain=beginner_explain,
         backtest_defaults_json=json.dumps(dataclasses.asdict(defaults)),
         whatif_pairs=whatif_pairs,
         charts_json=json.dumps(
@@ -691,6 +711,207 @@ def _as_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _fmt_float(value: Optional[float], digits: int = 4) -> str:
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value:.{digits}f}"
+
+
+def _fmt_percent(value: Optional[float], digits: int = 2) -> str:
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value * 100:.{digits}f}%"
+
+
+def _describe_signal(position: Optional[float]) -> str:
+    if position is None or not np.isfinite(position):
+        return "Posisi belum tersedia."
+    if position > 0:
+        return "Sinyal saat ini: LONG spread (long saham kiri, short saham kanan)."
+    if position < 0:
+        return "Sinyal saat ini: SHORT spread (short saham kiri, long saham kanan)."
+    return "Sinyal saat ini: FLAT/HOLD (tidak ada posisi baru)."
+
+
+def _metric_item_sharpe(sharpe: Optional[float]) -> BeginnerMetricExplain:
+    value = _fmt_float(sharpe, 3)
+    meaning = "Seberapa besar imbal hasil dibanding risiko volatilitas (lebih tinggi biasanya lebih baik)."
+    if sharpe is None or not np.isfinite(sharpe):
+        status = "Belum ada data"
+        implication = "Belum bisa menilai konsistensi return strategi."
+    elif sharpe < 0:
+        status = "Kurang baik"
+        implication = "Historisnya return belum sepadan dengan risiko. Perlu hati-hati."
+    elif sharpe < 1:
+        status = "Cukup"
+        implication = "Ada potensi, tapi margin keunggulannya masih tipis."
+    elif sharpe < 2:
+        status = "Baik"
+        implication = "Risk-adjusted return relatif sehat pada data historis."
+    else:
+        status = "Sangat baik"
+        implication = "Risk-adjusted return sangat kuat pada data historis."
+    return BeginnerMetricExplain(
+        name="Sharpe Ratio (OOS)",
+        value=value,
+        meaning=meaning,
+        status=status,
+        implication=implication,
+    )
+
+
+def _metric_item_drawdown(maxdd: Optional[float]) -> BeginnerMetricExplain:
+    drawdown_pct = abs(maxdd) if maxdd is not None and np.isfinite(maxdd) else None
+    value = _fmt_percent(drawdown_pct, 2)
+    meaning = "Penurunan terbesar dari puncak ke lembah nilai portofolio selama periode uji."
+    if drawdown_pct is None:
+        status = "Belum ada data"
+        implication = "Belum bisa memperkirakan seberapa dalam kerugian sementara."
+    elif drawdown_pct <= 0.05:
+        status = "Rendah"
+        implication = "Fluktuasi turun historis relatif kecil."
+    elif drawdown_pct <= 0.15:
+        status = "Menengah"
+        implication = "Masih wajar untuk strategi aktif, tetapi tetap perlu batas risiko."
+    else:
+        status = "Tinggi"
+        implication = "Potensi penurunan historis cukup dalam."
+    return BeginnerMetricExplain(
+        name="Max Drawdown",
+        value=value,
+        meaning=meaning,
+        status=status,
+        implication=implication,
+    )
+
+
+def _metric_item_trades(n_trades: Optional[int]) -> BeginnerMetricExplain:
+    value = "N/A" if n_trades is None else str(n_trades)
+    meaning = "Jumlah transaksi pada periode uji (semakin banyak, strategi makin aktif)."
+    if n_trades is None:
+        status = "Belum ada data"
+        implication = "Belum terlihat gaya trading strateginya."
+    elif n_trades < 5:
+        status = "Sangat sedikit"
+        implication = "Sinyal jarang muncul; hasil bisa kurang stabil."
+    elif n_trades < 15:
+        status = "Sedang"
+        implication = "Frekuensi transaksi cukup untuk evaluasi awal."
+    else:
+        status = "Aktif"
+        implication = "Transaksi sering; perlu perhatikan biaya dan disiplin eksekusi."
+    return BeginnerMetricExplain(
+        name="Jumlah Trade",
+        value=value,
+        meaning=meaning,
+        status=status,
+        implication=implication,
+    )
+
+
+def _metric_item_turnover(turnover_ann: Optional[float]) -> BeginnerMetricExplain:
+    value = _fmt_float(turnover_ann, 2)
+    meaning = "Perkiraan frekuensi pergantian posisi dalam setahun."
+    if turnover_ann is None or not np.isfinite(turnover_ann):
+        status = "Belum ada data"
+        implication = "Belum bisa mengukur intensitas aktivitas strategi."
+    elif turnover_ann < 5:
+        status = "Rendah"
+        implication = "Aktivitas relatif santai, biaya transaksi cenderung lebih ringan."
+    elif turnover_ann < 12:
+        status = "Menengah"
+        implication = "Aktif secukupnya, biaya transaksi tetap perlu dipantau."
+    else:
+        status = "Tinggi"
+        implication = "Sangat aktif; biaya/slippage bisa lebih berpengaruh."
+    return BeginnerMetricExplain(
+        name="Turnover Annualised",
+        value=value,
+        meaning=meaning,
+        status=status,
+        implication=implication,
+    )
+
+
+def _metric_item_cagr(cagr: Optional[float]) -> BeginnerMetricExplain:
+    value = _fmt_percent(cagr, 2)
+    meaning = "Perkiraan pertumbuhan tahunan majemuk dari hasil backtest."
+    if cagr is None or not np.isfinite(cagr):
+        status = "Belum ada data"
+        implication = "Belum bisa memperkirakan laju pertumbuhan tahunan."
+    elif cagr < 0:
+        status = "Negatif"
+        implication = "Backtest menunjukkan modal cenderung turun."
+    elif cagr < 0.1:
+        status = "Rendah"
+        implication = "Ada pertumbuhan, tetapi belum agresif."
+    else:
+        status = "Positif"
+        implication = "Backtest menunjukkan pertumbuhan tahunan yang sehat."
+    return BeginnerMetricExplain(
+        name="CAGR",
+        value=value,
+        meaning=meaning,
+        status=status,
+        implication=implication,
+    )
+
+
+def _build_beginner_explain(
+    metrics: Optional[MetricSummary],
+    latest_signal: Optional[LatestSignal],
+) -> BeginnerExplain:
+    sharpe = metrics.sharpe_oos if metrics else None
+    maxdd = metrics.maxdd if metrics else None
+    n_trades = metrics.n_trades if metrics else None
+    turnover_ann = metrics.turnover_annualised if metrics else None
+    cagr = metrics.cagr if metrics else None
+
+    signal_summary = _describe_signal(latest_signal.position if latest_signal else None)
+
+    if sharpe is None or not np.isfinite(sharpe):
+        headline = "Data belum cukup untuk menilai kualitas strategi."
+    elif sharpe < 0:
+        headline = "Secara historis, strategi ini masih cenderung merugi relatif terhadap risikonya."
+    elif sharpe < 1:
+        headline = "Strategi berada di zona netral: ada potensi, tetapi belum kuat."
+    else:
+        headline = "Secara historis, strategi menunjukkan kualitas risk-return yang cukup baik."
+
+    modal_awal = 10_000_000.0
+    if cagr is None or not np.isfinite(cagr):
+        projection = "Simulasi 1 tahun belum tersedia karena nilai CAGR tidak ada."
+    else:
+        modal_akhir = modal_awal * (1.0 + cagr)
+        modal_akhir = max(modal_akhir, 0.0)
+        projection = (
+            f"Simulasi sederhana: jika modal awal Rp10.000.000 dan CAGR historis "
+            f"{_fmt_percent(cagr, 2)}, estimasi menjadi sekitar Rp{modal_akhir:,.0f} "
+            f"dalam 1 tahun."
+        )
+
+    caveat = (
+        "Catatan penting: ini hasil backtest historis, bukan jaminan hasil masa depan "
+        "dan bukan nasihat keuangan."
+    )
+
+    metric_items = [
+        _metric_item_sharpe(sharpe),
+        _metric_item_drawdown(maxdd),
+        _metric_item_trades(n_trades),
+        _metric_item_turnover(turnover_ann),
+        _metric_item_cagr(cagr),
+    ]
+
+    return BeginnerExplain(
+        headline=headline,
+        signal_summary=signal_summary,
+        one_year_projection=projection,
+        caveat=caveat,
+        metric_items=metric_items,
+    )
 
 
 if __name__ == "__main__":
