@@ -1126,10 +1126,13 @@ def execute_trades(
     w2 = np.abs(beta_vals) / weights
     pos = np.zeros(len(lp_pair))
     cost = np.zeros(len(lp_pair))
+    ret_core_vals = np.zeros(len(lp_pair))
     trades: List[Dict[str, object]] = []
     open_idx: Optional[int] = None
     open_side = 0
     trade_pnl = 0.0
+    trade_gross_pnl = 0.0
+    trade_total_cost = 0.0
     trade_days = 0
     for i in range(len(lp_pair)):
         prev = pos[i - 1] if i > 0 else 0
@@ -1141,12 +1144,16 @@ def execute_trades(
                 open_idx = i
                 open_side = 1
                 trade_pnl = 0.0
+                trade_gross_pnl = 0.0
+                trade_total_cost = 0.0
                 trade_days = 0
             elif enter_short:
                 pos[i] = -1
                 open_idx = i
                 open_side = -1
                 trade_pnl = 0.0
+                trade_gross_pnl = 0.0
+                trade_total_cost = 0.0
                 trade_days = 0
             else:
                 pos[i] = 0
@@ -1184,17 +1191,33 @@ def execute_trades(
             pnl_core = -w1[i] * r1.iloc[i] + w2[i] * r2.iloc[i]
         else:
             pnl_core = 0.0
-        pnl_net = pnl_core - cost[i]
+        ret_core_vals[i] = pnl_core
         if open_idx is not None:
-            trade_pnl += pnl_net
+            trade_gross_pnl += pnl_core
+            trade_total_cost += cost[i]
+            trade_pnl = trade_gross_pnl - trade_total_cost
         if open_idx is not None and pos[i] == 0:
+            holding_days = i - open_idx + 1
+            if cfg.debug:
+                LOGGER.debug(
+                    "Trade closed | side=%s open_idx=%d close_idx=%d gross=%.6f cost=%.6f net=%.6f",
+                    "LONG" if open_side > 0 else "SHORT",
+                    open_idx,
+                    i,
+                    trade_gross_pnl,
+                    trade_total_cost,
+                    trade_pnl,
+                )
             trades.append(
                 {
                     "open_index": open_idx,
                     "close_index": i,
                     "side": "LONG" if open_side > 0 else "SHORT",
                     "days": trade_days,
+                    "holding_days": holding_days,
                     "pnl": trade_pnl,
+                    "gross_pnl": trade_gross_pnl,
+                    "total_cost": trade_total_cost,
                     "open_date": lp_pair.index[open_idx],
                     "close_date": lp_pair.index[i],
                 }
@@ -1202,17 +1225,11 @@ def execute_trades(
             open_idx = None
             open_side = 0
             trade_pnl = 0.0
+            trade_gross_pnl = 0.0
+            trade_total_cost = 0.0
             trade_days = 0
     pos_series = pd.Series(pos, index=lp_pair.index, name="pos")
     cost_series = pd.Series(cost, index=lp_pair.index, name="cost")
-    ret_core_vals = []
-    for i, position in enumerate(pos):
-        if position > 0:
-            ret_core_vals.append(w1[i] * r1.iloc[i] - w2[i] * r2.iloc[i])
-        elif position < 0:
-            ret_core_vals.append(-w1[i] * r1.iloc[i] + w2[i] * r2.iloc[i])
-        else:
-            ret_core_vals.append(0.0)
     ret_core = pd.Series(ret_core_vals, index=lp_pair.index, name="ret_core")
     ret_net = ret_core - cost_series
     ret_net.name = "ret"
