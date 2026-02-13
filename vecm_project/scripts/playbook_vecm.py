@@ -139,6 +139,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--z_exit", type=float, default=0.55)
     parser.add_argument("--z_stop", type=float, default=0.8)
     parser.add_argument("--max_hold", type=int, default=8)
+    parser.add_argument("--min_hold", type=int, default=0)
+    parser.add_argument("--dynamic_hold", type=int, default=0)
+    parser.add_argument("--dynamic_hold_max_add", type=int, default=0)
+    parser.add_argument("--dynamic_hold_step", type=float, default=0.5)
     parser.add_argument("--cooldown", type=int, default=1)
     parser.add_argument("--z_auto_method", default="mfpt")
     parser.add_argument("--z_auto", type=float, default=0.7)
@@ -200,6 +204,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         z_exit=float(args.z_exit),
         z_stop=float(args.z_stop),
         max_hold=int(args.max_hold),
+        min_hold=max(0, int(args.min_hold)),
+        dynamic_hold=bool(args.dynamic_hold),
+        dynamic_hold_max_add=max(0, int(args.dynamic_hold_max_add)),
+        dynamic_hold_step=max(float(args.dynamic_hold_step), 1e-6),
         cooldown=int(args.cooldown),
         z_auto_method=args.z_auto_method.lower(),
         z_auto_q=float(args.z_auto),
@@ -1150,6 +1158,23 @@ def execute_trades(
     trade_gross_pnl = 0.0
     trade_total_cost = 0.0
     trade_days = 0
+    trade_max_hold = max(1, int(cfg.max_hold))
+
+    def _resolve_trade_max_hold(entry_abs_z: float) -> int:
+        base_hold = max(1, int(cfg.max_hold))
+        if not cfg.dynamic_hold or cfg.dynamic_hold_max_add <= 0:
+            return base_hold
+        if not np.isfinite(entry_abs_z):
+            return base_hold
+        if cfg.z_entry is not None and np.isfinite(cfg.z_entry) and cfg.z_entry > 0:
+            z_ref = float(cfg.z_entry)
+        else:
+            z_ref = max(float(cfg.z_exit), 1e-6)
+        strength = max(0.0, float(entry_abs_z) - z_ref)
+        extra_days = int(np.floor(strength / max(float(cfg.dynamic_hold_step), 1e-6)))
+        extra_days = max(0, min(extra_days, int(cfg.dynamic_hold_max_add)))
+        return int(base_hold + extra_days)
+
     for i in range(len(lp_pair)):
         prev = pos[i - 1] if i > 0 else 0
         enter_long = bool(signals.iloc[i]["long"] > 0)
@@ -1163,6 +1188,8 @@ def execute_trades(
                 trade_gross_pnl = 0.0
                 trade_total_cost = 0.0
                 trade_days = 0
+                entry_z = float(zect.iloc[i]) if np.isfinite(zect.iloc[i]) else float("nan")
+                trade_max_hold = _resolve_trade_max_hold(abs(entry_z))
             elif enter_short:
                 pos[i] = -1
                 open_idx = i
@@ -1171,6 +1198,8 @@ def execute_trades(
                 trade_gross_pnl = 0.0
                 trade_total_cost = 0.0
                 trade_days = 0
+                entry_z = float(zect.iloc[i]) if np.isfinite(zect.iloc[i]) else float("nan")
+                trade_max_hold = _resolve_trade_max_hold(abs(entry_z))
             else:
                 pos[i] = 0
         else:
@@ -1186,8 +1215,10 @@ def execute_trades(
                     exit_flag = np.sign(zval) != np.sign(prev_z)
             elif cfg.exit == "tplus1":
                 exit_flag = trade_days >= 1
+            if trade_days < max(0, int(cfg.min_hold)):
+                exit_flag = False
             stop_flag = np.isfinite(zval) and abs(zval) >= cfg.z_stop
-            time_flag = trade_days >= cfg.max_hold
+            time_flag = trade_days >= trade_max_hold
             if exit_flag or stop_flag or time_flag:
                 pos[i] = 0
         if pos[i] != prev:
@@ -1234,6 +1265,7 @@ def execute_trades(
                     "pnl": trade_pnl,
                     "gross_pnl": trade_gross_pnl,
                     "total_cost": trade_total_cost,
+                    "max_hold_effective": trade_max_hold,
                     "open_date": lp_pair.index[open_idx],
                     "close_date": lp_pair.index[i],
                 }
@@ -1244,6 +1276,7 @@ def execute_trades(
             trade_gross_pnl = 0.0
             trade_total_cost = 0.0
             trade_days = 0
+            trade_max_hold = max(1, int(cfg.max_hold))
     pos_series = pd.Series(pos, index=lp_pair.index, name="pos")
     cost_series = pd.Series(cost, index=lp_pair.index, name="cost")
     ret_core = pd.Series(ret_core_vals, index=lp_pair.index, name="ret_core")

@@ -24,6 +24,10 @@ class PlaybookConfig:
     z_exit: float = 0.55
     z_stop: float = 0.8
     max_hold: int = 8
+    min_hold: int = 0
+    dynamic_hold: bool = False
+    dynamic_hold_max_add: int = 0
+    dynamic_hold_step: float = 0.5
     cooldown: int = 1
     z_auto_method: str = "mfpt"
     z_auto_q: float = 0.7
