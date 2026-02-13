@@ -22,3 +22,4 @@ vecm_project/out_ms/returns_*.csv
 vecm_project/out_ms/positions_*.csv
 vecm_project/out_ms/trades_*.csv
 vecm_project/out_ms/artifacts_*.json
+vecm_project/out_ms/last_error.txt
