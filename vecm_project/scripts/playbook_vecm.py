@@ -148,6 +148,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--gate_corr_win", type=int, default=45)
     parser.add_argument("--gate_enforce", type=int, default=1)
     parser.add_argument("--short_filter", type=int, default=0)
+    parser.add_argument(
+        "--signal_mode",
+        default="normal",
+        choices=["normal", "long_from_short_only"],
+        help="Signal execution mode: normal or contrarian long from short signal only",
+    )
     parser.add_argument("--beta_weight", type=int, default=1)
     parser.add_argument("--cost_bps", type=float, default=5.0)
     parser.add_argument("--half_life_max", type=float, default=120.0)
@@ -203,6 +209,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         gate_corr_win=int(args.gate_corr_win),
         gate_enforce=bool(args.gate_enforce),
         short_filter=bool(args.short_filter),
+        signal_mode=str(args.signal_mode).lower(),
         beta_weight=bool(args.beta_weight),
         cost_bps=float(args.cost_bps),
         half_life_max=float(args.half_life_max),
@@ -1055,6 +1062,15 @@ def build_signals(
     if cfg.gate_enforce:
         enter_long &= gates
         enter_short &= gates
+    signal_mode = str(getattr(cfg, "signal_mode", "normal") or "normal").lower()
+    if signal_mode == "long_from_short_only":
+        # Contrarian execution mode:
+        # - legacy short signal becomes long entry
+        # - legacy long signal is ignored
+        enter_long = enter_short.copy()
+        enter_short = pd.Series(False, index=enter_short.index)
+    elif signal_mode != "normal":
+        LOGGER.warning("Unknown signal_mode=%s, falling back to normal", signal_mode)
     long_conf = _confirm_streak(enter_long, cfg.regime_confirm)
     short_conf = _confirm_streak(enter_short, cfg.regime_confirm)
     long_cd = _cooldown(long_conf, cfg.cooldown)

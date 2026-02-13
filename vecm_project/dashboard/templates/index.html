@@ -280,6 +280,39 @@
         {% else %}
           <p class="text-muted">No pair data available for charting.</p>
         {% endif %}
+
+        <div class="mt-4">
+          <h2 class="h5">Price &amp; Trade Execution Timeline</h2>
+          {% if dashboard.execution_charts %}
+            <p class="text-muted mb-3">
+              BUY/SELL markers berasal dari trade log run terbaru untuk membantu melihat kenapa performa terjadi.
+            </p>
+            <div class="d-flex flex-wrap gap-2 mb-3">
+              <span class="small text-muted me-2 align-self-center">Range:</span>
+              <button type="button" class="btn btn-sm btn-outline-primary exec-range-btn active" data-range="3m">3M</button>
+              <button type="button" class="btn btn-sm btn-outline-primary exec-range-btn" data-range="6m">6M</button>
+              <button type="button" class="btn btn-sm btn-outline-primary exec-range-btn" data-range="1y">1Y</button>
+              <button type="button" class="btn btn-sm btn-outline-primary exec-range-btn" data-range="full">Full</button>
+            </div>
+            <div class="row g-3">
+              {% for chart in dashboard.execution_charts %}
+              <div class="col-12 col-lg-6">
+                <div class="card shadow-sm h-100">
+                  <div class="card-body">
+                    <h3 class="h6 mb-1">{{ chart.ticker }}</h3>
+                    <p class="small text-muted mb-2">{{ chart.pair }}</p>
+                    <div class="chart-container">
+                      <canvas id="exec-chart-{{ loop.index }}"></canvas>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="text-muted">No execution chart data for the latest run.</p>
+          {% endif %}
+        </div>
       </div>
     </div>
 
@@ -287,7 +320,9 @@
     <script src="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.js"></script>
     <script>
       const charts = {{ charts_json | safe }};
+      const executionCharts = {{ execution_charts_json | safe }};
       const backtestDefaults = {{ backtest_defaults_json | safe }};
+      const execChartInstances = [];
       charts.forEach((series, idx) => {
         const ctx = document.getElementById(`chart-${idx + 1}`);
         if (!ctx) return;
@@ -331,6 +366,152 @@
               },
             },
           },
+        });
+      });
+
+      function filterExecutionSeries(series, rangeKey) {
+        const labels = series.dates || [];
+        if (!labels.length || rangeKey === "full") {
+          return {
+            labels,
+            prices: series.prices || [],
+            buyPoints: series.buy_points || [],
+            sellPoints: series.sell_points || [],
+          };
+        }
+        const latest = new Date(labels[labels.length - 1]);
+        if (Number.isNaN(latest.getTime())) {
+          return {
+            labels,
+            prices: series.prices || [],
+            buyPoints: series.buy_points || [],
+            sellPoints: series.sell_points || [],
+          };
+        }
+        let months = 0;
+        if (rangeKey === "3m") months = 3;
+        if (rangeKey === "6m") months = 6;
+        if (rangeKey === "1y") months = 12;
+        if (!months) {
+          return {
+            labels,
+            prices: series.prices || [],
+            buyPoints: series.buy_points || [],
+            sellPoints: series.sell_points || [],
+          };
+        }
+        const cutoff = new Date(latest);
+        cutoff.setMonth(cutoff.getMonth() - months);
+        const selectedIndexes = [];
+        labels.forEach((d, i) => {
+          const ts = new Date(d);
+          if (!Number.isNaN(ts.getTime()) && ts >= cutoff) {
+            selectedIndexes.push(i);
+          }
+        });
+        if (!selectedIndexes.length) {
+          return {
+            labels,
+            prices: series.prices || [],
+            buyPoints: series.buy_points || [],
+            sellPoints: series.sell_points || [],
+          };
+        }
+        const selectedLabels = selectedIndexes.map((i) => labels[i]);
+        const selectedSet = new Set(selectedLabels);
+        const selectedPrices = selectedIndexes.map((i) => (series.prices || [])[i]);
+        const buyPoints = (series.buy_points || []).filter((p) => selectedSet.has(p.x));
+        const sellPoints = (series.sell_points || []).filter((p) => selectedSet.has(p.x));
+        return {
+          labels: selectedLabels,
+          prices: selectedPrices,
+          buyPoints,
+          sellPoints,
+        };
+      }
+
+      function renderExecutionCharts(rangeKey) {
+        execChartInstances.forEach((chart) => chart.destroy());
+        execChartInstances.length = 0;
+
+        executionCharts.forEach((series, idx) => {
+          const filtered = filterExecutionSeries(series, rangeKey);
+          const ctx = document.getElementById(`exec-chart-${idx + 1}`);
+          if (!ctx) return;
+          const chart = new Chart(ctx, {
+            type: "line",
+            data: {
+              labels: filtered.labels,
+              datasets: [
+                {
+                  label: `${series.ticker} Price`,
+                  data: filtered.prices,
+                  borderColor: "#0d6efd",
+                  backgroundColor: "#0d6efd",
+                  tension: 0.2,
+                  pointRadius: 0,
+                  borderWidth: 2,
+                },
+                {
+                  label: "BUY",
+                  type: "scatter",
+                  data: filtered.buyPoints,
+                  showLine: false,
+                  pointRadius: 5,
+                  pointHoverRadius: 6,
+                  pointBackgroundColor: "#198754",
+                  pointBorderColor: "#198754",
+                },
+                {
+                  label: "SELL",
+                  type: "scatter",
+                  data: filtered.sellPoints,
+                  showLine: false,
+                  pointRadius: 5,
+                  pointHoverRadius: 6,
+                  pointBackgroundColor: "#dc3545",
+                  pointBorderColor: "#dc3545",
+                },
+              ],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: {
+                mode: "nearest",
+                intersect: false,
+              },
+              plugins: {
+                tooltip: {
+                  callbacks: {
+                    label: function(context) {
+                      const raw = context.raw || {};
+                      if (raw && raw.event) {
+                        return `${context.dataset.label}: ${context.parsed.y?.toFixed(2)} (${raw.event})`;
+                      }
+                      return `${context.dataset.label}: ${context.parsed.y?.toFixed(2)}`;
+                    },
+                  },
+                },
+              },
+              scales: {
+                y: {
+                  title: { display: true, text: "Price" },
+                },
+              },
+            },
+          });
+          execChartInstances.push(chart);
+        });
+      }
+
+      renderExecutionCharts("3m");
+      const rangeButtons = document.querySelectorAll(".exec-range-btn");
+      rangeButtons.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          rangeButtons.forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          renderExecutionCharts(btn.dataset.range || "full");
         });
       });
 

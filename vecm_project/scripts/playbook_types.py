@@ -33,6 +33,7 @@ class PlaybookConfig:
     gate_corr_win: int = 45
     gate_enforce: bool = True
     short_filter: bool = False
+    signal_mode: str = "normal"
     beta_weight: bool = True
     cost_bps: float = 5.0
     half_life_max: float = 120.0

@@ -123,11 +123,22 @@ class PairChart:
 
 
 @dataclass
+class ExecutionChart:
+    pair: str
+    ticker: str
+    dates: List[str]
+    prices: List[float]
+    buy_points: List[Dict[str, object]]
+    sell_points: List[Dict[str, object]]
+
+
+@dataclass
 class DashboardData:
     run_id: Optional[str]
     latest_signal: Optional[LatestSignal]
     metrics: Optional[MetricSummary]
     pair_charts: List[PairChart]
+    execution_charts: List[ExecutionChart]
 
 
 @dataclass
@@ -340,6 +351,19 @@ def index() -> str:
                 for chart in data.pair_charts
             ]
         ),
+        execution_charts_json=json.dumps(
+            [
+                {
+                    "pair": chart.pair,
+                    "ticker": chart.ticker,
+                    "dates": chart.dates,
+                    "prices": chart.prices,
+                    "buy_points": chart.buy_points,
+                    "sell_points": chart.sell_points,
+                }
+                for chart in data.execution_charts
+            ]
+        ),
     )
 
 
@@ -373,7 +397,14 @@ def _build_whatif_decision_params(
     payload: Dict[str, Any],
     base_cfg: playbook_vecm.PlaybookConfig,
 ) -> playbook_vecm.DecisionParams:
-    z_entry_default = base_cfg.z_entry if base_cfg.z_entry is not None else 1.5
+    z_entry_default = base_cfg.z_entry
+    if z_entry_default is None or not np.isfinite(z_entry_default) or z_entry_default <= 0:
+        cap = _as_float(getattr(base_cfg, "z_entry_cap", None))
+        if cap is not None and np.isfinite(cap) and cap > 0:
+            z_entry_default = cap
+        else:
+            z_entry_default = 1.5
+    z_entry_default = float(min(2.5, max(0.5, z_entry_default)))
     z_exit_default = base_cfg.z_exit
     max_hold_default = base_cfg.max_hold
     cooldown_default = base_cfg.cooldown
@@ -519,11 +550,13 @@ def build_dashboard() -> DashboardData:
     latest_signal = _load_latest_signal(run_id) if run_id else None
     metrics = _load_metrics(run_id) if run_id else None
     pair_charts = _build_pair_charts(manifest_row)
+    execution_charts = _build_execution_charts(run_id, manifest_row)
     return DashboardData(
         run_id=run_id,
         latest_signal=latest_signal,
         metrics=metrics,
         pair_charts=pair_charts,
+        execution_charts=execution_charts,
     )
 
 
@@ -563,8 +596,16 @@ def _load_backtest_defaults() -> BacktestDefaults:
     pair_value = _normalise_pair(params.get("subset"))
     if pair_value is None and manifest_row is not None:
         pair_value = _normalise_pair(manifest_row.get("pair"))
+    z_entry_default = _as_float(params.get("z_entry"))
+    if z_entry_default is None and manifest_row is not None:
+        # If manual z_entry is absent, use the last run's effective threshold.
+        z_entry_default = _as_float(manifest_row.get("z_th"))
+    if z_entry_default is None:
+        z_entry_default = _as_float(params.get("z_entry_cap"))
+    if z_entry_default is not None and np.isfinite(z_entry_default):
+        z_entry_default = float(min(2.5, max(0.5, z_entry_default)))
     return BacktestDefaults(
-        z_entry=_as_float(params.get("z_entry")),
+        z_entry=z_entry_default,
         z_exit=_as_float(params.get("z_exit")),
         max_hold=_as_int(params.get("max_hold")),
         cooldown=_as_int(params.get("cooldown")),
@@ -596,8 +637,11 @@ def _load_latest_signal(run_id: str) -> Optional[LatestSignal]:
     pos_path = OUT_DIR / f"positions_{run_id}.csv"
     if not ret_path.exists() or not pos_path.exists():
         return None
-    ret_df = pd.read_csv(ret_path)
-    pos_df = pd.read_csv(pos_path)
+    try:
+        ret_df = pd.read_csv(ret_path)
+        pos_df = pd.read_csv(pos_path)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return None
     if ret_df.empty or pos_df.empty:
         return None
 
@@ -650,6 +694,111 @@ def _build_pair_charts(manifest_row: Optional[pd.Series]) -> List[PairChart]:
         chart = _compute_spread_zscore(panel, lhs, rhs)
         if chart is not None:
             charts.append(chart)
+    return charts
+
+
+def _trade_markers_for_pair(
+    trades_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    lhs: str,
+    rhs: str,
+) -> Dict[str, Dict[str, List[Dict[str, object]]]]:
+    markers: Dict[str, Dict[str, List[Dict[str, object]]]] = {
+        lhs: {"buy": [], "sell": []},
+        rhs: {"buy": [], "sell": []},
+    }
+    if trades_df is None or trades_df.empty:
+        return markers
+    if lhs not in price_df.columns or rhs not in price_df.columns:
+        return markers
+
+    def _add_marker(ticker: str, action: str, date_value: object, event: str) -> None:
+        ts = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(ts):
+            return
+        ts = pd.Timestamp(ts).normalize()
+        if ts not in price_df.index:
+            return
+        price = _as_float(price_df.at[ts, ticker])
+        if price is None:
+            return
+        markers[ticker][action].append(
+            {"x": ts.strftime("%Y-%m-%d"), "y": float(price), "event": event}
+        )
+
+    for _, trade in trades_df.iterrows():
+        side = str(trade.get("side", "")).upper()
+        open_date = trade.get("open_date")
+        close_date = trade.get("close_date")
+        if side == "LONG":
+            _add_marker(lhs, "buy", open_date, "OPEN_LONG")
+            _add_marker(rhs, "sell", open_date, "OPEN_LONG")
+            _add_marker(lhs, "sell", close_date, "CLOSE_LONG")
+            _add_marker(rhs, "buy", close_date, "CLOSE_LONG")
+        elif side == "SHORT":
+            _add_marker(lhs, "sell", open_date, "OPEN_SHORT")
+            _add_marker(rhs, "buy", open_date, "OPEN_SHORT")
+            _add_marker(lhs, "buy", close_date, "CLOSE_SHORT")
+            _add_marker(rhs, "sell", close_date, "CLOSE_SHORT")
+    return markers
+
+
+def _build_execution_charts(run_id: Optional[str], manifest_row: Optional[pd.Series]) -> List[ExecutionChart]:
+    if not run_id or manifest_row is None:
+        return []
+    pair_value = _normalise_pair(manifest_row.get("pair"))
+    if pair_value is None:
+        return []
+    lhs, rhs = pair_value.split(",", 1)
+
+    panel = _load_price_panel()
+    if panel is None or lhs not in panel.columns or rhs not in panel.columns:
+        return []
+
+    pos_path = OUT_DIR / f"positions_{run_id}.csv"
+    if not pos_path.exists():
+        return []
+    try:
+        pos_df = pd.read_csv(pos_path)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return []
+    if pos_df.empty:
+        return []
+    date_col = pos_df.columns[0]
+    pos_df["date"] = pd.to_datetime(pos_df[date_col], errors="coerce")
+    pos_df = pos_df.dropna(subset=["date"]).sort_values("date")
+    if pos_df.empty:
+        return []
+
+    idx = pd.DatetimeIndex(pos_df["date"]).normalize().unique()
+    subset = panel[[lhs, rhs]].copy()
+    subset.index = pd.DatetimeIndex(subset.index).normalize()
+    subset = subset.loc[subset.index.intersection(idx)].sort_index()
+    if subset.empty:
+        return []
+
+    trades_path = OUT_DIR / f"trades_{run_id}.csv"
+    if trades_path.exists():
+        try:
+            trades_df = pd.read_csv(trades_path)
+        except (OSError, ValueError, pd.errors.ParserError):
+            trades_df = pd.DataFrame()
+    else:
+        trades_df = pd.DataFrame()
+    markers = _trade_markers_for_pair(trades_df, subset, lhs, rhs)
+
+    charts: List[ExecutionChart] = []
+    for ticker in (lhs, rhs):
+        charts.append(
+            ExecutionChart(
+                pair=f"{lhs} ~ {rhs}",
+                ticker=ticker,
+                dates=[d.strftime("%Y-%m-%d") for d in subset.index],
+                prices=[float(v) for v in subset[ticker].tolist()],
+                buy_points=markers[ticker]["buy"],
+                sell_points=markers[ticker]["sell"],
+            )
+        )
     return charts
 
 
