@@ -50,7 +50,13 @@ from statsmodels.tsa.vector_ar.vecm import VECM
 
 from . import storage
 from .cache_keys import hash_config, hash_dataframe
-from .data_streaming import ensure_price_data, load_cached_prices
+from .cost_liquidity import (
+    compute_cost_events,
+    compute_liquidity_metrics,
+    compute_nav_cagr_calmar,
+    resolve_idx_cost_config,
+)
+from .data_streaming import ensure_price_data, load_cached_prices, load_cached_volumes
 from .ms_spread import compute_regime_prob, fit_ms_spread
 from .playbook_types import (
     DecisionParams,
@@ -1225,6 +1231,12 @@ class ExecutionResult:
     ret_core: pd.Series
     cost: pd.Series
     trades: pd.DataFrame
+    nav_prev: Optional[pd.Series] = None
+    w1: Optional[pd.Series] = None
+    w2: Optional[pd.Series] = None
+    close_pair: Optional[pd.DataFrame] = None
+    volume_pair: Optional[pd.DataFrame] = None
+    cost_breakdown: Optional[pd.DataFrame] = None
     p_regime: Optional[pd.Series] = None
     delta_score: Optional[pd.Series] = None
     delta_mom12: Optional[pd.Series] = None
@@ -1236,6 +1248,7 @@ def execute_trades(
     lp_pair: pd.DataFrame,
     beta_series: pd.Series,
     cfg: PlaybookConfig,
+    volume_pair: Optional[pd.DataFrame] = None,
     p_regime: Optional[pd.Series] = None,
     delta_score: Optional[pd.Series] = None,
     delta_mom12: Optional[pd.Series] = None,
@@ -1245,17 +1258,54 @@ def execute_trades(
     lp_pair = lp_pair.reindex(idx).ffill().dropna()
     beta_series = beta_series.reindex(lp_pair.index).ffill()
     zect = zect.reindex(lp_pair.index)
+    if volume_pair is not None:
+        volume_pair = volume_pair.reindex(lp_pair.index)
+        volume_pair = volume_pair.astype(float)
     if p_regime is not None:
         p_regime = p_regime.reindex(lp_pair.index)
     r1 = lp_pair.iloc[:, 0].diff().fillna(0.0)
     r2 = lp_pair.iloc[:, 1].diff().fillna(0.0)
+    close_pair = np.exp(lp_pair)
+    close1 = close_pair.iloc[:, 0]
+    close2 = close_pair.iloc[:, 1]
+    close_ret1 = close1.pct_change().fillna(0.0)
+    close_ret2 = close2.pct_change().fillna(0.0)
     beta_vals = beta_series.fillna(beta_series.mean()).to_numpy()
     weights = 1.0 + np.abs(beta_vals)
     w1 = 1.0 / weights
     w2 = np.abs(beta_vals) / weights
+    use_idx_cost_model = str(getattr(cfg, "cost_model", "simple")).strip().lower() == "idx_realistic"
+    idx_cost_cfg = resolve_idx_cost_config(
+        fee_buy=cfg.fee_buy,
+        fee_sell=cfg.fee_sell,
+        broker_buy_rate=getattr(cfg, "broker_buy_rate", None),
+        broker_sell_rate=getattr(cfg, "broker_sell_rate", None),
+        exchange_levy=getattr(cfg, "exchange_levy", None),
+        sell_tax=getattr(cfg, "sell_tax", None),
+        spread_bps=getattr(cfg, "spread_bps", None),
+        impact_model=getattr(cfg, "impact_model", None),
+        impact_k=getattr(cfg, "impact_k", None),
+        adtv_win=getattr(cfg, "adtv_win", None),
+        sigma_win=getattr(cfg, "sigma_win", None),
+        illiq_cap_mode=getattr(cfg, "illiq_cap_mode", None),
+        illiq_cap_value=getattr(cfg, "illiq_cap_value", None),
+    )
+
     pos = np.zeros(len(lp_pair))
     cost = np.zeros(len(lp_pair))
     ret_core_vals = np.zeros(len(lp_pair))
+    nav_prev_vals = np.ones(len(lp_pair))
+    dexp1_vals = np.zeros(len(lp_pair))
+    dexp2_vals = np.zeros(len(lp_pair))
+    notional_leg1_vals = np.zeros(len(lp_pair))
+    notional_leg2_vals = np.zeros(len(lp_pair))
+    turnover_daily_vals = np.zeros(len(lp_pair))
+    participation_vals = np.full(len(lp_pair), np.nan)
+    cost_broker_vals = np.zeros(len(lp_pair))
+    cost_levy_vals = np.zeros(len(lp_pair))
+    cost_spread_vals = np.zeros(len(lp_pair))
+    cost_impact_vals = np.zeros(len(lp_pair))
+    cost_sell_tax_vals = np.zeros(len(lp_pair))
     trades: List[Dict[str, object]] = []
     open_idx: Optional[int] = None
     open_side = 0
@@ -1264,6 +1314,7 @@ def execute_trades(
     trade_total_cost = 0.0
     trade_days = 0
     trade_max_hold = max(1, int(cfg.max_hold))
+    nav_prev_value = 1.0
 
     def _resolve_trade_max_hold(entry_abs_z: float) -> int:
         base_hold = max(1, int(cfg.max_hold))
@@ -1281,6 +1332,7 @@ def execute_trades(
         return int(base_hold + extra_days)
 
     for i in range(len(lp_pair)):
+        nav_prev_vals[i] = nav_prev_value
         prev = pos[i - 1] if i > 0 else 0
         enter_long = bool(signals.iloc[i]["long"] > 0)
         enter_short = bool(signals.iloc[i]["short"] > 0)
@@ -1326,8 +1378,56 @@ def execute_trades(
             time_flag = trade_days >= trade_max_hold
             if exit_flag or stop_flag or time_flag:
                 pos[i] = 0
+        prev_exp1 = (pos[i - 1] * w1[i - 1]) if i > 0 else 0.0
+        prev_exp2 = (-pos[i - 1] * w2[i - 1]) if i > 0 else 0.0
+        curr_exp1 = pos[i] * w1[i]
+        curr_exp2 = -pos[i] * w2[i]
         if pos[i] != prev:
-            # Apply fees
+            dexp1_vals[i] = curr_exp1 - prev_exp1
+            dexp2_vals[i] = curr_exp2 - prev_exp2
+        else:
+            dexp1_vals[i] = 0.0
+            dexp2_vals[i] = 0.0
+
+        event_notional_leg1 = abs(dexp1_vals[i]) * nav_prev_vals[i]
+        event_notional_leg2 = abs(dexp2_vals[i]) * nav_prev_vals[i]
+        notional_leg1_vals[i] = event_notional_leg1
+        notional_leg2_vals[i] = event_notional_leg2
+        if nav_prev_vals[i] > 0:
+            turnover_daily_vals[i] = (event_notional_leg1 + event_notional_leg2) / nav_prev_vals[i]
+        else:
+            turnover_daily_vals[i] = 0.0
+
+        if use_idx_cost_model and (event_notional_leg1 > 0.0 or event_notional_leg2 > 0.0):
+            hist_idx = lp_pair.index[: i + 1]
+            cost_event = compute_cost_events(
+                dexp1=pd.Series(dexp1_vals[: i + 1], index=hist_idx),
+                dexp2=pd.Series(dexp2_vals[: i + 1], index=hist_idx),
+                nav_prev=pd.Series(nav_prev_vals[: i + 1], index=hist_idx),
+                close1=close1.iloc[: i + 1],
+                close2=close2.iloc[: i + 1],
+                ret1=close_ret1.iloc[: i + 1],
+                ret2=close_ret2.iloc[: i + 1],
+                volume1=(volume_pair.iloc[: i + 1, 0] if volume_pair is not None else None),
+                volume2=(volume_pair.iloc[: i + 1, 1] if volume_pair is not None else None),
+                broker_buy_rate=idx_cost_cfg["broker_buy_rate"],
+                broker_sell_rate=idx_cost_cfg["broker_sell_rate"],
+                levy_rate=idx_cost_cfg["levy_rate"],
+                sell_tax_rate=idx_cost_cfg["sell_tax_rate"],
+                spread_bps=idx_cost_cfg["spread_bps"],
+                impact_model=idx_cost_cfg["impact_model"],
+                impact_k=idx_cost_cfg["impact_k"],
+                adtv_win=int(idx_cost_cfg["adtv_win"]),
+                sigma_win=int(idx_cost_cfg["sigma_win"]),
+            ).iloc[-1]
+            cost[i] = float(cost_event["cost_total"])
+            participation_vals[i] = float(cost_event["participation"]) if np.isfinite(cost_event["participation"]) else np.nan
+            cost_broker_vals[i] = float(cost_event["cost_broker"])
+            cost_levy_vals[i] = float(cost_event["cost_levy"])
+            cost_spread_vals[i] = float(cost_event["cost_spread"])
+            cost_impact_vals[i] = float(cost_event["cost_impact"])
+            cost_sell_tax_vals[i] = float(cost_event["cost_sell_tax"])
+        elif pos[i] != prev:
             fee = cfg.fee_buy + cfg.fee_sell
             if prev == 0 and pos[i] == 1:
                 cost[i] = fee * (w1[i] + w2[i])
@@ -1344,6 +1444,7 @@ def execute_trades(
         else:
             pnl_core = 0.0
         ret_core_vals[i] = pnl_core
+        nav_prev_value = max(nav_prev_value * (1.0 + pnl_core - cost[i]), 1e-9)
         if open_idx is not None:
             trade_gross_pnl += pnl_core
             trade_total_cost += cost[i]
@@ -1387,6 +1488,26 @@ def execute_trades(
     ret_core = pd.Series(ret_core_vals, index=lp_pair.index, name="ret_core")
     ret_net = ret_core - cost_series
     ret_net.name = "ret"
+    nav_prev_series = pd.Series(nav_prev_vals, index=lp_pair.index, name="nav_prev")
+    w1_series = pd.Series(w1, index=lp_pair.index, name="w1")
+    w2_series = pd.Series(w2, index=lp_pair.index, name="w2")
+    cost_breakdown = pd.DataFrame(
+        {
+            "dexp1": dexp1_vals,
+            "dexp2": dexp2_vals,
+            "notional_leg1": notional_leg1_vals,
+            "notional_leg2": notional_leg2_vals,
+            "turnover_daily": turnover_daily_vals,
+            "participation": participation_vals,
+            "cost_broker": cost_broker_vals,
+            "cost_levy": cost_levy_vals,
+            "cost_spread": cost_spread_vals,
+            "cost_impact": cost_impact_vals,
+            "cost_sell_tax": cost_sell_tax_vals,
+            "cost_total": cost,
+        },
+        index=lp_pair.index,
+    )
     trades_df = pd.DataFrame(trades)
     return ExecutionResult(
         pos=pos_series,
@@ -1394,6 +1515,12 @@ def execute_trades(
         ret_core=ret_core,
         cost=cost_series,
         trades=trades_df,
+        nav_prev=nav_prev_series,
+        w1=w1_series,
+        w2=w2_series,
+        close_pair=close_pair,
+        volume_pair=volume_pair,
+        cost_breakdown=cost_breakdown,
         p_regime=p_regime,
         delta_score=delta_score,
         delta_mom12=delta_mom12,
@@ -1930,12 +2057,33 @@ def evaluate_rules(
         p_regime=features.p_mr_series,
         delta_mom12=features.delta_mom12,
     )
+    volume_pair: Optional[pd.DataFrame] = None
+    try:
+        volume_panel = load_cached_volumes()
+        if "date" in volume_panel.columns:
+            volume_panel = volume_panel.set_index("date")
+        volume_panel.index = pd.to_datetime(volume_panel.index, errors="coerce")
+        if features.selected_l in volume_panel.columns and features.selected_r in volume_panel.columns:
+            volume_pair = volume_panel[[features.selected_l, features.selected_r]].reindex(features.lp.index)
+    except Exception:
+        try:
+            ensure_price_data(tickers=[features.selected_l, features.selected_r], force_refresh=False)
+            volume_panel = load_cached_volumes()
+            if "date" in volume_panel.columns:
+                volume_panel = volume_panel.set_index("date")
+            volume_panel.index = pd.to_datetime(volume_panel.index, errors="coerce")
+            if features.selected_l in volume_panel.columns and features.selected_r in volume_panel.columns:
+                volume_pair = volume_panel[[features.selected_l, features.selected_r]].reindex(features.lp.index)
+        except Exception:
+            volume_pair = None
+
     exec_res = execute_trades(
         features.zect,
         signals,
         features.lp,
         features.beta_series,
         cfg,
+        volume_pair=volume_pair,
         p_regime=features.p_mr_series,
         delta_score=features.delta_score,
         delta_mom12=features.delta_mom12,
