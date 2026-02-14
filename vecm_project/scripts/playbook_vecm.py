@@ -431,6 +431,13 @@ def _write_text(path: pathlib.Path, text: str) -> None:
     path.write_text(text)
 
 
+def _resolve_stage2_obj_mode() -> str:
+    mode = str(os.getenv("STAGE2_OBJ_MODE", "legacy")).strip().lower()
+    if mode not in {"legacy", "idx_v1", "idx_v2_calmar"}:
+        return "legacy"
+    return mode
+
+
 def _resolve_universe(
     universe: Optional[Iterable[str] | str],
     fallback: str,
@@ -1566,65 +1573,210 @@ def compute_metrics(
         p_mr_mean = float("nan")
         p_mr_inpos = float("nan")
 
-    ret = exec_res.ret
+    ret_core = exec_res.ret_core if exec_res.ret_core is not None else exec_res.ret
+    cost = exec_res.cost if exec_res.cost is not None else pd.Series(0.0, index=ret_core.index)
+    ret_net = (ret_core - cost).fillna(0.0)
+    ret_net.name = "ret"
 
-    # Kalau sama sekali tidak ada return, kembalikan metrik default
-    if ret.empty:
+    if ret_net.empty:
         return {
             "sharpe_oos": 0.0,
+            "sharpe_oos_net": 0.0,
             "maxdd": 0.0,
+            "maxdd_oos_net": 0.0,
             "turnover": 0.0,
             "turnover_annualised": 0.0,
+            "turnover_annualised_notional": 0.0,
             "n_trades": n_trades,
             "avg_hold_days": avg_hold_days,
             "p_mr_mean": p_mr_mean,
             "p_mr_inpos_mean": p_mr_inpos,
             "cagr": 0.0,
+            "cagr_oos_net": 0.0,
+            "calmar_oos_net": 0.0,
             "nav_oos": 1.0,
+            "nav_end_oos_net": 1.0,
+            "participation_mean": 0.0,
+            "participation_max": 0.0,
+            "amihud_illiq": 0.0,
+            "illiq_cap": float("nan"),
+            "illiq_cap_used": float("nan"),
+            "illiq_cap_mode": "insample_p80",
+            "cost_total": 0.0,
+            "cost_sell_tax_total": 0.0,
+            "cost_spread_total": 0.0,
+            "cost_impact_total": 0.0,
+            "cost_broker_total": 0.0,
+            "cost_levy_total": 0.0,
+            "cost_model": str(getattr(cfg, "cost_model", "simple")),
         }
 
-    # --- OOS mask & NAV ---
-    mask_oos = ret.index.date >= oos_start
-    ret_oos = ret[mask_oos]
-    if ret_oos.empty:
-        ret_oos = ret
-
-    nav = (1 + ret_oos).cumprod()
-    nav0 = nav.iloc[0] if not nav.empty else 1.0
-    nav1 = nav.iloc[-1] if not nav.empty else 1.0
-
     ann_days = cfg.ann_days if cfg.ann_days else 252
-    total_days = max(len(ret_oos), 1)
-    cagr = (nav1 / nav0) ** (ann_days / total_days) - 1 if nav0 > 0 and nav1 > 0 else 0.0
-
-    dd = nav / nav.cummax() - 1
-    maxdd = float(dd.min()) if not dd.empty else 0.0
+    mask_oos = pd.Series(ret_net.index.date >= oos_start, index=ret_net.index)
+    ret_oos = ret_net[mask_oos]
+    if ret_oos.empty:
+        ret_oos = ret_net
+        mask_oos = pd.Series(True, index=ret_net.index)
 
     mu = float(ret_oos.mean())
     sd = float(ret_oos.std())
-    sharpe = (mu / sd) * math.sqrt(252) if sd > 0 else 0.0
+    sharpe_net = (mu / sd) * math.sqrt(ann_days) if sd > 0 else 0.0
 
-    # --- Turnover: dihitung di horizon OOS ---
+    nav_stats = compute_nav_cagr_calmar(
+        ret_oos,
+        ann_days=ann_days,
+        calmar_eps=resolve_idx_cost_config(
+            fee_buy=cfg.fee_buy,
+            fee_sell=cfg.fee_sell,
+            broker_buy_rate=getattr(cfg, "broker_buy_rate", None),
+            broker_sell_rate=getattr(cfg, "broker_sell_rate", None),
+            exchange_levy=getattr(cfg, "exchange_levy", None),
+            sell_tax=getattr(cfg, "sell_tax", None),
+            spread_bps=getattr(cfg, "spread_bps", None),
+            impact_model=getattr(cfg, "impact_model", None),
+            impact_k=getattr(cfg, "impact_k", None),
+            adtv_win=getattr(cfg, "adtv_win", None),
+            sigma_win=getattr(cfg, "sigma_win", None),
+            illiq_cap_mode=getattr(cfg, "illiq_cap_mode", None),
+            illiq_cap_value=getattr(cfg, "illiq_cap_value", None),
+        )["calmar_eps"],
+    )
+
+    # Legacy turnover (state-change count) retained for backward compatibility.
     pos = exec_res.pos
     pos_oos = pos[mask_oos]
     if pos_oos.empty:
         pos_oos = pos
-
     turnover_total = float(np.abs(pos_oos.diff().fillna(0)).sum())
     days_pos = max(len(pos_oos), 1)
     turnover_annualised = float(turnover_total * (ann_days / days_pos))
 
+    # Notional turnover from exposure deltas (IDX foundation).
+    if isinstance(exec_res.cost_breakdown, pd.DataFrame) and "turnover_daily" in exec_res.cost_breakdown.columns:
+        turnover_daily_series = exec_res.cost_breakdown["turnover_daily"].reindex(ret_net.index).fillna(0.0)
+    else:
+        turnover_daily_series = pd.Series(0.0, index=ret_net.index)
+    turnover_oos = turnover_daily_series[mask_oos]
+    if turnover_oos.empty:
+        turnover_oos = turnover_daily_series
+    turnover_annualised_notional = float(ann_days * turnover_oos.mean()) if not turnover_oos.empty else 0.0
+
+    idx_cfg = resolve_idx_cost_config(
+        fee_buy=cfg.fee_buy,
+        fee_sell=cfg.fee_sell,
+        broker_buy_rate=getattr(cfg, "broker_buy_rate", None),
+        broker_sell_rate=getattr(cfg, "broker_sell_rate", None),
+        exchange_levy=getattr(cfg, "exchange_levy", None),
+        sell_tax=getattr(cfg, "sell_tax", None),
+        spread_bps=getattr(cfg, "spread_bps", None),
+        impact_model=getattr(cfg, "impact_model", None),
+        impact_k=getattr(cfg, "impact_k", None),
+        adtv_win=getattr(cfg, "adtv_win", None),
+        sigma_win=getattr(cfg, "sigma_win", None),
+        illiq_cap_mode=getattr(cfg, "illiq_cap_mode", None),
+        illiq_cap_value=getattr(cfg, "illiq_cap_value", None),
+    )
+    liquidity = {
+        "participation_mean": 0.0,
+        "participation_max": 0.0,
+        "amihud_illiq": 0.0,
+        "illiq_cap": float("nan"),
+        "illiq_cap_mode": idx_cfg["illiq_cap_mode"],
+    }
+    if (
+        isinstance(exec_res.close_pair, pd.DataFrame)
+        and exec_res.close_pair.shape[1] >= 2
+        and isinstance(exec_res.w1, pd.Series)
+        and isinstance(exec_res.w2, pd.Series)
+        and isinstance(exec_res.nav_prev, pd.Series)
+    ):
+        close_pair = exec_res.close_pair.reindex(ret_net.index)
+        volume_pair = exec_res.volume_pair.reindex(ret_net.index) if isinstance(exec_res.volume_pair, pd.DataFrame) else None
+        close1 = close_pair.iloc[:, 0].astype(float)
+        close2 = close_pair.iloc[:, 1].astype(float)
+        ret1 = close1.pct_change().fillna(0.0)
+        ret2 = close2.pct_change().fillna(0.0)
+        exp1 = exec_res.pos.reindex(ret_net.index).fillna(0.0) * exec_res.w1.reindex(ret_net.index).fillna(0.0)
+        exp2 = -exec_res.pos.reindex(ret_net.index).fillna(0.0) * exec_res.w2.reindex(ret_net.index).fillna(0.0)
+        dexp1 = exp1.diff().fillna(exp1)
+        dexp2 = exp2.diff().fillna(exp2)
+        if isinstance(exec_res.cost_breakdown, pd.DataFrame):
+            event_mask = (
+                exec_res.cost_breakdown["dexp1"].reindex(ret_net.index).fillna(0.0).abs()
+                + exec_res.cost_breakdown["dexp2"].reindex(ret_net.index).fillna(0.0).abs()
+            ) > 0
+            dexp1 = dexp1.where(event_mask, 0.0)
+            dexp2 = dexp2.where(event_mask, 0.0)
+        notional_leg1 = dexp1.abs() * exec_res.nav_prev.reindex(ret_net.index).fillna(1.0)
+        notional_leg2 = dexp2.abs() * exec_res.nav_prev.reindex(ret_net.index).fillna(1.0)
+        liquidity = compute_liquidity_metrics(
+            close1=close1,
+            close2=close2,
+            volume1=(volume_pair.iloc[:, 0] if volume_pair is not None and volume_pair.shape[1] >= 2 else None),
+            volume2=(volume_pair.iloc[:, 1] if volume_pair is not None and volume_pair.shape[1] >= 2 else None),
+            ret1=ret1,
+            ret2=ret2,
+            notional_leg1=notional_leg1,
+            notional_leg2=notional_leg2,
+            oos_mask=mask_oos,
+            adtv_win=int(idx_cfg["adtv_win"]),
+            illiq_cap_mode=str(idx_cfg["illiq_cap_mode"]),
+            illiq_cap_value=idx_cfg["illiq_cap_value"],
+        )
+
+    cost_breakdown = exec_res.cost_breakdown if isinstance(exec_res.cost_breakdown, pd.DataFrame) else pd.DataFrame(index=ret_net.index)
+    cost_total = float(cost.sum())
+    cost_sell_tax_total = float(cost_breakdown.get("cost_sell_tax", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_spread_total = float(cost_breakdown.get("cost_spread", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_impact_total = float(cost_breakdown.get("cost_impact", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_broker_total = float(cost_breakdown.get("cost_broker", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_levy_total = float(cost_breakdown.get("cost_levy", pd.Series(0.0, index=ret_net.index)).sum())
+
+    try:
+        idx_rho_cap = float(os.getenv("IDX_RHO_CAP", "0.02"))
+    except ValueError:
+        idx_rho_cap = 0.02
+
     return {
-        "sharpe_oos": float(sharpe),
-        "maxdd": float(maxdd),
+        # Backward compatible fields
+        "sharpe_oos": float(sharpe_net),
+        "maxdd": float(nav_stats["maxdd_raw"]),
         "turnover": float(turnover_total),
         "turnover_annualised": float(turnover_annualised),
         "n_trades": int(n_trades),
         "avg_hold_days": float(avg_hold_days),
         "p_mr_mean": float(p_mr_mean),
         "p_mr_inpos_mean": float(p_mr_inpos),
-        "cagr": float(cagr),
-        "nav_oos": float(nav1),
+        "cagr": float(nav_stats["cagr"]),
+        "nav_oos": float(nav_stats["nav_end"]),
+        # Net + liquidity foundation
+        "sharpe_oos_net": float(sharpe_net),
+        "maxdd_oos_net": float(nav_stats["maxdd"]),
+        "cagr_oos_net": float(nav_stats["cagr"]),
+        "calmar_oos_net": float(nav_stats["calmar"]),
+        "nav_end_oos_net": float(nav_stats["nav_end"]),
+        "turnover_annualised_notional": float(turnover_annualised_notional),
+        "participation_mean": float(liquidity.get("participation_mean", 0.0)),
+        "participation_max": float(liquidity.get("participation_max", 0.0)),
+        "amihud_illiq": float(liquidity.get("amihud_illiq", 0.0)),
+        "illiq_cap": float(liquidity.get("illiq_cap", float("nan"))),
+        "illiq_cap_used": float(liquidity.get("illiq_cap", float("nan"))),
+        "illiq_cap_mode": str(liquidity.get("illiq_cap_mode", "insample_p80")),
+        "cost_total": float(cost_total),
+        "cost_sell_tax_total": float(cost_sell_tax_total),
+        "cost_spread_total": float(cost_spread_total),
+        "cost_impact_total": float(cost_impact_total),
+        "cost_broker_total": float(cost_broker_total),
+        "cost_levy_total": float(cost_levy_total),
+        # Cost/liquidity params for artifact debugging
+        "objective_mode": _resolve_stage2_obj_mode(),
+        "cost_model": str(getattr(cfg, "cost_model", "simple")),
+        "idx_spread_bps": float(idx_cfg["spread_bps"]),
+        "idx_impact_k": float(idx_cfg["impact_k"]),
+        "idx_sell_tax_rate": float(idx_cfg["sell_tax_rate"]),
+        "idx_adtv_win": float(idx_cfg["adtv_win"]),
+        "idx_sigma_win": float(idx_cfg["sigma_win"]),
+        "idx_rho_cap": float(idx_rho_cap),
     }
 
 
@@ -2194,6 +2346,18 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
     _df_to_csv(exec_res.pos.to_frame("pos"), pos_path)
 
     ret_df = pd.DataFrame({"ret": exec_res.ret, "cost": exec_res.cost})
+    if isinstance(exec_res.cost_breakdown, pd.DataFrame) and not exec_res.cost_breakdown.empty:
+        for col in [
+            "cost_broker",
+            "cost_levy",
+            "cost_spread",
+            "cost_impact",
+            "cost_sell_tax",
+            "turnover_daily",
+            "participation",
+        ]:
+            if col in exec_res.cost_breakdown.columns:
+                ret_df[col] = exec_res.cost_breakdown[col]
     if getattr(exec_res, "p_regime", None) is not None:
         ret_df["p_regime"] = exec_res.p_regime
     if getattr(exec_res, "delta_score", None) is not None:
