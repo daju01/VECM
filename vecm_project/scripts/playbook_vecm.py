@@ -124,6 +124,26 @@ def _ensure_default_input(path: str) -> str:
     return path
 
 
+def _env_default_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _env_default_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
 def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser = argparse.ArgumentParser(description="VECM/TVECM Trading Playbook")
     parser.add_argument("input_file", nargs="?", default=None)
@@ -160,6 +180,67 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     )
     parser.add_argument("--beta_weight", type=int, default=1)
     parser.add_argument("--cost_bps", type=float, default=5.0)
+    parser.add_argument(
+        "--cost_model",
+        default=os.getenv("VECM_COST_MODEL", "simple"),
+        choices=["simple", "idx_realistic"],
+        help="Transaction cost model: simple (legacy) or idx_realistic",
+    )
+    parser.add_argument(
+        "--broker_buy_rate",
+        type=float,
+        default=_env_default_float("IDX_BROKER_BUY_RATE", 0.0019),
+    )
+    parser.add_argument(
+        "--broker_sell_rate",
+        type=float,
+        default=_env_default_float("IDX_BROKER_SELL_RATE", 0.0029),
+    )
+    parser.add_argument(
+        "--exchange_levy",
+        type=float,
+        default=_env_default_float("IDX_EXCHANGE_LEVY", 0.0),
+    )
+    parser.add_argument(
+        "--sell_tax",
+        type=float,
+        default=_env_default_float("IDX_SELL_TAX_RATE", 0.001),
+    )
+    parser.add_argument(
+        "--spread_bps",
+        type=float,
+        default=_env_default_float("IDX_SPREAD_BPS", 20.0),
+    )
+    parser.add_argument(
+        "--impact_model",
+        default=os.getenv("IDX_IMPACT_MODEL", "sqrt"),
+        choices=["sqrt", "linear", "none"],
+    )
+    parser.add_argument(
+        "--impact_k",
+        type=float,
+        default=_env_default_float("IDX_IMPACT_K", 1.0),
+    )
+    parser.add_argument(
+        "--adtv_win",
+        type=int,
+        default=_env_default_int("IDX_ADTV_WIN", 20),
+    )
+    parser.add_argument(
+        "--sigma_win",
+        type=int,
+        default=_env_default_int("IDX_SIGMA_WIN", 20),
+    )
+    parser.add_argument(
+        "--illiq_cap_mode",
+        default=os.getenv("IDX_ILLIQ_CAP_MODE", "insample_p80"),
+        choices=["insample_p80", "static"],
+    )
+    parser.add_argument(
+        "--illiq_cap_value",
+        type=float,
+        default=_env_default_float("IDX_ILLIQ_CAP_VALUE", float("nan")),
+    )
     parser.add_argument("--half_life_max", type=float, default=120.0)
     parser.add_argument("--dd_stop", type=float, default=0.25)
     parser.add_argument("--fee_buy", type=float, default=0.0019)
@@ -220,6 +301,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         signal_mode=str(args.signal_mode).lower(),
         beta_weight=bool(args.beta_weight),
         cost_bps=float(args.cost_bps),
+        cost_model=str(args.cost_model).lower(),
+        broker_buy_rate=float(args.broker_buy_rate),
+        broker_sell_rate=float(args.broker_sell_rate),
+        exchange_levy=float(args.exchange_levy),
+        sell_tax=float(args.sell_tax),
+        spread_bps=float(args.spread_bps),
+        impact_model=str(args.impact_model).lower(),
+        impact_k=float(args.impact_k),
+        adtv_win=max(1, int(args.adtv_win)),
+        sigma_win=max(2, int(args.sigma_win)),
+        illiq_cap_mode=str(args.illiq_cap_mode).lower(),
+        illiq_cap_value=float(args.illiq_cap_value) if args.illiq_cap_value is not None and np.isfinite(args.illiq_cap_value) else None,
         half_life_max=float(args.half_life_max),
         dd_stop=float(args.dd_stop),
         fee_buy=float(args.fee_buy),
@@ -273,6 +366,18 @@ def _apply_settings_overrides(cfg: PlaybookConfig) -> None:
         "short_filter": settings.playbook_short_filter,
         "beta_weight": settings.playbook_beta_weight,
         "cost_bps": settings.playbook_cost_bps,
+        "cost_model": getattr(settings, "playbook_cost_model", None),
+        "broker_buy_rate": getattr(settings, "playbook_broker_buy_rate", None),
+        "broker_sell_rate": getattr(settings, "playbook_broker_sell_rate", None),
+        "exchange_levy": getattr(settings, "playbook_exchange_levy", None),
+        "sell_tax": getattr(settings, "playbook_sell_tax", None),
+        "spread_bps": getattr(settings, "playbook_spread_bps", None),
+        "impact_model": getattr(settings, "playbook_impact_model", None),
+        "impact_k": getattr(settings, "playbook_impact_k", None),
+        "adtv_win": getattr(settings, "playbook_adtv_win", None),
+        "sigma_win": getattr(settings, "playbook_sigma_win", None),
+        "illiq_cap_mode": getattr(settings, "playbook_illiq_cap_mode", None),
+        "illiq_cap_value": getattr(settings, "playbook_illiq_cap_value", None),
         "half_life_max": settings.playbook_half_life_max,
         "dd_stop": settings.playbook_dd_stop,
         "fee_buy": settings.playbook_fee_buy,

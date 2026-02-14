@@ -40,6 +40,18 @@ class PlaybookConfig:
     signal_mode: str = "normal"
     beta_weight: bool = True
     cost_bps: float = 5.0
+    cost_model: str = "simple"
+    broker_buy_rate: float = 0.0019
+    broker_sell_rate: float = 0.0029
+    exchange_levy: float = 0.0
+    sell_tax: float = 0.0010
+    spread_bps: float = 20.0
+    impact_model: str = "sqrt"
+    impact_k: float = 1.0
+    adtv_win: int = 20
+    sigma_win: int = 20
+    illiq_cap_mode: str = "insample_p80"
+    illiq_cap_value: Optional[float] = None
     half_life_max: float = 120.0
     dd_stop: float = 0.25
     fee_buy: float = 0.0019
@@ -107,6 +119,17 @@ class FeatureBundle:
     ms_error: str
     oos_start_date: dt.date
     horizon: Dict[str, object]
+    adtv_left: Optional[pd.Series] = None
+    adtv_right: Optional[pd.Series] = None
+    min_adtv: Optional[pd.Series] = None
+    participation_mean: Optional[float] = None
+    participation_max: Optional[float] = None
+    amihud_illiq: Optional[float] = None
+    illiq_cap_used: Optional[float] = None
+    cost_total: Optional[float] = None
+    cost_sell_tax_total: Optional[float] = None
+    cost_spread_total: Optional[float] = None
+    cost_impact_total: Optional[float] = None
 
 
 @dataclass(frozen=True)
