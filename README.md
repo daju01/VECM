@@ -118,6 +118,66 @@ sering muncul saat men-deploy playbook:
    `persist_artifacts` secara eksplisit (misalnya `daily_signal.py` saat
    `persist_artifacts=true`).
 
+## Stage-2 Objective Modes (Legacy + IDX)
+
+`stage2_bo.py` sekarang mendukung mode objective via env:
+
+```bash
+export STAGE2_OBJ_MODE=legacy          # default
+export STAGE2_OBJ_MODE=idx_v1          # Sharpe net + hinge penalties
+export STAGE2_OBJ_MODE=idx_v2_calmar   # Calmar/CAGR net + hinge penalties
+```
+
+- `legacy`: perilaku lama dipertahankan (`Score = sharpe - lambda_turnover * turnover_annualised`).
+- `idx_v1`: cocok untuk eksplorasi (objective lebih smooth, core di Sharpe net).
+- `idx_v2_calmar`: cocok untuk robustness (lebih fokus drawdown/tail-risk via Calmar/CAGR net).
+
+Aktifkan biaya IDX-realistic secara opt-in pada playbook:
+
+```bash
+python -m vecm_project.scripts.playbook_vecm \
+  vecm_project/data/adj_close_data.csv \
+  --subset ANTM.JK,TLKM.JK \
+  --cost_model idx_realistic \
+  --sell_tax 0.001 \
+  --spread_bps 20 \
+  --impact_model sqrt
+```
+
+Constraint umum untuk mode IDX:
+- penalty trades minimum (`STAGE2_MIN_TRADES`, default `5`)
+- penalty besar (`STAGE2_HUGE_PENALTY`, default `1_000_000`)
+- penalty short feasibility saat `allow_short=False` tapi posisi OOS mengandung short.
+
+## IDX Cost + Liquidity Foundation
+
+Pipeline kini menghasilkan dua cache data:
+- `vecm_project/data/adj_close_data.csv` (harga)
+- `vecm_project/data/volume_data.csv` (volume)
+
+Keduanya dibangun oleh `ensure_price_data()` di `data_streaming.py`.
+
+Komponen biaya IDX (diintegrasikan ke satu jalur cost pada pos-change, tanpa double count):
+- broker buy/sell
+- levy
+- sell tax (`IDX_SELL_TAX_RATE`, default `0.001` = 0.1%, hanya untuk SELL notional)
+- spread proxy (`IDX_SPREAD_BPS`, default `20`, half-spread per side)
+- impact (`IDX_IMPACT_K`, sigma rolling + partisipasi terhadap ADTV)
+
+Metrik likuiditas:
+- **ADTV**: rolling mean dari `Close * Volume` (default window `IDX_ADTV_WIN=20`)
+- **Participation**: `max(notional_leg1, notional_leg2) / min(ADTV_leg1, ADTV_leg2)`
+- **Amihud ILLIQ**: `mean(max(|r1|/dollar_volume1, |r2|/dollar_volume2))` pada OOS
+
+Cap ILLIQ:
+- `IDX_ILLIQ_CAP_MODE=insample_p80` (default) atau `static`
+- jika `static`, gunakan `IDX_ILLIQ_CAP_VALUE`
+
+Metrik net yang tersedia untuk objective/diagnostik:
+- `sharpe_oos_net`, `maxdd_oos_net`, `cagr_oos_net`, `calmar_oos_net`, `nav_end_oos_net`
+- `participation_mean`, `participation_max`, `amihud_illiq`, `illiq_cap`
+- `cost_total`, `cost_sell_tax_total`, `cost_spread_total`, `cost_impact_total`
+
 ## Troubleshooting (Top 5)
 
 | Masalah | Gejala | Solusi cepat |

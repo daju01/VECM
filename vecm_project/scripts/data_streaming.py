@@ -33,6 +33,7 @@ LOGGER = storage.configure_logging("data_streaming")
 BASE_DIR = pathlib.Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_PATH = DATA_DIR / "adj_close_data.csv"
+VOLUME_PATH = DATA_DIR / "volume_data.csv"
 CACHE_META_PATH = DATA_DIR / "adj_close_data.meta.json"
 CACHE_ROOT = BASE_DIR / "cache"
 TICKER_CACHE_DIR = CACHE_ROOT / "tickers"
@@ -219,7 +220,7 @@ def _circuit_record_success() -> None:
 def _download_alpha_vantage(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
     api_key = os.getenv("ALPHAVANTAGE_API_KEY")
     if not api_key:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     url = (
         "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED"
         f"&symbol={ticker}&outputsize=full&apikey={api_key}"
@@ -231,10 +232,10 @@ def _download_alpha_vantage(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         payload = response.json()
     except Exception as exc:  # pragma: no cover - network/runtime errors
         LOGGER.warning("Alpha Vantage fallback failed for %s: %s", ticker, exc)
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     series = payload.get("Time Series (Daily)") or {}
     if not series:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     rows = []
     for date_str, values in series.items():
         if not values:
@@ -244,6 +245,7 @@ def _download_alpha_vantage(ticker: str, start: pd.Timestamp, end: dt.date) -> p
                 "Date": pd.to_datetime(date_str),
                 "Ticker": ticker,
                 "AdjClose": float(values.get("5. adjusted close", "nan")),
+                "Volume": float(values.get("6. volume", "nan")),
             }
         )
     frame = pd.DataFrame(rows)
@@ -376,19 +378,25 @@ def _read_ticker_cache(path: pathlib.Path, ticker: str) -> pd.DataFrame:
         raise ValueError(f"Ticker cache at {path} missing Date column")
     if "AdjClose" not in frame.columns:
         raise ValueError(f"Ticker cache at {path} missing AdjClose column")
-    frame = frame[["Date", "AdjClose"]].copy()
+    if "Volume" not in frame.columns:
+        frame["Volume"] = float("nan")
+    frame = frame[["Date", "AdjClose", "Volume"]].copy()
     frame["Date"] = pd.to_datetime(frame["Date"])
     frame["Ticker"] = ticker
     frame["AdjClose"] = pd.to_numeric(frame["AdjClose"], errors="coerce")
+    frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce")
     return frame.dropna(subset=["AdjClose"])
 
 
 def _write_ticker_cache(ticker: str, frame: pd.DataFrame) -> str:
     cache_dir = _ticker_cache_dir(ticker)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    tidy = frame[["Date", "AdjClose"]].copy()
+    if "Volume" not in frame.columns:
+        frame = frame.assign(Volume=float("nan"))
+    tidy = frame[["Date", "AdjClose", "Volume"]].copy()
     tidy["Date"] = pd.to_datetime(tidy["Date"])
     tidy["AdjClose"] = pd.to_numeric(tidy["AdjClose"], errors="coerce")
+    tidy["Volume"] = pd.to_numeric(tidy["Volume"], errors="coerce")
     tidy = tidy.dropna(subset=["AdjClose"]).sort_values("Date")
     data_hash = hash_dataframe(tidy)
     path = _ticker_cache_path(ticker, data_hash, ".parquet")
@@ -472,8 +480,9 @@ def _read_existing_prices() -> Optional[pd.DataFrame]:
     df = pd.read_csv(DATA_PATH, parse_dates=["Date"])
     if {"Ticker", "AdjClose"}.issubset(df.columns):
         tidy = df[["Date", "Ticker", "AdjClose"]].copy()
+        tidy["Volume"] = float("nan")
         tidy["Date"] = pd.to_datetime(tidy["Date"])
-        return tidy
+        return tidy[["Date", "Ticker", "AdjClose", "Volume"]]
     if "Date" not in df.columns:
         LOGGER.warning("Existing price file missing 'Date' column; ignoring cache at %s", DATA_PATH)
         return None
@@ -484,7 +493,30 @@ def _read_existing_prices() -> Optional[pd.DataFrame]:
     tidy = df.melt(id_vars="Date", var_name="Ticker", value_name="AdjClose")
     tidy["Date"] = pd.to_datetime(tidy["Date"])
     tidy = tidy.dropna(subset=["AdjClose"])
-    return tidy[["Date", "Ticker", "AdjClose"]]
+    tidy["Volume"] = float("nan")
+    return tidy[["Date", "Ticker", "AdjClose", "Volume"]]
+
+
+def _read_existing_volumes() -> Optional[pd.DataFrame]:
+    if not VOLUME_PATH.exists():
+        return None
+    df = pd.read_csv(VOLUME_PATH, parse_dates=["Date"])
+    if {"Ticker", "Volume"}.issubset(df.columns):
+        tidy = df[["Date", "Ticker", "Volume"]].copy()
+        tidy["Date"] = pd.to_datetime(tidy["Date"])
+        tidy["Volume"] = pd.to_numeric(tidy["Volume"], errors="coerce")
+        return tidy
+    if "Date" not in df.columns:
+        LOGGER.warning("Existing volume file missing 'Date' column; ignoring cache at %s", VOLUME_PATH)
+        return None
+    value_cols = [col for col in df.columns if col != "Date"]
+    if not value_cols:
+        LOGGER.warning("Existing volume cache has no ticker columns; ignoring cache at %s", VOLUME_PATH)
+        return None
+    tidy = df.melt(id_vars="Date", var_name="Ticker", value_name="Volume")
+    tidy["Date"] = pd.to_datetime(tidy["Date"])
+    tidy["Volume"] = pd.to_numeric(tidy["Volume"], errors="coerce")
+    return tidy
 
 
 def _read_ticker_caches(
@@ -509,7 +541,7 @@ def _read_ticker_caches(
             continue
         frames.append(frame)
         if cache_hash is None:
-            cache_hash = hash_dataframe(frame[["Date", "AdjClose"]])
+            cache_hash = hash_dataframe(frame[["Date", "AdjClose", "Volume"]])
             record = record or {}
             record["data_hash"] = cache_hash
             bucket[ticker] = record
@@ -518,7 +550,7 @@ def _read_ticker_caches(
     if frames:
         meta["tickers"] = bucket
         return _merge_frames(frames), hashes, changed
-    return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"]), hashes, changed
+    return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"]), hashes, changed
 
 
 @lru_cache(maxsize=1)
@@ -526,19 +558,27 @@ def _load_offline_table() -> pd.DataFrame:
     if os.getenv("OFFLINE_FALLBACK_PATH") is None:
         LOGGER.info("Using default offline fallback path at %s", OFFLINE_FALLBACK_PATH)
     if not OFFLINE_FALLBACK_PATH.exists():
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     try:
         table = pd.read_csv(OFFLINE_FALLBACK_PATH, parse_dates=["Date"])
     except Exception as exc:  # pragma: no cover - fallback best effort
         LOGGER.warning("Failed to load offline fallback at %s: %s", OFFLINE_FALLBACK_PATH, exc)
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
-    required = {"Date", "Ticker", "AdjClose"}
-    if not required.issubset(table.columns):
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
+    required = ["Date", "Ticker", "AdjClose"]
+    if not set(required).issubset(table.columns):
         LOGGER.warning(
-            "Offline fallback at %s missing required columns %s", OFFLINE_FALLBACK_PATH, required - set(table.columns)
+            "Offline fallback at %s missing required columns %s",
+            OFFLINE_FALLBACK_PATH,
+            set(required) - set(table.columns),
         )
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
-    table = table[list(required)].copy()
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
+    has_volume = "Volume" in table.columns
+    cols = list(required) + (["Volume"] if has_volume else [])
+    table = table[cols].copy()
+    if has_volume:
+        table["Volume"] = pd.to_numeric(table["Volume"], errors="coerce")
+    else:
+        table["Volume"] = float("nan")
     table["Ticker"] = table["Ticker"].astype(str)
     table["AdjClose"] = pd.to_numeric(table["AdjClose"], errors="coerce")
     table = table.dropna(subset=["AdjClose"])
@@ -548,7 +588,7 @@ def _load_offline_table() -> pd.DataFrame:
 def _offline_prices_for(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
     table = _load_offline_table()
     if table.empty:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     mask = (
         (table["Ticker"].str.upper() == ticker.upper())
         & (table["Date"] >= start)
@@ -556,7 +596,7 @@ def _offline_prices_for(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.Da
     )
     subset = table.loc[mask].copy()
     if subset.empty:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     subset["Ticker"] = ticker
     LOGGER.info(
         "Loaded %d offline rows for %s covering %s to %s",
@@ -568,11 +608,13 @@ def _offline_prices_for(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.Da
     return subset
 
 
-def _tidy_to_wide(df: pd.DataFrame) -> pd.DataFrame:
+def _tidy_to_wide(df: pd.DataFrame, value_col: str = "AdjClose") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["Date"])
+    if value_col not in df.columns:
+        raise ValueError(f"Tidy frame missing expected value column '{value_col}'")
     pivot = (
-        df.pivot_table(index="Date", columns="Ticker", values="AdjClose", aggfunc="last")
+        df.pivot_table(index="Date", columns="Ticker", values=value_col, aggfunc="last")
         .sort_index()
     )
     pivot = pivot.reset_index()
@@ -580,15 +622,15 @@ def _tidy_to_wide(df: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 
-def _write_wide(df: pd.DataFrame) -> None:
+def _write_wide(df: pd.DataFrame, path: pathlib.Path, *, label: str) -> None:
     df = df.copy()
     if "date" not in df.columns and "Date" in df.columns:
         df = df.rename(columns={"Date": "date"})
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date")
     df = df.rename(columns={"date": "Date"})
-    df.to_csv(DATA_PATH, index=False)
-    LOGGER.info("Price cache updated at %s with %d rows", DATA_PATH, len(df))
+    df.to_csv(path, index=False)
+    LOGGER.info("%s cache updated at %s with %d rows", label, path, len(df))
 
 
 def _ensure_meta_bucket(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -690,7 +732,7 @@ def _resume_dates(
 
 def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> pd.DataFrame:
     if start >= pd.Timestamp(end):
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     proxy_url = os.getenv("https_proxy") or os.getenv("HTTPS_PROXY")
     if not _circuit_allows():
         LOGGER.warning("Circuit breaker open; using fallback provider for %s", ticker)
@@ -718,14 +760,14 @@ def _download_single_ticker(ticker: str, start: pd.Timestamp, end: dt.date) -> p
         fallback = _offline_prices_for(ticker, start, end)
         if not fallback.empty:
             return fallback
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     _circuit_record_success()
     return frame
 
 
 def _history_to_tidy_frame(history: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if history is None or history.empty:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
 
     price_series: Optional[pd.Series] = None
     for field in ("Adj Close", "Close"):
@@ -754,16 +796,37 @@ def _history_to_tidy_frame(history: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 break
 
     if price_series is None:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
+
+    volume_series: Optional[pd.Series] = None
+    if isinstance(history.columns, pd.MultiIndex):
+        level0 = history.columns.get_level_values(0)
+        if "Volume" in level0:
+            volume_frame = history.xs("Volume", axis=1, level=0)
+            if isinstance(volume_frame, pd.Series):
+                volume_series = volume_frame
+            elif ticker in volume_frame.columns:
+                volume_series = volume_frame[ticker]
+            elif len(volume_frame.columns):
+                volume_series = volume_frame.iloc[:, 0]
+    else:
+        if "Volume" in history.columns:
+            vol_col = history["Volume"]
+            volume_series = vol_col.iloc[:, 0] if isinstance(vol_col, pd.DataFrame) else vol_col
 
     frame = price_series.to_frame(name="AdjClose").reset_index()
+    if volume_series is not None:
+        frame["Volume"] = volume_series.values
+    else:
+        frame["Volume"] = float("nan")
     date_col = frame.columns[0]
     frame = frame.rename(columns={date_col: "Date"})
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
     frame["AdjClose"] = pd.to_numeric(frame["AdjClose"], errors="coerce")
+    frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce")
     frame["Ticker"] = ticker
     frame = frame.dropna(subset=["Date", "AdjClose"])
-    return frame[["Date", "Ticker", "AdjClose"]]
+    return frame[["Date", "Ticker", "AdjClose", "Volume"]]
 
 
 def _download_with_retry(
@@ -778,17 +841,22 @@ def _download_with_retry(
             time.sleep(delay)
             delay *= 2
     LOGGER.warning("No data returned for %s after %d attempts", ticker, max_attempts)
-    return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+    return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
 
 
 def _merge_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     valid_frames = [frame for frame in frames if frame is not None and not frame.empty]
     if not valid_frames:
-        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose"])
+        return pd.DataFrame(columns=["Date", "Ticker", "AdjClose", "Volume"])
     merged = pd.concat(valid_frames, ignore_index=True)
+    if "Volume" not in merged.columns:
+        merged["Volume"] = float("nan")
+    merged["AdjClose"] = pd.to_numeric(merged["AdjClose"], errors="coerce")
+    merged["Volume"] = pd.to_numeric(merged["Volume"], errors="coerce")
     merged["Date"] = pd.to_datetime(merged["Date"])
     merged = (
-        merged.drop_duplicates(subset=["Date", "Ticker"], keep="last")
+        merged.dropna(subset=["Date", "AdjClose"])
+        .drop_duplicates(subset=["Date", "Ticker"], keep="last")
         .sort_values(["Date", "Ticker"])
         .reset_index(drop=True)
     )
@@ -799,8 +867,15 @@ def ensure_price_data(
     tickers: Optional[Sequence[str]] = None,
     force_refresh: bool = False,
     default_start: dt.date = DEFAULT_START_DATE,
-) -> pd.DataFrame:
-    """Ensure the adjusted close cache exists and return it in wide format."""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ensure price+volume caches exist and return them in wide format.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame]
+        ``(price_df, volume_df)`` with a ``date`` column followed by ticker
+        columns in wide format.
+    """
 
     _ensure_data_dir()
     start_time = time.perf_counter()
@@ -823,6 +898,15 @@ def ensure_price_data(
         if cache_meta_changed:
             meta_changed = True
         csv_cache = _read_existing_prices()
+        volume_cache = _read_existing_volumes()
+        if csv_cache is not None and volume_cache is not None:
+            csv_cache = csv_cache.merge(volume_cache, on=["Date", "Ticker"], how="left")
+            if "Volume_x" in csv_cache.columns:
+                csv_cache["Volume"] = csv_cache["Volume_x"]
+                csv_cache = csv_cache.drop(columns=["Volume_x"], errors="ignore")
+            if "Volume_y" in csv_cache.columns:
+                csv_cache["Volume"] = csv_cache["Volume_y"].combine_first(csv_cache.get("Volume"))
+                csv_cache = csv_cache.drop(columns=["Volume_y"], errors="ignore")
         if not ticker_cache.empty and csv_cache is not None:
             existing = _merge_frames([csv_cache, ticker_cache])
         elif not ticker_cache.empty:
@@ -832,15 +916,17 @@ def ensure_price_data(
     if existing is not None and not force_refresh:
         resume_dates = _resume_dates(ticker_list, existing, default_start)
         missing_tickers = sorted(set(ticker_list) - set(existing["Ticker"].unique()))
-        wide = _tidy_to_wide(existing)
-        current_hash = hash_dataframe(wide)
+        wide_price = _tidy_to_wide(existing, value_col="AdjClose")
+        current_hash = hash_dataframe(wide_price)
         cached_hash = meta.get("data_hash")
         if cached_hash == current_hash and not missing_tickers:
             LOGGER.info("Price cache unchanged (hash=%s); skipping download", current_hash[:12])
-            _write_wide(wide)
+            wide_volume = _tidy_to_wide(existing, value_col="Volume")
+            _write_wide(wide_price, DATA_PATH, label="Price")
+            _write_wide(wide_volume, VOLUME_PATH, label="Volume")
             if meta_changed:
                 _write_cache_meta(meta)
-            return wide
+            return wide_price, wide_volume
     else:
         resume_dates = _resume_dates(ticker_list, existing, default_start)
 
@@ -919,11 +1005,11 @@ def ensure_price_data(
 
     meta_bucket = _ensure_meta_bucket(meta)
     for ticker in ticker_list:
-        ticker_frame = combined.loc[combined["Ticker"] == ticker, ["Date", "AdjClose"]].copy()
+        ticker_frame = combined.loc[combined["Ticker"] == ticker, ["Date", "AdjClose", "Volume"]].copy()
         if ticker_frame.empty:
             continue
         ticker_frame = ticker_frame.sort_values("Date")
-        data_hash = hash_dataframe(ticker_frame)
+        data_hash = hash_dataframe(ticker_frame[["Date", "AdjClose", "Volume"]])
         record = meta_bucket.get(ticker, {}) if isinstance(meta_bucket, dict) else {}
         cached_hash = record.get("data_hash")
         cache_path = _find_existing_ticker_cache(ticker, cached_hash)
@@ -948,12 +1034,14 @@ def ensure_price_data(
         )
         meta_changed = True
 
-    wide = _tidy_to_wide(combined)
-    new_hash = hash_dataframe(wide)
+    wide_price = _tidy_to_wide(combined, value_col="AdjClose")
+    wide_volume = _tidy_to_wide(combined, value_col="Volume")
+    new_hash = hash_dataframe(wide_price)
     if meta.get("data_hash") != new_hash:
         meta_changed = True
     meta["data_hash"] = new_hash
-    _write_wide(wide)
+    _write_wide(wide_price, DATA_PATH, label="Price")
+    _write_wide(wide_volume, VOLUME_PATH, label="Volume")
     if refreshed_tickers:
         LOGGER.info("Refreshed %d tickers: %s", len(refreshed_tickers), ", ".join(sorted(refreshed_tickers)[:10]))
         if len(refreshed_tickers) > 10:
@@ -975,7 +1063,7 @@ def ensure_price_data(
     )
     if meta_changed:
         _write_cache_meta(meta)
-    return wide
+    return wide_price, wide_volume
 
 
 def load_cached_prices(path: Optional[pathlib.Path | str] = None) -> pd.DataFrame:
@@ -1000,10 +1088,37 @@ def load_cached_prices(path: Optional[pathlib.Path | str] = None) -> pd.DataFram
     return df
 
 
+def load_cached_volumes(path: Optional[pathlib.Path | str] = None) -> pd.DataFrame:
+    """Load cached volume data in wide format without downloading."""
+
+    cache_path = pathlib.Path(path or VOLUME_PATH)
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Volume cache not found at {cache_path}. Run ensure_price_data() to populate it first."
+        )
+    df = pd.read_csv(cache_path, parse_dates=["Date"])
+    if {"Ticker", "Volume"}.issubset(df.columns):
+        df = _tidy_to_wide(df[["Date", "Ticker", "Volume"]], value_col="Volume")
+    elif "Date" not in df.columns:
+        raise ValueError(f"Volume cache at {cache_path} is missing a 'Date' column")
+    else:
+        df = df.sort_values("Date")
+    if "Date" in df.columns:
+        df = df.rename(columns={"Date": "date"})
+    elif "date" not in df.columns:
+        raise ValueError(f"Volume cache at {cache_path} does not expose a date column")
+    return df
+
+
 if __name__ == "__main__":  # pragma: no cover - smoke test helper
     try:
         recent_start = dt.date.today() - dt.timedelta(days=30)
-        df = ensure_price_data(tickers=["^JKSE", "USDIDR=X"], default_start=recent_start)
-        LOGGER.info("Downloaded %d rows across %d tickers", len(df), df["Ticker"].nunique())
+        price_df, volume_df = ensure_price_data(tickers=["^JKSE", "USDIDR=X"], default_start=recent_start)
+        LOGGER.info(
+            "Downloaded %d price rows and %d volume rows across %d tickers",
+            len(price_df),
+            len(volume_df),
+            max(0, len(price_df.columns) - 1),
+        )
     except Exception as exc:
         LOGGER.error("Data streaming smoke test failed: %s", exc)

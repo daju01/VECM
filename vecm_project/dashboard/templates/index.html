@@ -25,6 +25,13 @@
       .slider {
         margin-top: 12px;
       }
+      .sim-stat {
+        min-height: 78px;
+      }
+      .sim-table-wrap {
+        max-height: 280px;
+        overflow-y: auto;
+      }
     </style>
   </head>
   <body>
@@ -168,6 +175,9 @@
                 <p class="text-muted mb-0">
                   Adjust parameters to re-evaluate metrics using cached features.
                 </p>
+                <p class="small text-muted mb-0">
+                  Default preset: IDX long-only adaptive (no short selling).
+                </p>
               </div>
               <span class="badge text-bg-secondary" id="whatif-status">Idle</span>
             </div>
@@ -309,6 +319,79 @@
               </div>
               {% endfor %}
             </div>
+
+            <div class="mt-4">
+              <h2 class="h5">Trading Simulation Sheet</h2>
+              <p class="text-muted mb-3">
+                Simulasi transaksi per saham berdasarkan marker BUY/SELL.
+                Asumsi notional per order: <strong id="sim-notional-label">-</strong>.
+              </p>
+              <div class="row g-3">
+                {% for chart in dashboard.execution_charts %}
+                <div class="col-12 col-lg-6">
+                  <div class="card shadow-sm h-100">
+                    <div class="card-body">
+                      <h3 class="h6 mb-1">{{ chart.ticker }}</h3>
+                      <p class="small text-muted mb-3">{{ chart.pair }}</p>
+
+                      <div class="row g-2 mb-3">
+                        <div class="col-6 col-xl-3">
+                          <div class="border rounded p-2 sim-stat">
+                            <div class="text-muted small">Total BUY Value</div>
+                            <div class="fw-semibold" id="sim-buy-value-{{ loop.index }}">-</div>
+                          </div>
+                        </div>
+                        <div class="col-6 col-xl-3">
+                          <div class="border rounded p-2 sim-stat">
+                            <div class="text-muted small">Total SELL Value</div>
+                            <div class="fw-semibold" id="sim-sell-value-{{ loop.index }}">-</div>
+                          </div>
+                        </div>
+                        <div class="col-6 col-xl-3">
+                          <div class="border rounded p-2 sim-stat">
+                            <div class="text-muted small">BUY/Sell Volume</div>
+                            <div class="fw-semibold" id="sim-volume-{{ loop.index }}">-</div>
+                          </div>
+                        </div>
+                        <div class="col-6 col-xl-3">
+                          <div class="border rounded p-2 sim-stat">
+                            <div class="text-muted small">Net Cashflow</div>
+                            <div class="fw-semibold" id="sim-net-cash-{{ loop.index }}">-</div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="chart-container mb-3">
+                        <canvas id="sim-chart-{{ loop.index }}"></canvas>
+                      </div>
+
+                      <div class="table-responsive sim-table-wrap">
+                        <table class="table table-sm table-striped align-middle mb-0">
+                          <thead>
+                            <tr>
+                              <th>#</th>
+                              <th>Date</th>
+                              <th>Action</th>
+                              <th>Event</th>
+                              <th>Price</th>
+                              <th>Volume</th>
+                              <th>Trade Value</th>
+                              <th>Cum. Cashflow</th>
+                            </tr>
+                          </thead>
+                          <tbody id="sim-table-{{ loop.index }}">
+                            <tr>
+                              <td colspan="8" class="text-muted">No simulation rows.</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
           {% else %}
             <p class="text-muted">No execution chart data for the latest run.</p>
           {% endif %}
@@ -323,6 +406,40 @@
       const executionCharts = {{ execution_charts_json | safe }};
       const backtestDefaults = {{ backtest_defaults_json | safe }};
       const execChartInstances = [];
+      const simChartInstances = [];
+      const SIM_NOTIONAL_PER_ORDER = 10000000;
+      const idrFormatter = new Intl.NumberFormat("id-ID", {
+        style: "currency",
+        currency: "IDR",
+        maximumFractionDigits: 0,
+      });
+      const numFormatter = new Intl.NumberFormat("id-ID", {
+        maximumFractionDigits: 2,
+      });
+      const simNotionalLabel = document.getElementById("sim-notional-label");
+      if (simNotionalLabel) {
+        simNotionalLabel.textContent = idrFormatter.format(SIM_NOTIONAL_PER_ORDER);
+      }
+
+      function formatIDR(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return "-";
+        return idrFormatter.format(parsed);
+      }
+
+      function formatQty(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return "-";
+        return numFormatter.format(parsed);
+      }
+
+      function setText(id, text) {
+        const el = document.getElementById(id);
+        if (el) {
+          el.textContent = text;
+        }
+      }
+
       charts.forEach((series, idx) => {
         const ctx = document.getElementById(`chart-${idx + 1}`);
         if (!ctx) return;
@@ -430,6 +547,152 @@
         };
       }
 
+      function buildSimulationRows(series, rangeKey) {
+        const filtered = filterExecutionSeries(series, rangeKey);
+        const events = [];
+        (filtered.buyPoints || []).forEach((point) => {
+          events.push({
+            date: point.x,
+            action: "BUY",
+            event: point.event || "BUY",
+            price: Number(point.y),
+            sortHint: 0,
+          });
+        });
+        (filtered.sellPoints || []).forEach((point) => {
+          events.push({
+            date: point.x,
+            action: "SELL",
+            event: point.event || "SELL",
+            price: Number(point.y),
+            sortHint: 1,
+          });
+        });
+        events.sort((a, b) => {
+          const da = new Date(a.date).getTime();
+          const db = new Date(b.date).getTime();
+          if (da !== db) return da - db;
+          return a.sortHint - b.sortHint;
+        });
+
+        let cumulativeCash = 0;
+        const rows = [];
+        events.forEach((evt, idx) => {
+          if (!Number.isFinite(evt.price) || evt.price <= 0) return;
+          const volume = Math.max(1, Math.floor(SIM_NOTIONAL_PER_ORDER / evt.price));
+          const tradeValue = volume * evt.price;
+          const cashFlow = evt.action === "SELL" ? tradeValue : -tradeValue;
+          cumulativeCash += cashFlow;
+          rows.push({
+            no: idx + 1,
+            date: evt.date,
+            action: evt.action,
+            event: evt.event,
+            price: evt.price,
+            volume,
+            tradeValue,
+            cumulativeCash,
+          });
+        });
+        return rows;
+      }
+
+      function renderSimulationSheet(rangeKey) {
+        simChartInstances.forEach((chart) => chart.destroy());
+        simChartInstances.length = 0;
+
+        executionCharts.forEach((series, idx) => {
+          const rows = buildSimulationRows(series, rangeKey);
+          const tableBody = document.getElementById(`sim-table-${idx + 1}`);
+          if (tableBody) {
+            if (!rows.length) {
+              tableBody.innerHTML = '<tr><td colspan="8" class="text-muted">No simulation rows for selected range.</td></tr>';
+            } else {
+              tableBody.innerHTML = rows
+                .map(
+                  (row) => `
+                    <tr>
+                      <td>${row.no}</td>
+                      <td>${row.date}</td>
+                      <td>${row.action}</td>
+                      <td>${row.event}</td>
+                      <td>${formatQty(row.price)}</td>
+                      <td>${formatQty(row.volume)}</td>
+                      <td>${formatIDR(row.tradeValue)}</td>
+                      <td>${formatIDR(row.cumulativeCash)}</td>
+                    </tr>
+                  `
+                )
+                .join("");
+            }
+          }
+
+          const totals = rows.reduce(
+            (acc, row) => {
+              if (row.action === "BUY") {
+                acc.buyValue += row.tradeValue;
+                acc.buyVol += row.volume;
+              } else {
+                acc.sellValue += row.tradeValue;
+                acc.sellVol += row.volume;
+              }
+              return acc;
+            },
+            { buyValue: 0, sellValue: 0, buyVol: 0, sellVol: 0 }
+          );
+          const netCash = totals.sellValue - totals.buyValue;
+          setText(`sim-buy-value-${idx + 1}`, formatIDR(totals.buyValue));
+          setText(`sim-sell-value-${idx + 1}`, formatIDR(totals.sellValue));
+          setText(
+            `sim-volume-${idx + 1}`,
+            `${formatQty(totals.buyVol)} / ${formatQty(totals.sellVol)}`
+          );
+          setText(`sim-net-cash-${idx + 1}`, formatIDR(netCash));
+
+          const chartCanvas = document.getElementById(`sim-chart-${idx + 1}`);
+          if (!chartCanvas) return;
+          const chart = new Chart(chartCanvas, {
+            type: "line",
+            data: {
+              labels: rows.map((row) => row.date),
+              datasets: [
+                {
+                  label: "Cumulative Cashflow",
+                  data: rows.map((row) => row.cumulativeCash),
+                  borderColor: "#fd7e14",
+                  backgroundColor: "#fd7e14",
+                  borderWidth: 2,
+                  pointRadius: 2,
+                  tension: 0.15,
+                },
+              ],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              scales: {
+                y: {
+                  title: { display: true, text: "Cashflow (IDR)" },
+                  ticks: {
+                    callback: (value) => formatIDR(value),
+                  },
+                },
+              },
+              plugins: {
+                tooltip: {
+                  callbacks: {
+                    label: function(context) {
+                      return `${context.dataset.label}: ${formatIDR(context.parsed.y)}`;
+                    },
+                  },
+                },
+              },
+            },
+          });
+          simChartInstances.push(chart);
+        });
+      }
+
       function renderExecutionCharts(rangeKey) {
         execChartInstances.forEach((chart) => chart.destroy());
         execChartInstances.length = 0;
@@ -506,12 +769,15 @@
       }
 
       renderExecutionCharts("3m");
+      renderSimulationSheet("3m");
       const rangeButtons = document.querySelectorAll(".exec-range-btn");
       rangeButtons.forEach((btn) => {
         btn.addEventListener("click", () => {
           rangeButtons.forEach((b) => b.classList.remove("active"));
           btn.classList.add("active");
-          renderExecutionCharts(btn.dataset.range || "full");
+          const selectedRange = btn.dataset.range || "full";
+          renderExecutionCharts(selectedRange);
+          renderSimulationSheet(selectedRange);
         });
       });
 

@@ -29,6 +29,28 @@ DATA_DIR = BASE_DIR / "data"
 OUT_DIR = BASE_DIR / "out_ms"
 RUN_MANIFEST = OUT_DIR / "run_manifest.csv"
 
+# Dashboard default strategy preset:
+# enforce long-only independent execution with adaptive exits and IDX realistic costs.
+DASHBOARD_IDX_LONG_ADAPTIVE_PRESET: Dict[str, Any] = {
+    "subset": "ANTM.JK,TLKM.JK",
+    "signal_mode": "long_independent",
+    "long_only": True,
+    "cost_model": "idx_realistic",
+    "z_entry": 0.923,
+    "z_exit": 0.244,
+    "z_stop_buffer": 1.909,
+    "min_hold": 8,
+    "max_hold": 34,
+    "cooldown": 1,
+    "p_th": 0.585,
+    "gate_enforce": 1,
+    "adaptive_exit": True,
+    "adaptive_loss_cut": 0.03,
+    "adaptive_profit_hold": 0.008,
+    "adaptive_profit_extend_days": 11,
+    "adaptive_max_hold_cap": 87,
+}
+
 
 def _read_env_credentials() -> Tuple[Optional[str], Optional[str]]:
     return os.getenv("DASHBOARD_USER"), os.getenv("DASHBOARD_PASS")
@@ -227,6 +249,14 @@ def _normalise_pair(value: Any) -> Optional[str]:
     return f"{tokens[0]},{tokens[1]}"
 
 
+def _apply_dashboard_strategy_preset(params: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(params)
+    merged.update(DASHBOARD_IDX_LONG_ADAPTIVE_PRESET)
+    if _normalise_pair(merged.get("subset")) is None:
+        merged["subset"] = "ANTM.JK,TLKM.JK"
+    return merged
+
+
 def _pair_label(pair_value: str) -> str:
     lhs, rhs = pair_value.split(",", 1)
     return f"{lhs} ~ {rhs}"
@@ -259,11 +289,11 @@ def _load_whatif_pair_options(default_pair: Optional[str]) -> List[Dict[str, str
 def _latest_backtest_context() -> Tuple[Optional[str], Optional[pd.Series], Dict[str, Any]]:
     run_id, manifest_row = _latest_run()
     if not run_id:
-        return None, manifest_row, {}
+        return None, manifest_row, _apply_dashboard_strategy_preset({})
     params = _load_manifest_params(run_id)
     if not params:
         params = playbook_vecm.parse_args([]).to_dict()
-    return run_id, manifest_row, dict(params)
+    return run_id, manifest_row, _apply_dashboard_strategy_preset(dict(params))
 
 
 @app.route("/healthz")

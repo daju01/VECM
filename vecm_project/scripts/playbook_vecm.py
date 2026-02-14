@@ -50,7 +50,13 @@ from statsmodels.tsa.vector_ar.vecm import VECM
 
 from . import storage
 from .cache_keys import hash_config, hash_dataframe
-from .data_streaming import ensure_price_data, load_cached_prices
+from .cost_liquidity import (
+    compute_cost_events,
+    compute_liquidity_metrics,
+    compute_nav_cagr_calmar,
+    resolve_idx_cost_config,
+)
+from .data_streaming import ensure_price_data, load_cached_prices, load_cached_volumes
 from .ms_spread import compute_regime_prob, fit_ms_spread
 from .playbook_types import (
     DecisionParams,
@@ -124,6 +130,26 @@ def _ensure_default_input(path: str) -> str:
     return path
 
 
+def _env_default_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _env_default_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
 def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser = argparse.ArgumentParser(description="VECM/TVECM Trading Playbook")
     parser.add_argument("input_file", nargs="?", default=None)
@@ -138,7 +164,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--z_entry", type=float, default=None)
     parser.add_argument("--z_exit", type=float, default=0.55)
     parser.add_argument("--z_stop", type=float, default=0.8)
+    parser.add_argument("--z_stop_buffer", type=float, default=0.75)
     parser.add_argument("--max_hold", type=int, default=8)
+    parser.add_argument("--min_hold", type=int, default=0)
+    parser.add_argument("--dynamic_hold", type=int, default=0)
+    parser.add_argument("--dynamic_hold_max_add", type=int, default=0)
+    parser.add_argument("--dynamic_hold_step", type=float, default=0.5)
+    parser.add_argument("--adaptive_exit", type=int, default=0)
+    parser.add_argument("--adaptive_loss_cut", type=float, default=0.02)
+    parser.add_argument("--adaptive_profit_hold", type=float, default=0.01)
+    parser.add_argument("--adaptive_profit_extend_days", type=int, default=5)
+    parser.add_argument("--adaptive_max_hold_cap", type=int, default=60)
     parser.add_argument("--cooldown", type=int, default=1)
     parser.add_argument("--z_auto_method", default="mfpt")
     parser.add_argument("--z_auto", type=float, default=0.7)
@@ -151,11 +187,72 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument(
         "--signal_mode",
         default="normal",
-        choices=["normal", "long_from_short_only"],
-        help="Signal execution mode: normal or contrarian long from short signal only",
+        choices=["normal", "long_from_short_only", "long_independent"],
+        help="Signal execution mode: normal, contrarian long_from_short_only, or long_independent (per-leg long only)",
     )
     parser.add_argument("--beta_weight", type=int, default=1)
     parser.add_argument("--cost_bps", type=float, default=5.0)
+    parser.add_argument(
+        "--cost_model",
+        default=os.getenv("VECM_COST_MODEL", "simple"),
+        choices=["simple", "idx_realistic"],
+        help="Transaction cost model: simple (legacy) or idx_realistic",
+    )
+    parser.add_argument(
+        "--broker_buy_rate",
+        type=float,
+        default=_env_default_float("IDX_BROKER_BUY_RATE", 0.0019),
+    )
+    parser.add_argument(
+        "--broker_sell_rate",
+        type=float,
+        default=_env_default_float("IDX_BROKER_SELL_RATE", 0.0029),
+    )
+    parser.add_argument(
+        "--exchange_levy",
+        type=float,
+        default=_env_default_float("IDX_EXCHANGE_LEVY", 0.0),
+    )
+    parser.add_argument(
+        "--sell_tax",
+        type=float,
+        default=_env_default_float("IDX_SELL_TAX_RATE", 0.001),
+    )
+    parser.add_argument(
+        "--spread_bps",
+        type=float,
+        default=_env_default_float("IDX_SPREAD_BPS", 20.0),
+    )
+    parser.add_argument(
+        "--impact_model",
+        default=os.getenv("IDX_IMPACT_MODEL", "sqrt"),
+        choices=["sqrt", "linear", "none"],
+    )
+    parser.add_argument(
+        "--impact_k",
+        type=float,
+        default=_env_default_float("IDX_IMPACT_K", 1.0),
+    )
+    parser.add_argument(
+        "--adtv_win",
+        type=int,
+        default=_env_default_int("IDX_ADTV_WIN", 20),
+    )
+    parser.add_argument(
+        "--sigma_win",
+        type=int,
+        default=_env_default_int("IDX_SIGMA_WIN", 20),
+    )
+    parser.add_argument(
+        "--illiq_cap_mode",
+        default=os.getenv("IDX_ILLIQ_CAP_MODE", "insample_p80"),
+        choices=["insample_p80", "static"],
+    )
+    parser.add_argument(
+        "--illiq_cap_value",
+        type=float,
+        default=_env_default_float("IDX_ILLIQ_CAP_VALUE", float("nan")),
+    )
     parser.add_argument("--half_life_max", type=float, default=120.0)
     parser.add_argument("--dd_stop", type=float, default=0.25)
     parser.add_argument("--fee_buy", type=float, default=0.0019)
@@ -199,7 +296,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         z_entry=float(args.z_entry) if args.z_entry is not None else None,
         z_exit=float(args.z_exit),
         z_stop=float(args.z_stop),
+        z_stop_buffer=max(float(args.z_stop_buffer), 0.0),
         max_hold=int(args.max_hold),
+        min_hold=max(0, int(args.min_hold)),
+        dynamic_hold=bool(args.dynamic_hold),
+        dynamic_hold_max_add=max(0, int(args.dynamic_hold_max_add)),
+        dynamic_hold_step=max(float(args.dynamic_hold_step), 1e-6),
+        adaptive_exit=bool(args.adaptive_exit),
+        adaptive_loss_cut=max(float(args.adaptive_loss_cut), 0.0),
+        adaptive_profit_hold=max(float(args.adaptive_profit_hold), 0.0),
+        adaptive_profit_extend_days=max(0, int(args.adaptive_profit_extend_days)),
+        adaptive_max_hold_cap=max(1, int(args.adaptive_max_hold_cap)),
         cooldown=int(args.cooldown),
         z_auto_method=args.z_auto_method.lower(),
         z_auto_q=float(args.z_auto),
@@ -212,6 +319,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         signal_mode=str(args.signal_mode).lower(),
         beta_weight=bool(args.beta_weight),
         cost_bps=float(args.cost_bps),
+        cost_model=str(args.cost_model).lower(),
+        broker_buy_rate=float(args.broker_buy_rate),
+        broker_sell_rate=float(args.broker_sell_rate),
+        exchange_levy=float(args.exchange_levy),
+        sell_tax=float(args.sell_tax),
+        spread_bps=float(args.spread_bps),
+        impact_model=str(args.impact_model).lower(),
+        impact_k=float(args.impact_k),
+        adtv_win=max(1, int(args.adtv_win)),
+        sigma_win=max(2, int(args.sigma_win)),
+        illiq_cap_mode=str(args.illiq_cap_mode).lower(),
+        illiq_cap_value=float(args.illiq_cap_value) if args.illiq_cap_value is not None and np.isfinite(args.illiq_cap_value) else None,
         half_life_max=float(args.half_life_max),
         dd_stop=float(args.dd_stop),
         fee_buy=float(args.fee_buy),
@@ -253,7 +372,17 @@ def _apply_settings_overrides(cfg: PlaybookConfig) -> None:
         "z_entry": settings.playbook_z_entry,
         "z_exit": settings.playbook_z_exit,
         "z_stop": settings.playbook_z_stop,
+        "z_stop_buffer": getattr(settings, "playbook_z_stop_buffer", None),
         "max_hold": settings.playbook_max_hold,
+        "min_hold": getattr(settings, "playbook_min_hold", None),
+        "dynamic_hold": getattr(settings, "playbook_dynamic_hold", None),
+        "dynamic_hold_max_add": getattr(settings, "playbook_dynamic_hold_max_add", None),
+        "dynamic_hold_step": getattr(settings, "playbook_dynamic_hold_step", None),
+        "adaptive_exit": getattr(settings, "playbook_adaptive_exit", None),
+        "adaptive_loss_cut": getattr(settings, "playbook_adaptive_loss_cut", None),
+        "adaptive_profit_hold": getattr(settings, "playbook_adaptive_profit_hold", None),
+        "adaptive_profit_extend_days": getattr(settings, "playbook_adaptive_profit_extend_days", None),
+        "adaptive_max_hold_cap": getattr(settings, "playbook_adaptive_max_hold_cap", None),
         "cooldown": settings.playbook_cooldown,
         "z_auto_method": settings.playbook_z_auto_method,
         "z_auto_q": settings.playbook_z_auto_q,
@@ -265,6 +394,18 @@ def _apply_settings_overrides(cfg: PlaybookConfig) -> None:
         "short_filter": settings.playbook_short_filter,
         "beta_weight": settings.playbook_beta_weight,
         "cost_bps": settings.playbook_cost_bps,
+        "cost_model": getattr(settings, "playbook_cost_model", None),
+        "broker_buy_rate": getattr(settings, "playbook_broker_buy_rate", None),
+        "broker_sell_rate": getattr(settings, "playbook_broker_sell_rate", None),
+        "exchange_levy": getattr(settings, "playbook_exchange_levy", None),
+        "sell_tax": getattr(settings, "playbook_sell_tax", None),
+        "spread_bps": getattr(settings, "playbook_spread_bps", None),
+        "impact_model": getattr(settings, "playbook_impact_model", None),
+        "impact_k": getattr(settings, "playbook_impact_k", None),
+        "adtv_win": getattr(settings, "playbook_adtv_win", None),
+        "sigma_win": getattr(settings, "playbook_sigma_win", None),
+        "illiq_cap_mode": getattr(settings, "playbook_illiq_cap_mode", None),
+        "illiq_cap_value": getattr(settings, "playbook_illiq_cap_value", None),
         "half_life_max": settings.playbook_half_life_max,
         "dd_stop": settings.playbook_dd_stop,
         "fee_buy": settings.playbook_fee_buy,
@@ -310,6 +451,13 @@ def _ensure_run_dirs() -> None:
 def _write_text(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def _resolve_stage2_obj_mode() -> str:
+    mode = str(os.getenv("STAGE2_OBJ_MODE", "legacy")).strip().lower()
+    if mode not in {"legacy", "idx_v1", "idx_v2_calmar"}:
+        return "legacy"
+    return mode
 
 
 def _resolve_universe(
@@ -1069,7 +1217,7 @@ def build_signals(
         # - legacy long signal is ignored
         enter_long = enter_short.copy()
         enter_short = pd.Series(False, index=enter_short.index)
-    elif signal_mode != "normal":
+    elif signal_mode not in {"normal", "long_independent"}:
         LOGGER.warning("Unknown signal_mode=%s, falling back to normal", signal_mode)
     long_conf = _confirm_streak(enter_long, cfg.regime_confirm)
     short_conf = _confirm_streak(enter_short, cfg.regime_confirm)
@@ -1080,8 +1228,9 @@ def build_signals(
         signals["delta_score"] = delta_score.reindex(zect.index)
     if delta_mom12 is not None:
         signals["delta_mom12"] = delta_mom12.reindex(zect.index)
-    # Enforce long-only patch when configured
-    if cfg.long_only:
+    # Enforce long-only patch when configured.
+    # In long_independent mode, `short` means "buy right leg" (not short-selling).
+    if cfg.long_only and signal_mode != "long_independent":
         signals["short"] = 0.0
     if cfg.mom_enable:
         LOGGER.info(
@@ -1112,6 +1261,12 @@ class ExecutionResult:
     ret_core: pd.Series
     cost: pd.Series
     trades: pd.DataFrame
+    nav_prev: Optional[pd.Series] = None
+    w1: Optional[pd.Series] = None
+    w2: Optional[pd.Series] = None
+    close_pair: Optional[pd.DataFrame] = None
+    volume_pair: Optional[pd.DataFrame] = None
+    cost_breakdown: Optional[pd.DataFrame] = None
     p_regime: Optional[pd.Series] = None
     delta_score: Optional[pd.Series] = None
     delta_mom12: Optional[pd.Series] = None
@@ -1123,6 +1278,7 @@ def execute_trades(
     lp_pair: pd.DataFrame,
     beta_series: pd.Series,
     cfg: PlaybookConfig,
+    volume_pair: Optional[pd.DataFrame] = None,
     p_regime: Optional[pd.Series] = None,
     delta_score: Optional[pd.Series] = None,
     delta_mom12: Optional[pd.Series] = None,
@@ -1132,17 +1288,56 @@ def execute_trades(
     lp_pair = lp_pair.reindex(idx).ffill().dropna()
     beta_series = beta_series.reindex(lp_pair.index).ffill()
     zect = zect.reindex(lp_pair.index)
+    if volume_pair is not None:
+        volume_pair = volume_pair.reindex(lp_pair.index)
+        volume_pair = volume_pair.astype(float)
     if p_regime is not None:
         p_regime = p_regime.reindex(lp_pair.index)
     r1 = lp_pair.iloc[:, 0].diff().fillna(0.0)
     r2 = lp_pair.iloc[:, 1].diff().fillna(0.0)
+    close_pair = np.exp(lp_pair)
+    close1 = close_pair.iloc[:, 0]
+    close2 = close_pair.iloc[:, 1]
+    close_ret1 = close1.pct_change().fillna(0.0)
+    close_ret2 = close2.pct_change().fillna(0.0)
     beta_vals = beta_series.fillna(beta_series.mean()).to_numpy()
     weights = 1.0 + np.abs(beta_vals)
     w1 = 1.0 / weights
     w2 = np.abs(beta_vals) / weights
+    signal_mode = str(getattr(cfg, "signal_mode", "normal") or "normal").lower()
+    independent_long_mode = signal_mode == "long_independent"
+    use_idx_cost_model = str(getattr(cfg, "cost_model", "simple")).strip().lower() == "idx_realistic"
+    idx_cost_cfg = resolve_idx_cost_config(
+        fee_buy=cfg.fee_buy,
+        fee_sell=cfg.fee_sell,
+        broker_buy_rate=getattr(cfg, "broker_buy_rate", None),
+        broker_sell_rate=getattr(cfg, "broker_sell_rate", None),
+        exchange_levy=getattr(cfg, "exchange_levy", None),
+        sell_tax=getattr(cfg, "sell_tax", None),
+        spread_bps=getattr(cfg, "spread_bps", None),
+        impact_model=getattr(cfg, "impact_model", None),
+        impact_k=getattr(cfg, "impact_k", None),
+        adtv_win=getattr(cfg, "adtv_win", None),
+        sigma_win=getattr(cfg, "sigma_win", None),
+        illiq_cap_mode=getattr(cfg, "illiq_cap_mode", None),
+        illiq_cap_value=getattr(cfg, "illiq_cap_value", None),
+    )
+
     pos = np.zeros(len(lp_pair))
     cost = np.zeros(len(lp_pair))
     ret_core_vals = np.zeros(len(lp_pair))
+    nav_prev_vals = np.ones(len(lp_pair))
+    dexp1_vals = np.zeros(len(lp_pair))
+    dexp2_vals = np.zeros(len(lp_pair))
+    notional_leg1_vals = np.zeros(len(lp_pair))
+    notional_leg2_vals = np.zeros(len(lp_pair))
+    turnover_daily_vals = np.zeros(len(lp_pair))
+    participation_vals = np.full(len(lp_pair), np.nan)
+    cost_broker_vals = np.zeros(len(lp_pair))
+    cost_levy_vals = np.zeros(len(lp_pair))
+    cost_spread_vals = np.zeros(len(lp_pair))
+    cost_impact_vals = np.zeros(len(lp_pair))
+    cost_sell_tax_vals = np.zeros(len(lp_pair))
     trades: List[Dict[str, object]] = []
     open_idx: Optional[int] = None
     open_side = 0
@@ -1150,7 +1345,27 @@ def execute_trades(
     trade_gross_pnl = 0.0
     trade_total_cost = 0.0
     trade_days = 0
+    trade_max_hold = max(1, int(cfg.max_hold))
+    trade_extended = False
+    nav_prev_value = 1.0
+
+    def _resolve_trade_max_hold(entry_abs_z: float) -> int:
+        base_hold = max(1, int(cfg.max_hold))
+        if not cfg.dynamic_hold or cfg.dynamic_hold_max_add <= 0:
+            return base_hold
+        if not np.isfinite(entry_abs_z):
+            return base_hold
+        if cfg.z_entry is not None and np.isfinite(cfg.z_entry) and cfg.z_entry > 0:
+            z_ref = float(cfg.z_entry)
+        else:
+            z_ref = max(float(cfg.z_exit), 1e-6)
+        strength = max(0.0, float(entry_abs_z) - z_ref)
+        extra_days = int(np.floor(strength / max(float(cfg.dynamic_hold_step), 1e-6)))
+        extra_days = max(0, min(extra_days, int(cfg.dynamic_hold_max_add)))
+        return int(base_hold + extra_days)
+
     for i in range(len(lp_pair)):
+        nav_prev_vals[i] = nav_prev_value
         prev = pos[i - 1] if i > 0 else 0
         enter_long = bool(signals.iloc[i]["long"] > 0)
         enter_short = bool(signals.iloc[i]["short"] > 0)
@@ -1163,14 +1378,21 @@ def execute_trades(
                 trade_gross_pnl = 0.0
                 trade_total_cost = 0.0
                 trade_days = 0
+                trade_extended = False
+                entry_z = float(zect.iloc[i]) if np.isfinite(zect.iloc[i]) else float("nan")
+                trade_max_hold = _resolve_trade_max_hold(abs(entry_z))
             elif enter_short:
-                pos[i] = -1
+                # In long_independent mode, short signal means "buy right leg".
+                pos[i] = -1 if independent_long_mode else -1
                 open_idx = i
                 open_side = -1
                 trade_pnl = 0.0
                 trade_gross_pnl = 0.0
                 trade_total_cost = 0.0
                 trade_days = 0
+                trade_extended = False
+                entry_z = float(zect.iloc[i]) if np.isfinite(zect.iloc[i]) else float("nan")
+                trade_max_hold = _resolve_trade_max_hold(abs(entry_z))
             else:
                 pos[i] = 0
         else:
@@ -1186,12 +1408,86 @@ def execute_trades(
                     exit_flag = np.sign(zval) != np.sign(prev_z)
             elif cfg.exit == "tplus1":
                 exit_flag = trade_days >= 1
+            min_hold_req = max(0, int(cfg.min_hold))
+            if trade_days < min_hold_req:
+                exit_flag = False
             stop_flag = np.isfinite(zval) and abs(zval) >= cfg.z_stop
-            time_flag = trade_days >= cfg.max_hold
+            if trade_days < min_hold_req:
+                stop_flag = False
+
+            if bool(getattr(cfg, "adaptive_exit", False)):
+                loss_cut = max(float(getattr(cfg, "adaptive_loss_cut", 0.0)), 0.0)
+                if loss_cut > 0 and trade_pnl <= -loss_cut and trade_days >= 1:
+                    exit_flag = True
+                profit_hold = max(float(getattr(cfg, "adaptive_profit_hold", 0.0)), 0.0)
+                if (
+                    profit_hold > 0
+                    and (not trade_extended)
+                    and trade_pnl >= profit_hold
+                ):
+                    extend_days = max(0, int(getattr(cfg, "adaptive_profit_extend_days", 0)))
+                    hold_cap = max(trade_max_hold, int(getattr(cfg, "adaptive_max_hold_cap", trade_max_hold)))
+                    trade_max_hold = min(trade_max_hold + extend_days, hold_cap)
+                    trade_extended = True
+            time_flag = trade_days >= trade_max_hold
             if exit_flag or stop_flag or time_flag:
                 pos[i] = 0
+        if independent_long_mode:
+            prev_exp1 = 1.0 if prev > 0 else 0.0
+            prev_exp2 = 1.0 if prev < 0 else 0.0
+            curr_exp1 = 1.0 if pos[i] > 0 else 0.0
+            curr_exp2 = 1.0 if pos[i] < 0 else 0.0
+        else:
+            prev_exp1 = (pos[i - 1] * w1[i - 1]) if i > 0 else 0.0
+            prev_exp2 = (-pos[i - 1] * w2[i - 1]) if i > 0 else 0.0
+            curr_exp1 = pos[i] * w1[i]
+            curr_exp2 = -pos[i] * w2[i]
         if pos[i] != prev:
-            # Apply fees
+            dexp1_vals[i] = curr_exp1 - prev_exp1
+            dexp2_vals[i] = curr_exp2 - prev_exp2
+        else:
+            dexp1_vals[i] = 0.0
+            dexp2_vals[i] = 0.0
+
+        event_notional_leg1 = abs(dexp1_vals[i]) * nav_prev_vals[i]
+        event_notional_leg2 = abs(dexp2_vals[i]) * nav_prev_vals[i]
+        notional_leg1_vals[i] = event_notional_leg1
+        notional_leg2_vals[i] = event_notional_leg2
+        if nav_prev_vals[i] > 0:
+            turnover_daily_vals[i] = (event_notional_leg1 + event_notional_leg2) / nav_prev_vals[i]
+        else:
+            turnover_daily_vals[i] = 0.0
+
+        if use_idx_cost_model and (event_notional_leg1 > 0.0 or event_notional_leg2 > 0.0):
+            hist_idx = lp_pair.index[: i + 1]
+            cost_event = compute_cost_events(
+                dexp1=pd.Series(dexp1_vals[: i + 1], index=hist_idx),
+                dexp2=pd.Series(dexp2_vals[: i + 1], index=hist_idx),
+                nav_prev=pd.Series(nav_prev_vals[: i + 1], index=hist_idx),
+                close1=close1.iloc[: i + 1],
+                close2=close2.iloc[: i + 1],
+                ret1=close_ret1.iloc[: i + 1],
+                ret2=close_ret2.iloc[: i + 1],
+                volume1=(volume_pair.iloc[: i + 1, 0] if volume_pair is not None else None),
+                volume2=(volume_pair.iloc[: i + 1, 1] if volume_pair is not None else None),
+                broker_buy_rate=idx_cost_cfg["broker_buy_rate"],
+                broker_sell_rate=idx_cost_cfg["broker_sell_rate"],
+                levy_rate=idx_cost_cfg["levy_rate"],
+                sell_tax_rate=idx_cost_cfg["sell_tax_rate"],
+                spread_bps=idx_cost_cfg["spread_bps"],
+                impact_model=idx_cost_cfg["impact_model"],
+                impact_k=idx_cost_cfg["impact_k"],
+                adtv_win=int(idx_cost_cfg["adtv_win"]),
+                sigma_win=int(idx_cost_cfg["sigma_win"]),
+            ).iloc[-1]
+            cost[i] = float(cost_event["cost_total"])
+            participation_vals[i] = float(cost_event["participation"]) if np.isfinite(cost_event["participation"]) else np.nan
+            cost_broker_vals[i] = float(cost_event["cost_broker"])
+            cost_levy_vals[i] = float(cost_event["cost_levy"])
+            cost_spread_vals[i] = float(cost_event["cost_spread"])
+            cost_impact_vals[i] = float(cost_event["cost_impact"])
+            cost_sell_tax_vals[i] = float(cost_event["cost_sell_tax"])
+        elif pos[i] != prev:
             fee = cfg.fee_buy + cfg.fee_sell
             if prev == 0 and pos[i] == 1:
                 cost[i] = fee * (w1[i] + w2[i])
@@ -1201,13 +1497,21 @@ def execute_trades(
                 cost[i] = fee * (w1[i] + w2[i])
             else:
                 cost[i] = 2 * fee * (w1[i] + w2[i])
-        if pos[i] > 0:
+        if independent_long_mode:
+            if pos[i] > 0:
+                pnl_core = float(close_ret1.iloc[i])
+            elif pos[i] < 0:
+                pnl_core = float(close_ret2.iloc[i])
+            else:
+                pnl_core = 0.0
+        elif pos[i] > 0:
             pnl_core = w1[i] * r1.iloc[i] - w2[i] * r2.iloc[i]
         elif pos[i] < 0:
             pnl_core = -w1[i] * r1.iloc[i] + w2[i] * r2.iloc[i]
         else:
             pnl_core = 0.0
         ret_core_vals[i] = pnl_core
+        nav_prev_value = max(nav_prev_value * (1.0 + pnl_core - cost[i]), 1e-9)
         if open_idx is not None:
             trade_gross_pnl += pnl_core
             trade_total_cost += cost[i]
@@ -1228,12 +1532,17 @@ def execute_trades(
                 {
                     "open_index": open_idx,
                     "close_index": i,
-                    "side": "LONG" if open_side > 0 else "SHORT",
+                    "side": (
+                        "LONG_LEFT" if independent_long_mode and open_side > 0 else
+                        "LONG_RIGHT" if independent_long_mode and open_side < 0 else
+                        "LONG" if open_side > 0 else "SHORT"
+                    ),
                     "days": trade_days,
                     "holding_days": holding_days,
                     "pnl": trade_pnl,
                     "gross_pnl": trade_gross_pnl,
                     "total_cost": trade_total_cost,
+                    "max_hold_effective": trade_max_hold,
                     "open_date": lp_pair.index[open_idx],
                     "close_date": lp_pair.index[i],
                 }
@@ -1244,11 +1553,33 @@ def execute_trades(
             trade_gross_pnl = 0.0
             trade_total_cost = 0.0
             trade_days = 0
+            trade_max_hold = max(1, int(cfg.max_hold))
+            trade_extended = False
     pos_series = pd.Series(pos, index=lp_pair.index, name="pos")
     cost_series = pd.Series(cost, index=lp_pair.index, name="cost")
     ret_core = pd.Series(ret_core_vals, index=lp_pair.index, name="ret_core")
     ret_net = ret_core - cost_series
     ret_net.name = "ret"
+    nav_prev_series = pd.Series(nav_prev_vals, index=lp_pair.index, name="nav_prev")
+    w1_series = pd.Series(w1, index=lp_pair.index, name="w1")
+    w2_series = pd.Series(w2, index=lp_pair.index, name="w2")
+    cost_breakdown = pd.DataFrame(
+        {
+            "dexp1": dexp1_vals,
+            "dexp2": dexp2_vals,
+            "notional_leg1": notional_leg1_vals,
+            "notional_leg2": notional_leg2_vals,
+            "turnover_daily": turnover_daily_vals,
+            "participation": participation_vals,
+            "cost_broker": cost_broker_vals,
+            "cost_levy": cost_levy_vals,
+            "cost_spread": cost_spread_vals,
+            "cost_impact": cost_impact_vals,
+            "cost_sell_tax": cost_sell_tax_vals,
+            "cost_total": cost,
+        },
+        index=lp_pair.index,
+    )
     trades_df = pd.DataFrame(trades)
     return ExecutionResult(
         pos=pos_series,
@@ -1256,6 +1587,12 @@ def execute_trades(
         ret_core=ret_core,
         cost=cost_series,
         trades=trades_df,
+        nav_prev=nav_prev_series,
+        w1=w1_series,
+        w2=w2_series,
+        close_pair=close_pair,
+        volume_pair=volume_pair,
+        cost_breakdown=cost_breakdown,
         p_regime=p_regime,
         delta_score=delta_score,
         delta_mom12=delta_mom12,
@@ -1301,65 +1638,210 @@ def compute_metrics(
         p_mr_mean = float("nan")
         p_mr_inpos = float("nan")
 
-    ret = exec_res.ret
+    ret_core = exec_res.ret_core if exec_res.ret_core is not None else exec_res.ret
+    cost = exec_res.cost if exec_res.cost is not None else pd.Series(0.0, index=ret_core.index)
+    ret_net = (ret_core - cost).fillna(0.0)
+    ret_net.name = "ret"
 
-    # Kalau sama sekali tidak ada return, kembalikan metrik default
-    if ret.empty:
+    if ret_net.empty:
         return {
             "sharpe_oos": 0.0,
+            "sharpe_oos_net": 0.0,
             "maxdd": 0.0,
+            "maxdd_oos_net": 0.0,
             "turnover": 0.0,
             "turnover_annualised": 0.0,
+            "turnover_annualised_notional": 0.0,
             "n_trades": n_trades,
             "avg_hold_days": avg_hold_days,
             "p_mr_mean": p_mr_mean,
             "p_mr_inpos_mean": p_mr_inpos,
             "cagr": 0.0,
+            "cagr_oos_net": 0.0,
+            "calmar_oos_net": 0.0,
             "nav_oos": 1.0,
+            "nav_end_oos_net": 1.0,
+            "participation_mean": 0.0,
+            "participation_max": 0.0,
+            "amihud_illiq": 0.0,
+            "illiq_cap": float("nan"),
+            "illiq_cap_used": float("nan"),
+            "illiq_cap_mode": "insample_p80",
+            "cost_total": 0.0,
+            "cost_sell_tax_total": 0.0,
+            "cost_spread_total": 0.0,
+            "cost_impact_total": 0.0,
+            "cost_broker_total": 0.0,
+            "cost_levy_total": 0.0,
+            "cost_model": str(getattr(cfg, "cost_model", "simple")),
         }
 
-    # --- OOS mask & NAV ---
-    mask_oos = ret.index.date >= oos_start
-    ret_oos = ret[mask_oos]
-    if ret_oos.empty:
-        ret_oos = ret
-
-    nav = (1 + ret_oos).cumprod()
-    nav0 = nav.iloc[0] if not nav.empty else 1.0
-    nav1 = nav.iloc[-1] if not nav.empty else 1.0
-
     ann_days = cfg.ann_days if cfg.ann_days else 252
-    total_days = max(len(ret_oos), 1)
-    cagr = (nav1 / nav0) ** (ann_days / total_days) - 1 if nav0 > 0 and nav1 > 0 else 0.0
-
-    dd = nav / nav.cummax() - 1
-    maxdd = float(dd.min()) if not dd.empty else 0.0
+    mask_oos = pd.Series(ret_net.index.date >= oos_start, index=ret_net.index)
+    ret_oos = ret_net[mask_oos]
+    if ret_oos.empty:
+        ret_oos = ret_net
+        mask_oos = pd.Series(True, index=ret_net.index)
 
     mu = float(ret_oos.mean())
     sd = float(ret_oos.std())
-    sharpe = (mu / sd) * math.sqrt(252) if sd > 0 else 0.0
+    sharpe_net = (mu / sd) * math.sqrt(ann_days) if sd > 0 else 0.0
 
-    # --- Turnover: dihitung di horizon OOS ---
+    nav_stats = compute_nav_cagr_calmar(
+        ret_oos,
+        ann_days=ann_days,
+        calmar_eps=resolve_idx_cost_config(
+            fee_buy=cfg.fee_buy,
+            fee_sell=cfg.fee_sell,
+            broker_buy_rate=getattr(cfg, "broker_buy_rate", None),
+            broker_sell_rate=getattr(cfg, "broker_sell_rate", None),
+            exchange_levy=getattr(cfg, "exchange_levy", None),
+            sell_tax=getattr(cfg, "sell_tax", None),
+            spread_bps=getattr(cfg, "spread_bps", None),
+            impact_model=getattr(cfg, "impact_model", None),
+            impact_k=getattr(cfg, "impact_k", None),
+            adtv_win=getattr(cfg, "adtv_win", None),
+            sigma_win=getattr(cfg, "sigma_win", None),
+            illiq_cap_mode=getattr(cfg, "illiq_cap_mode", None),
+            illiq_cap_value=getattr(cfg, "illiq_cap_value", None),
+        )["calmar_eps"],
+    )
+
+    # Legacy turnover (state-change count) retained for backward compatibility.
     pos = exec_res.pos
     pos_oos = pos[mask_oos]
     if pos_oos.empty:
         pos_oos = pos
-
     turnover_total = float(np.abs(pos_oos.diff().fillna(0)).sum())
     days_pos = max(len(pos_oos), 1)
     turnover_annualised = float(turnover_total * (ann_days / days_pos))
 
+    # Notional turnover from exposure deltas (IDX foundation).
+    if isinstance(exec_res.cost_breakdown, pd.DataFrame) and "turnover_daily" in exec_res.cost_breakdown.columns:
+        turnover_daily_series = exec_res.cost_breakdown["turnover_daily"].reindex(ret_net.index).fillna(0.0)
+    else:
+        turnover_daily_series = pd.Series(0.0, index=ret_net.index)
+    turnover_oos = turnover_daily_series[mask_oos]
+    if turnover_oos.empty:
+        turnover_oos = turnover_daily_series
+    turnover_annualised_notional = float(ann_days * turnover_oos.mean()) if not turnover_oos.empty else 0.0
+
+    idx_cfg = resolve_idx_cost_config(
+        fee_buy=cfg.fee_buy,
+        fee_sell=cfg.fee_sell,
+        broker_buy_rate=getattr(cfg, "broker_buy_rate", None),
+        broker_sell_rate=getattr(cfg, "broker_sell_rate", None),
+        exchange_levy=getattr(cfg, "exchange_levy", None),
+        sell_tax=getattr(cfg, "sell_tax", None),
+        spread_bps=getattr(cfg, "spread_bps", None),
+        impact_model=getattr(cfg, "impact_model", None),
+        impact_k=getattr(cfg, "impact_k", None),
+        adtv_win=getattr(cfg, "adtv_win", None),
+        sigma_win=getattr(cfg, "sigma_win", None),
+        illiq_cap_mode=getattr(cfg, "illiq_cap_mode", None),
+        illiq_cap_value=getattr(cfg, "illiq_cap_value", None),
+    )
+    liquidity = {
+        "participation_mean": 0.0,
+        "participation_max": 0.0,
+        "amihud_illiq": 0.0,
+        "illiq_cap": float("nan"),
+        "illiq_cap_mode": idx_cfg["illiq_cap_mode"],
+    }
+    if (
+        isinstance(exec_res.close_pair, pd.DataFrame)
+        and exec_res.close_pair.shape[1] >= 2
+        and isinstance(exec_res.w1, pd.Series)
+        and isinstance(exec_res.w2, pd.Series)
+        and isinstance(exec_res.nav_prev, pd.Series)
+    ):
+        close_pair = exec_res.close_pair.reindex(ret_net.index)
+        volume_pair = exec_res.volume_pair.reindex(ret_net.index) if isinstance(exec_res.volume_pair, pd.DataFrame) else None
+        close1 = close_pair.iloc[:, 0].astype(float)
+        close2 = close_pair.iloc[:, 1].astype(float)
+        ret1 = close1.pct_change().fillna(0.0)
+        ret2 = close2.pct_change().fillna(0.0)
+        exp1 = exec_res.pos.reindex(ret_net.index).fillna(0.0) * exec_res.w1.reindex(ret_net.index).fillna(0.0)
+        exp2 = -exec_res.pos.reindex(ret_net.index).fillna(0.0) * exec_res.w2.reindex(ret_net.index).fillna(0.0)
+        dexp1 = exp1.diff().fillna(exp1)
+        dexp2 = exp2.diff().fillna(exp2)
+        if isinstance(exec_res.cost_breakdown, pd.DataFrame):
+            event_mask = (
+                exec_res.cost_breakdown["dexp1"].reindex(ret_net.index).fillna(0.0).abs()
+                + exec_res.cost_breakdown["dexp2"].reindex(ret_net.index).fillna(0.0).abs()
+            ) > 0
+            dexp1 = dexp1.where(event_mask, 0.0)
+            dexp2 = dexp2.where(event_mask, 0.0)
+        notional_leg1 = dexp1.abs() * exec_res.nav_prev.reindex(ret_net.index).fillna(1.0)
+        notional_leg2 = dexp2.abs() * exec_res.nav_prev.reindex(ret_net.index).fillna(1.0)
+        liquidity = compute_liquidity_metrics(
+            close1=close1,
+            close2=close2,
+            volume1=(volume_pair.iloc[:, 0] if volume_pair is not None and volume_pair.shape[1] >= 2 else None),
+            volume2=(volume_pair.iloc[:, 1] if volume_pair is not None and volume_pair.shape[1] >= 2 else None),
+            ret1=ret1,
+            ret2=ret2,
+            notional_leg1=notional_leg1,
+            notional_leg2=notional_leg2,
+            oos_mask=mask_oos,
+            adtv_win=int(idx_cfg["adtv_win"]),
+            illiq_cap_mode=str(idx_cfg["illiq_cap_mode"]),
+            illiq_cap_value=idx_cfg["illiq_cap_value"],
+        )
+
+    cost_breakdown = exec_res.cost_breakdown if isinstance(exec_res.cost_breakdown, pd.DataFrame) else pd.DataFrame(index=ret_net.index)
+    cost_total = float(cost.sum())
+    cost_sell_tax_total = float(cost_breakdown.get("cost_sell_tax", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_spread_total = float(cost_breakdown.get("cost_spread", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_impact_total = float(cost_breakdown.get("cost_impact", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_broker_total = float(cost_breakdown.get("cost_broker", pd.Series(0.0, index=ret_net.index)).sum())
+    cost_levy_total = float(cost_breakdown.get("cost_levy", pd.Series(0.0, index=ret_net.index)).sum())
+
+    try:
+        idx_rho_cap = float(os.getenv("IDX_RHO_CAP", "0.02"))
+    except ValueError:
+        idx_rho_cap = 0.02
+
     return {
-        "sharpe_oos": float(sharpe),
-        "maxdd": float(maxdd),
+        # Backward compatible fields
+        "sharpe_oos": float(sharpe_net),
+        "maxdd": float(nav_stats["maxdd_raw"]),
         "turnover": float(turnover_total),
         "turnover_annualised": float(turnover_annualised),
         "n_trades": int(n_trades),
         "avg_hold_days": float(avg_hold_days),
         "p_mr_mean": float(p_mr_mean),
         "p_mr_inpos_mean": float(p_mr_inpos),
-        "cagr": float(cagr),
-        "nav_oos": float(nav1),
+        "cagr": float(nav_stats["cagr"]),
+        "nav_oos": float(nav_stats["nav_end"]),
+        # Net + liquidity foundation
+        "sharpe_oos_net": float(sharpe_net),
+        "maxdd_oos_net": float(nav_stats["maxdd"]),
+        "cagr_oos_net": float(nav_stats["cagr"]),
+        "calmar_oos_net": float(nav_stats["calmar"]),
+        "nav_end_oos_net": float(nav_stats["nav_end"]),
+        "turnover_annualised_notional": float(turnover_annualised_notional),
+        "participation_mean": float(liquidity.get("participation_mean", 0.0)),
+        "participation_max": float(liquidity.get("participation_max", 0.0)),
+        "amihud_illiq": float(liquidity.get("amihud_illiq", 0.0)),
+        "illiq_cap": float(liquidity.get("illiq_cap", float("nan"))),
+        "illiq_cap_used": float(liquidity.get("illiq_cap", float("nan"))),
+        "illiq_cap_mode": str(liquidity.get("illiq_cap_mode", "insample_p80")),
+        "cost_total": float(cost_total),
+        "cost_sell_tax_total": float(cost_sell_tax_total),
+        "cost_spread_total": float(cost_spread_total),
+        "cost_impact_total": float(cost_impact_total),
+        "cost_broker_total": float(cost_broker_total),
+        "cost_levy_total": float(cost_levy_total),
+        # Cost/liquidity params for artifact debugging
+        "objective_mode": _resolve_stage2_obj_mode(),
+        "cost_model": str(getattr(cfg, "cost_model", "simple")),
+        "idx_spread_bps": float(idx_cfg["spread_bps"]),
+        "idx_impact_k": float(idx_cfg["impact_k"]),
+        "idx_sell_tax_rate": float(idx_cfg["sell_tax_rate"]),
+        "idx_adtv_win": float(idx_cfg["adtv_win"]),
+        "idx_sigma_win": float(idx_cfg["sigma_win"]),
+        "idx_rho_cap": float(idx_rho_cap),
     }
 
 
@@ -1418,13 +1900,22 @@ def _apply_decision_params(
     cfg: PlaybookConfig,
     decision_params: DecisionParams,
 ) -> PlaybookConfig:
+    z_entry_val = float(decision_params.z_entry) if decision_params.z_entry is not None else None
+    base_z_stop = float(getattr(cfg, "z_stop", 0.8))
+    z_stop_buffer = max(float(getattr(cfg, "z_stop_buffer", 0.0)), 0.0)
+    if z_entry_val is not None and np.isfinite(z_entry_val):
+        target_z_stop = z_entry_val + z_stop_buffer
+        tuned_z_stop = max(base_z_stop, target_z_stop)
+    else:
+        tuned_z_stop = base_z_stop
+
     updated_cfg = dataclasses.replace(
         cfg,
         z_entry=decision_params.z_entry,
         z_exit=float(decision_params.z_exit),
         max_hold=int(decision_params.max_hold),
         cooldown=int(decision_params.cooldown),
-        z_stop=float(max(decision_params.z_entry or 0.0, decision_params.z_exit)),
+        z_stop=float(tuned_z_stop),
         p_th=decision_params.p_th if decision_params.p_th is not None else cfg.p_th,
     )
     if updated_cfg.z_entry is not None:
@@ -1434,13 +1925,6 @@ def _apply_decision_params(
                 updated_cfg.z_entry,
             )
             updated_cfg = dataclasses.replace(updated_cfg, z_entry=None)
-        elif updated_cfg.z_stop < updated_cfg.z_entry:
-            LOGGER.info(
-                "Adjusting z_stop from %.3f to %.3f to respect z_entry threshold",
-                updated_cfg.z_stop,
-                updated_cfg.z_entry,
-            )
-            updated_cfg = dataclasses.replace(updated_cfg, z_stop=float(updated_cfg.z_entry))
     return updated_cfg
 
 
@@ -1792,12 +2276,33 @@ def evaluate_rules(
         p_regime=features.p_mr_series,
         delta_mom12=features.delta_mom12,
     )
+    volume_pair: Optional[pd.DataFrame] = None
+    try:
+        volume_panel = load_cached_volumes()
+        if "date" in volume_panel.columns:
+            volume_panel = volume_panel.set_index("date")
+        volume_panel.index = pd.to_datetime(volume_panel.index, errors="coerce")
+        if features.selected_l in volume_panel.columns and features.selected_r in volume_panel.columns:
+            volume_pair = volume_panel[[features.selected_l, features.selected_r]].reindex(features.lp.index)
+    except Exception:
+        try:
+            ensure_price_data(tickers=[features.selected_l, features.selected_r], force_refresh=False)
+            volume_panel = load_cached_volumes()
+            if "date" in volume_panel.columns:
+                volume_panel = volume_panel.set_index("date")
+            volume_panel.index = pd.to_datetime(volume_panel.index, errors="coerce")
+            if features.selected_l in volume_panel.columns and features.selected_r in volume_panel.columns:
+                volume_pair = volume_panel[[features.selected_l, features.selected_r]].reindex(features.lp.index)
+        except Exception:
+            volume_pair = None
+
     exec_res = execute_trades(
         features.zect,
         signals,
         features.lp,
         features.beta_series,
         cfg,
+        volume_pair=volume_pair,
         p_regime=features.p_mr_series,
         delta_score=features.delta_score,
         delta_mom12=features.delta_mom12,
@@ -1908,6 +2413,18 @@ def persist_artifacts(run_id: str, cfg: PlaybookConfig, result: Dict[str, object
     _df_to_csv(exec_res.pos.to_frame("pos"), pos_path)
 
     ret_df = pd.DataFrame({"ret": exec_res.ret, "cost": exec_res.cost})
+    if isinstance(exec_res.cost_breakdown, pd.DataFrame) and not exec_res.cost_breakdown.empty:
+        for col in [
+            "cost_broker",
+            "cost_levy",
+            "cost_spread",
+            "cost_impact",
+            "cost_sell_tax",
+            "turnover_daily",
+            "participation",
+        ]:
+            if col in exec_res.cost_breakdown.columns:
+                ret_df[col] = exec_res.cost_breakdown[col]
     if getattr(exec_res, "p_regime", None) is not None:
         ret_df["p_regime"] = exec_res.p_regime
     if getattr(exec_res, "delta_score", None) is not None:
