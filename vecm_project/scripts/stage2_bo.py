@@ -89,44 +89,211 @@ def _resolve_min_trades() -> int:
     return max(0, min_trades)
 
 
+def _resolve_huge_penalty() -> float:
+    raw = os.getenv("STAGE2_HUGE_PENALTY", "1000000")
+    try:
+        return float(raw)
+    except ValueError:
+        return 1_000_000.0
+
+
+def _resolve_obj_mode() -> str:
+    mode = str(os.getenv("STAGE2_OBJ_MODE", "legacy")).strip().lower()
+    if mode not in {"legacy", "idx_v1", "idx_v2_calmar"}:
+        return "legacy"
+    return mode
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _cfg_or_env_float(cfg: Mapping[str, Any], key: str, env_name: str, default: float) -> float:
+    """Read float from cfg first; fall back to env/default when cfg is None/invalid."""
+
+    value = cfg.get(key)
+    if value is None:
+        return _env_float(env_name, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return _env_float(env_name, default)
+
+
+def _objective_env_snapshot(base_cfg: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    cfg = dict(base_cfg or {})
+    return {
+        "objective_mode": _resolve_obj_mode(),
+        "cost_model": str(cfg.get("cost_model", "simple")),
+        "broker_buy_rate": _cfg_or_env_float(cfg, "broker_buy_rate", "IDX_BROKER_BUY_RATE", 0.0019),
+        "broker_sell_rate": _cfg_or_env_float(cfg, "broker_sell_rate", "IDX_BROKER_SELL_RATE", 0.0029),
+        "exchange_levy": _cfg_or_env_float(cfg, "exchange_levy", "IDX_LEVY_RATE", 0.0),
+        "sell_tax": _cfg_or_env_float(cfg, "sell_tax", "IDX_SELL_TAX_RATE", 0.001),
+        "spread_bps": _cfg_or_env_float(cfg, "spread_bps", "IDX_SPREAD_BPS", 20.0),
+        "impact_model": str(cfg.get("impact_model", os.getenv("IDX_IMPACT_MODEL", "sqrt"))),
+        "impact_k": _cfg_or_env_float(cfg, "impact_k", "IDX_IMPACT_K", 1.0),
+        "adtv_win": _cfg_or_env_float(cfg, "adtv_win", "IDX_ADTV_WIN", 20.0),
+        "sigma_win": _cfg_or_env_float(cfg, "sigma_win", "IDX_SIGMA_WIN", 20.0),
+        "illiq_cap_mode_cfg": str(cfg.get("illiq_cap_mode", os.getenv("IDX_ILLIQ_CAP_MODE", "insample_p80"))),
+        "illiq_cap_value_cfg": _cfg_or_env_float(cfg, "illiq_cap_value", "IDX_ILLIQ_CAP_VALUE", float("nan")),
+        "dd_cap": _env_float("IDX_DD_CAP", 0.15),
+        "dd_hard": _env_float("IDX_DD_HARD", 0.20),
+        "rho_cap": _env_float("IDX_RHO_CAP", 0.02),
+        "illiq_cap_mode": str(os.getenv("IDX_ILLIQ_CAP_MODE", "insample_p80")).strip().lower(),
+        "illiq_cap_value": _env_float("IDX_ILLIQ_CAP_VALUE", float("nan")),
+        "lambda_dd": _env_float("IDX_LAMBDA_DD", 4.0),
+        "lambda_cap": _env_float("IDX_LAMBDA_CAP", 50.0),
+        "lambda_illiq": _env_float("IDX_LAMBDA_ILLIQ", 10.0),
+        "lambda_to": _env_float("IDX_LAMBDA_TO", 0.002),
+        "calmar_eps": _env_float("IDX_CALMAR_EPS", 0.01),
+        "min_trades": _resolve_min_trades(),
+        "huge_penalty": _resolve_huge_penalty(),
+    }
+
+
 def score_rules(
     *,
     feature_result: Any,
     decision_params: DecisionParams,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """Evaluate the cached features once and expose scalar diagnostics."""
 
     start = time.perf_counter()
     result = evaluate_rules(feature_result, decision_params)
     elapsed = time.perf_counter() - start
     metrics = result.get("metrics", {})
+    execution = result.get("execution")
+    objective_mode = _resolve_obj_mode()
     sharpe = float(metrics.get("sharpe_oos", 0.0))
+    sharpe_net = float(metrics.get("sharpe_oos_net", sharpe))
     turnover = float(metrics.get("turnover", 0.0))
     turnover_ann = float(metrics.get("turnover_annualised", turnover))
+    turnover_ann_notional = float(metrics.get("turnover_annualised_notional", turnover_ann))
     n_trades = int(metrics.get("n_trades", 0) or 0)
     min_trades = _resolve_min_trades()
-    lambda_turnover = _resolve_turnover_lambda()
+    huge_penalty = _resolve_huge_penalty()
 
+    penalty_dd = 0.0
+    penalty_cap = 0.0
+    penalty_illiq = 0.0
+    penalty_to = 0.0
+    penalty_short = 0.0
+    base_value = sharpe
+    lambda_turnover = _resolve_turnover_lambda()
     score = sharpe - lambda_turnover * turnover_ann
+
+    if objective_mode in {"idx_v1", "idx_v2_calmar"}:
+        maxdd_net = float(metrics.get("maxdd_oos_net", abs(float(metrics.get("maxdd", 0.0)))))
+        if maxdd_net < 0:
+            maxdd_net = abs(maxdd_net)
+        participation_mean = float(metrics.get("participation_mean", 0.0))
+        amihud_illiq = float(metrics.get("amihud_illiq", 0.0))
+        illiq_cap = float(metrics.get("illiq_cap", math.nan))
+        if not math.isfinite(illiq_cap):
+            illiq_cap = amihud_illiq
+
+        rho_cap = _env_float("IDX_RHO_CAP", 0.02)
+        lambda_cap = _env_float("IDX_LAMBDA_CAP", 50.0)
+        lambda_illiq = _env_float("IDX_LAMBDA_ILLIQ", 10.0)
+        lambda_to = _env_float("IDX_LAMBDA_TO", 0.002)
+        lambda_dd = _env_float("IDX_LAMBDA_DD", 4.0)
+
+        if objective_mode == "idx_v1":
+            dd_cap = _env_float("IDX_DD_CAP", 0.15)
+            base_value = sharpe_net
+            penalty_dd = lambda_dd * max(0.0, maxdd_net - dd_cap) ** 2
+        else:
+            dd_hard = _env_float("IDX_DD_HARD", 0.20)
+            cagr_net = float(metrics.get("cagr_oos_net", metrics.get("cagr", 0.0)))
+            calmar_net = float(metrics.get("calmar_oos_net", 0.0))
+            base_value = cagr_net if cagr_net <= 0 else calmar_net
+            penalty_dd = lambda_dd * max(0.0, maxdd_net - dd_hard) ** 2
+
+        penalty_cap = lambda_cap * max(0.0, participation_mean - rho_cap) ** 2
+        penalty_illiq = lambda_illiq * max(0.0, amihud_illiq - illiq_cap) ** 2
+        penalty_to = lambda_to * turnover_ann_notional
+        score = base_value - penalty_dd - penalty_cap - penalty_illiq - penalty_to
+
+        allow_short = True
+        if getattr(feature_result, "features", None) is not None:
+            allow_short = not bool(getattr(feature_result.features.cfg, "long_only", False))
+        if not allow_short and execution is not None and hasattr(execution, "pos"):
+            pos_series = getattr(execution, "pos")
+            if isinstance(pos_series, pd.Series):
+                oos_start = getattr(getattr(feature_result, "features", None), "oos_start_date", None)
+                if oos_start is not None and hasattr(pos_series.index, "date"):
+                    pos_oos = pos_series[pos_series.index.date >= oos_start]
+                    if pos_oos.empty:
+                        pos_oos = pos_series
+                else:
+                    pos_oos = pos_series
+                if (pos_oos < 0).any():
+                    penalty_short = huge_penalty
+                    score -= penalty_short
+
     min_trades_penalty = 0.0
     valid_trial = n_trades >= min_trades
     if not valid_trial:
-        min_trades_penalty = 1_000_000.0 + float(min_trades - n_trades)
+        min_trades_penalty = huge_penalty + float(min_trades - n_trades)
         score -= min_trades_penalty
+
+    maxdd_metric = float(metrics.get("maxdd_oos_net", abs(float(metrics.get("maxdd", 0.0)))))
+    if maxdd_metric < 0:
+        maxdd_metric = abs(maxdd_metric)
 
     diagnostics = {
         "Score": float(score),
         "eval_time_s": float(elapsed),
+        "objective_mode": float({"legacy": 0, "idx_v1": 1, "idx_v2_calmar": 2}.get(objective_mode, 0)),
+        "objective_mode_label": objective_mode,
+        "base_value": float(base_value),
         "sharpe_oos": sharpe,
+        "sharpe_oos_net": sharpe_net,
         "maxdd": float(metrics.get("maxdd", 0.0)),
+        "maxdd_oos_net": float(maxdd_metric),
         "turnover": turnover,
         "turnover_annualised": turnover_ann,
+        "turnover_annualised_notional": turnover_ann_notional,
+        "participation_mean": float(metrics.get("participation_mean", 0.0)),
+        "participation_max": float(metrics.get("participation_max", 0.0)),
+        "amihud_illiq": float(metrics.get("amihud_illiq", 0.0)),
+        "illiq_cap": float(metrics.get("illiq_cap", math.nan)),
+        "illiq_cap_used": float(metrics.get("illiq_cap_used", metrics.get("illiq_cap", math.nan))),
+        "cost_model": str(metrics.get("cost_model", "simple")),
+        "cagr_oos_net": float(metrics.get("cagr_oos_net", metrics.get("cagr", 0.0))),
+        "calmar_oos_net": float(metrics.get("calmar_oos_net", 0.0)),
+        "penalty_dd": float(penalty_dd),
+        "penalty_cap": float(penalty_cap),
+        "penalty_illiq": float(penalty_illiq),
+        "penalty_to": float(penalty_to),
+        "penalty_short": float(penalty_short),
         "n_trades": float(n_trades),
         "min_trades_required": float(min_trades),
         "min_trades_penalty": float(min_trades_penalty),
+        "huge_penalty": float(huge_penalty),
         "valid_trial": float(1.0 if valid_trial else 0.0),
         "alpha_ec": float(metrics.get("alpha_ec", math.nan)),
         "half_life_full": float(metrics.get("half_life_full", math.nan)),
+        "idx_dd_cap": float(_env_float("IDX_DD_CAP", 0.15)),
+        "idx_dd_hard": float(_env_float("IDX_DD_HARD", 0.20)),
+        "idx_rho_cap": float(_env_float("IDX_RHO_CAP", 0.02)),
+        "idx_lambda_dd": float(_env_float("IDX_LAMBDA_DD", 4.0)),
+        "idx_lambda_cap": float(_env_float("IDX_LAMBDA_CAP", 50.0)),
+        "idx_lambda_illiq": float(_env_float("IDX_LAMBDA_ILLIQ", 10.0)),
+        "idx_lambda_to": float(_env_float("IDX_LAMBDA_TO", 0.002)),
+        "idx_calmar_eps": float(_env_float("IDX_CALMAR_EPS", 0.01)),
+        "idx_spread_bps": float(metrics.get("idx_spread_bps", math.nan)),
+        "idx_impact_k": float(metrics.get("idx_impact_k", math.nan)),
+        "idx_sell_tax_rate": float(metrics.get("idx_sell_tax_rate", math.nan)),
+        "idx_adtv_win": float(metrics.get("idx_adtv_win", math.nan)),
+        "idx_sigma_win": float(metrics.get("idx_sigma_win", math.nan)),
+        "illiq_cap_mode": str(metrics.get("illiq_cap_mode", "insample_p80")),
     }
     return diagnostics
 
@@ -250,6 +417,13 @@ def run_bo(
 
     with storage.managed_storage("stage2_bo") as conn:
         with storage.with_transaction(conn):
+            objective_snapshot = _objective_env_snapshot(cfg_payload)
+            best_record = best.user_attrs.get("record") if hasattr(best, "user_attrs") else None
+            if isinstance(best_record, dict):
+                best_diag = best_record.get("diagnostics", {})
+                if isinstance(best_diag, dict):
+                    objective_snapshot["illiq_cap_used_best"] = best_diag.get("illiq_cap_used")
+                    objective_snapshot["objective_mode_label"] = best_diag.get("objective_mode_label")
             storage.write_run(
                 conn,
                 study_run_id,
@@ -258,7 +432,7 @@ def run_bo(
                 n_workers=n_jobs,
                 plan="optuna_tpe",
                 seed_method="tpe",
-                notes=json.dumps({"pair": pair, "method": method, "acq": acq}),
+                notes=json.dumps({"pair": pair, "method": method, "acq": acq, **objective_snapshot}),
             )
             horizon_payload = {"horizon": horizon} if horizon else None
             for trial in study.trials:
