@@ -164,11 +164,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument("--z_entry", type=float, default=None)
     parser.add_argument("--z_exit", type=float, default=0.55)
     parser.add_argument("--z_stop", type=float, default=0.8)
+    parser.add_argument("--z_stop_buffer", type=float, default=0.75)
     parser.add_argument("--max_hold", type=int, default=8)
     parser.add_argument("--min_hold", type=int, default=0)
     parser.add_argument("--dynamic_hold", type=int, default=0)
     parser.add_argument("--dynamic_hold_max_add", type=int, default=0)
     parser.add_argument("--dynamic_hold_step", type=float, default=0.5)
+    parser.add_argument("--adaptive_exit", type=int, default=0)
+    parser.add_argument("--adaptive_loss_cut", type=float, default=0.02)
+    parser.add_argument("--adaptive_profit_hold", type=float, default=0.01)
+    parser.add_argument("--adaptive_profit_extend_days", type=int, default=5)
+    parser.add_argument("--adaptive_max_hold_cap", type=int, default=60)
     parser.add_argument("--cooldown", type=int, default=1)
     parser.add_argument("--z_auto_method", default="mfpt")
     parser.add_argument("--z_auto", type=float, default=0.7)
@@ -181,8 +187,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
     parser.add_argument(
         "--signal_mode",
         default="normal",
-        choices=["normal", "long_from_short_only"],
-        help="Signal execution mode: normal or contrarian long from short signal only",
+        choices=["normal", "long_from_short_only", "long_independent"],
+        help="Signal execution mode: normal, contrarian long_from_short_only, or long_independent (per-leg long only)",
     )
     parser.add_argument("--beta_weight", type=int, default=1)
     parser.add_argument("--cost_bps", type=float, default=5.0)
@@ -290,11 +296,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PlaybookConfig:
         z_entry=float(args.z_entry) if args.z_entry is not None else None,
         z_exit=float(args.z_exit),
         z_stop=float(args.z_stop),
+        z_stop_buffer=max(float(args.z_stop_buffer), 0.0),
         max_hold=int(args.max_hold),
         min_hold=max(0, int(args.min_hold)),
         dynamic_hold=bool(args.dynamic_hold),
         dynamic_hold_max_add=max(0, int(args.dynamic_hold_max_add)),
         dynamic_hold_step=max(float(args.dynamic_hold_step), 1e-6),
+        adaptive_exit=bool(args.adaptive_exit),
+        adaptive_loss_cut=max(float(args.adaptive_loss_cut), 0.0),
+        adaptive_profit_hold=max(float(args.adaptive_profit_hold), 0.0),
+        adaptive_profit_extend_days=max(0, int(args.adaptive_profit_extend_days)),
+        adaptive_max_hold_cap=max(1, int(args.adaptive_max_hold_cap)),
         cooldown=int(args.cooldown),
         z_auto_method=args.z_auto_method.lower(),
         z_auto_q=float(args.z_auto),
@@ -360,7 +372,17 @@ def _apply_settings_overrides(cfg: PlaybookConfig) -> None:
         "z_entry": settings.playbook_z_entry,
         "z_exit": settings.playbook_z_exit,
         "z_stop": settings.playbook_z_stop,
+        "z_stop_buffer": getattr(settings, "playbook_z_stop_buffer", None),
         "max_hold": settings.playbook_max_hold,
+        "min_hold": getattr(settings, "playbook_min_hold", None),
+        "dynamic_hold": getattr(settings, "playbook_dynamic_hold", None),
+        "dynamic_hold_max_add": getattr(settings, "playbook_dynamic_hold_max_add", None),
+        "dynamic_hold_step": getattr(settings, "playbook_dynamic_hold_step", None),
+        "adaptive_exit": getattr(settings, "playbook_adaptive_exit", None),
+        "adaptive_loss_cut": getattr(settings, "playbook_adaptive_loss_cut", None),
+        "adaptive_profit_hold": getattr(settings, "playbook_adaptive_profit_hold", None),
+        "adaptive_profit_extend_days": getattr(settings, "playbook_adaptive_profit_extend_days", None),
+        "adaptive_max_hold_cap": getattr(settings, "playbook_adaptive_max_hold_cap", None),
         "cooldown": settings.playbook_cooldown,
         "z_auto_method": settings.playbook_z_auto_method,
         "z_auto_q": settings.playbook_z_auto_q,
@@ -1195,7 +1217,7 @@ def build_signals(
         # - legacy long signal is ignored
         enter_long = enter_short.copy()
         enter_short = pd.Series(False, index=enter_short.index)
-    elif signal_mode != "normal":
+    elif signal_mode not in {"normal", "long_independent"}:
         LOGGER.warning("Unknown signal_mode=%s, falling back to normal", signal_mode)
     long_conf = _confirm_streak(enter_long, cfg.regime_confirm)
     short_conf = _confirm_streak(enter_short, cfg.regime_confirm)
@@ -1206,8 +1228,9 @@ def build_signals(
         signals["delta_score"] = delta_score.reindex(zect.index)
     if delta_mom12 is not None:
         signals["delta_mom12"] = delta_mom12.reindex(zect.index)
-    # Enforce long-only patch when configured
-    if cfg.long_only:
+    # Enforce long-only patch when configured.
+    # In long_independent mode, `short` means "buy right leg" (not short-selling).
+    if cfg.long_only and signal_mode != "long_independent":
         signals["short"] = 0.0
     if cfg.mom_enable:
         LOGGER.info(
@@ -1281,6 +1304,8 @@ def execute_trades(
     weights = 1.0 + np.abs(beta_vals)
     w1 = 1.0 / weights
     w2 = np.abs(beta_vals) / weights
+    signal_mode = str(getattr(cfg, "signal_mode", "normal") or "normal").lower()
+    independent_long_mode = signal_mode == "long_independent"
     use_idx_cost_model = str(getattr(cfg, "cost_model", "simple")).strip().lower() == "idx_realistic"
     idx_cost_cfg = resolve_idx_cost_config(
         fee_buy=cfg.fee_buy,
@@ -1321,6 +1346,7 @@ def execute_trades(
     trade_total_cost = 0.0
     trade_days = 0
     trade_max_hold = max(1, int(cfg.max_hold))
+    trade_extended = False
     nav_prev_value = 1.0
 
     def _resolve_trade_max_hold(entry_abs_z: float) -> int:
@@ -1352,16 +1378,19 @@ def execute_trades(
                 trade_gross_pnl = 0.0
                 trade_total_cost = 0.0
                 trade_days = 0
+                trade_extended = False
                 entry_z = float(zect.iloc[i]) if np.isfinite(zect.iloc[i]) else float("nan")
                 trade_max_hold = _resolve_trade_max_hold(abs(entry_z))
             elif enter_short:
-                pos[i] = -1
+                # In long_independent mode, short signal means "buy right leg".
+                pos[i] = -1 if independent_long_mode else -1
                 open_idx = i
                 open_side = -1
                 trade_pnl = 0.0
                 trade_gross_pnl = 0.0
                 trade_total_cost = 0.0
                 trade_days = 0
+                trade_extended = False
                 entry_z = float(zect.iloc[i]) if np.isfinite(zect.iloc[i]) else float("nan")
                 trade_max_hold = _resolve_trade_max_hold(abs(entry_z))
             else:
@@ -1379,16 +1408,40 @@ def execute_trades(
                     exit_flag = np.sign(zval) != np.sign(prev_z)
             elif cfg.exit == "tplus1":
                 exit_flag = trade_days >= 1
-            if trade_days < max(0, int(cfg.min_hold)):
+            min_hold_req = max(0, int(cfg.min_hold))
+            if trade_days < min_hold_req:
                 exit_flag = False
             stop_flag = np.isfinite(zval) and abs(zval) >= cfg.z_stop
+            if trade_days < min_hold_req:
+                stop_flag = False
+
+            if bool(getattr(cfg, "adaptive_exit", False)):
+                loss_cut = max(float(getattr(cfg, "adaptive_loss_cut", 0.0)), 0.0)
+                if loss_cut > 0 and trade_pnl <= -loss_cut and trade_days >= 1:
+                    exit_flag = True
+                profit_hold = max(float(getattr(cfg, "adaptive_profit_hold", 0.0)), 0.0)
+                if (
+                    profit_hold > 0
+                    and (not trade_extended)
+                    and trade_pnl >= profit_hold
+                ):
+                    extend_days = max(0, int(getattr(cfg, "adaptive_profit_extend_days", 0)))
+                    hold_cap = max(trade_max_hold, int(getattr(cfg, "adaptive_max_hold_cap", trade_max_hold)))
+                    trade_max_hold = min(trade_max_hold + extend_days, hold_cap)
+                    trade_extended = True
             time_flag = trade_days >= trade_max_hold
             if exit_flag or stop_flag or time_flag:
                 pos[i] = 0
-        prev_exp1 = (pos[i - 1] * w1[i - 1]) if i > 0 else 0.0
-        prev_exp2 = (-pos[i - 1] * w2[i - 1]) if i > 0 else 0.0
-        curr_exp1 = pos[i] * w1[i]
-        curr_exp2 = -pos[i] * w2[i]
+        if independent_long_mode:
+            prev_exp1 = 1.0 if prev > 0 else 0.0
+            prev_exp2 = 1.0 if prev < 0 else 0.0
+            curr_exp1 = 1.0 if pos[i] > 0 else 0.0
+            curr_exp2 = 1.0 if pos[i] < 0 else 0.0
+        else:
+            prev_exp1 = (pos[i - 1] * w1[i - 1]) if i > 0 else 0.0
+            prev_exp2 = (-pos[i - 1] * w2[i - 1]) if i > 0 else 0.0
+            curr_exp1 = pos[i] * w1[i]
+            curr_exp2 = -pos[i] * w2[i]
         if pos[i] != prev:
             dexp1_vals[i] = curr_exp1 - prev_exp1
             dexp2_vals[i] = curr_exp2 - prev_exp2
@@ -1444,7 +1497,14 @@ def execute_trades(
                 cost[i] = fee * (w1[i] + w2[i])
             else:
                 cost[i] = 2 * fee * (w1[i] + w2[i])
-        if pos[i] > 0:
+        if independent_long_mode:
+            if pos[i] > 0:
+                pnl_core = float(close_ret1.iloc[i])
+            elif pos[i] < 0:
+                pnl_core = float(close_ret2.iloc[i])
+            else:
+                pnl_core = 0.0
+        elif pos[i] > 0:
             pnl_core = w1[i] * r1.iloc[i] - w2[i] * r2.iloc[i]
         elif pos[i] < 0:
             pnl_core = -w1[i] * r1.iloc[i] + w2[i] * r2.iloc[i]
@@ -1472,7 +1532,11 @@ def execute_trades(
                 {
                     "open_index": open_idx,
                     "close_index": i,
-                    "side": "LONG" if open_side > 0 else "SHORT",
+                    "side": (
+                        "LONG_LEFT" if independent_long_mode and open_side > 0 else
+                        "LONG_RIGHT" if independent_long_mode and open_side < 0 else
+                        "LONG" if open_side > 0 else "SHORT"
+                    ),
                     "days": trade_days,
                     "holding_days": holding_days,
                     "pnl": trade_pnl,
@@ -1490,6 +1554,7 @@ def execute_trades(
             trade_total_cost = 0.0
             trade_days = 0
             trade_max_hold = max(1, int(cfg.max_hold))
+            trade_extended = False
     pos_series = pd.Series(pos, index=lp_pair.index, name="pos")
     cost_series = pd.Series(cost, index=lp_pair.index, name="cost")
     ret_core = pd.Series(ret_core_vals, index=lp_pair.index, name="ret_core")
@@ -1835,13 +1900,22 @@ def _apply_decision_params(
     cfg: PlaybookConfig,
     decision_params: DecisionParams,
 ) -> PlaybookConfig:
+    z_entry_val = float(decision_params.z_entry) if decision_params.z_entry is not None else None
+    base_z_stop = float(getattr(cfg, "z_stop", 0.8))
+    z_stop_buffer = max(float(getattr(cfg, "z_stop_buffer", 0.0)), 0.0)
+    if z_entry_val is not None and np.isfinite(z_entry_val):
+        target_z_stop = z_entry_val + z_stop_buffer
+        tuned_z_stop = max(base_z_stop, target_z_stop)
+    else:
+        tuned_z_stop = base_z_stop
+
     updated_cfg = dataclasses.replace(
         cfg,
         z_entry=decision_params.z_entry,
         z_exit=float(decision_params.z_exit),
         max_hold=int(decision_params.max_hold),
         cooldown=int(decision_params.cooldown),
-        z_stop=float(max(decision_params.z_entry or 0.0, decision_params.z_exit)),
+        z_stop=float(tuned_z_stop),
         p_th=decision_params.p_th if decision_params.p_th is not None else cfg.p_th,
     )
     if updated_cfg.z_entry is not None:
@@ -1851,13 +1925,6 @@ def _apply_decision_params(
                 updated_cfg.z_entry,
             )
             updated_cfg = dataclasses.replace(updated_cfg, z_entry=None)
-        elif updated_cfg.z_stop < updated_cfg.z_entry:
-            LOGGER.info(
-                "Adjusting z_stop from %.3f to %.3f to respect z_entry threshold",
-                updated_cfg.z_stop,
-                updated_cfg.z_entry,
-            )
-            updated_cfg = dataclasses.replace(updated_cfg, z_stop=float(updated_cfg.z_entry))
     return updated_cfg
 
 

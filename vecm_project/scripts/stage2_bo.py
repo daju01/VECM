@@ -221,8 +221,10 @@ def score_rules(
         score = base_value - penalty_dd - penalty_cap - penalty_illiq - penalty_to
 
         allow_short = True
+        signal_mode = "normal"
         if getattr(feature_result, "features", None) is not None:
             allow_short = not bool(getattr(feature_result.features.cfg, "long_only", False))
+            signal_mode = str(getattr(feature_result.features.cfg, "signal_mode", "normal") or "normal").lower()
         if not allow_short and execution is not None and hasattr(execution, "pos"):
             pos_series = getattr(execution, "pos")
             if isinstance(pos_series, pd.Series):
@@ -233,7 +235,8 @@ def score_rules(
                         pos_oos = pos_series
                 else:
                     pos_oos = pos_series
-                if (pos_oos < 0).any():
+                # In long_independent mode, negative `pos` denotes "long right leg", not short-selling.
+                if signal_mode != "long_independent" and (pos_oos < 0).any():
                     penalty_short = huge_penalty
                     score -= penalty_short
 

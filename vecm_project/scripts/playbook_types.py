@@ -23,11 +23,17 @@ class PlaybookConfig:
     z_entry: Optional[float] = None
     z_exit: float = 0.55
     z_stop: float = 0.8
+    z_stop_buffer: float = 0.75
     max_hold: int = 8
     min_hold: int = 0
     dynamic_hold: bool = False
     dynamic_hold_max_add: int = 0
     dynamic_hold_step: float = 0.5
+    adaptive_exit: bool = False
+    adaptive_loss_cut: float = 0.02
+    adaptive_profit_hold: float = 0.01
+    adaptive_profit_extend_days: int = 5
+    adaptive_max_hold_cap: int = 60
     cooldown: int = 1
     z_auto_method: str = "mfpt"
     z_auto_q: float = 0.7
